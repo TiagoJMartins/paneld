@@ -34,7 +34,11 @@ impl Layout {
             (device.width as f32 / grid.cols as f32).min(device.height as f32 / grid.rows as f32);
 
         let gutter = (smallest_side * 0.06).clamp(1.0, 10.0);
-        let padding = (smallest_side * 0.10).clamp(2.0, 12.0);
+        // A tighter ceiling than the gutter's, because padding is charged twice —
+        // once on each side — and it comes straight off the width a figure has to
+        // fit in. The hairline rule and the gutter already separate two cells; a
+        // wider inset only shrinks the number inside one.
+        let padding = (smallest_side * 0.10).clamp(2.0, 8.0);
 
         // Usable cell size: what one `1fr` track resolves to once the frame's own
         // padding and the gaps between tracks are taken out. Needed to scale type

@@ -273,25 +273,37 @@ fn cell_node(
     inputs: &RenderInputs<'_>,
     layout: &Layout,
 ) -> Node {
-    let (cell_w, cell_h) = layout.cell();
-    let span_w = cell_w * widget.col_span as f32;
-    let span_h = cell_h * widget.row_span as f32;
-    let label_px = (span_h * 0.13).clamp(11.0, 32.0);
+    // The rect the grid will actually hand this widget, rather than cells times
+    // span: a spanning cell swallows the gutters it spans over, so computing the
+    // box here as `cell * span` measured a 2x2 ten pixels short of where
+    // `Layout::rect` places it — the exact disagreement `rect` exists to prevent.
+    let (_, _, span_w, span_h) = layout.rect(widget);
     let padding = layout.padding();
-    // What a cell's contents actually have to fit inside, which is the span less
-    // its own padding and the hairline rule on each side.
-    let content_w = (span_w - padding * 2.0 - 2.0).max(1.0);
+    // Padding on both sides, plus the hairline rule on each.
+    let chrome = padding * 2.0 + 2.0;
+    // What a cell's contents actually have to fit inside.
+    let content_w = (span_w - chrome).max(1.0);
+    // Chrome is sized to one cell and never to the span: a label is chrome, and a
+    // label that grew with its widget's span would set the same word at two sizes
+    // on one dashboard.
+    let label_px = (layout.cell().1 * 0.11).max(MIN_TYPE_PX);
+    let gap = (span_h * 0.03).clamp(2.0, 8.0);
 
-    let mut children = vec![header_node(
-        fonts, widget, cell, inputs, content_w, label_px,
-    )];
+    let header = header_node(fonts, widget, cell, inputs, content_w, label_px);
+    // Measured rather than derived from `label_px`: a line box is the layout
+    // engine's answer and not the font size, and the body is sized from whatever
+    // the header leaves — so an estimate here shows up either as a body that
+    // overflows its cell or as a strip of the cell nothing ever uses.
+    let content_h = (span_h - chrome - intrinsic_size(fonts, header.clone()).1 - gap).max(1.0);
+
+    let mut children = vec![header];
     // The body sits in its own growing box so that the header is pinned to the top
     // of every cell while the body is centred in whatever space is left. Laying
     // both out in one column instead would centre them as a group, which makes a
     // label's height depend on how tall its neighbour's content happens to be.
     children.push(
         Node::container(body_nodes(
-            fonts, &cell.body, cell.ink, content_w, span_h, label_px,
+            fonts, &cell.body, cell.ink, content_w, content_h,
         ))
         .with_style(
             Style::default()
@@ -313,9 +325,7 @@ fn cell_node(
             .with(StyleDeclaration::flex_direction(FlexDirection::Column))
             .with(StyleDeclaration::justify_content(JustifyContent::Start))
             .with(StyleDeclaration::align_items(AlignItems::Start))
-            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(
-                (span_h * 0.03).clamp(2.0, 8.0),
-            ))))
+            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(gap))))
             .with(StyleDeclaration::padding_top(Length::Px(padding)))
             .with(StyleDeclaration::padding_right(Length::Px(padding)))
             .with(StyleDeclaration::padding_bottom(Length::Px(padding)))
@@ -440,68 +450,53 @@ fn line(coordinate: u32) -> GridPlacement {
 }
 
 /// The nodes that make up a cell below its header.
-fn body_nodes(
-    fonts: &Fonts,
-    body: &Body,
-    ink: Ink,
-    content_w: f32,
-    span_h: f32,
-    label_px: f32,
-) -> Vec<Node> {
-    let figure_px = (span_h * 0.40).clamp(18.0, 168.0);
-    let prose_px = (span_h * 0.11).clamp(12.0, 34.0);
-
+///
+/// Every size here comes out of the content box rather than out of a fraction of
+/// the cell capped at some pixel count. Those caps were set against a 400x300 test
+/// device and silently bound everything on the 1448x1072 panel in service: a label
+/// asked for 45px and got 32, a weather caption asked for 82px and got 34.
+fn body_nodes(fonts: &Fonts, body: &Body, ink: Ink, content_w: f32, content_h: f32) -> Vec<Node> {
     match body {
         Body::Figure { text, unit } => {
-            vec![fitted(fonts, content_w, figure_px, |size| {
+            // The design size *is* the box's height: a run set at that size overflows
+            // it by exactly its line height, so fitting both axes lands the figure on
+            // whichever limit actually binds. Fitting width alone, as this did, left
+            // the height unused — which on a nearly square cell is most of the cell.
+            vec![fitted_box(fonts, content_w, content_h, content_h, |size| {
                 figure_node(text, unit.as_deref(), ink, size)
             })]
         }
 
         Body::Sky { svg, condition } => {
-            // The icon *is* the reading here, so it takes the space a figure would
-            // and the words are its caption rather than the other way round. The
-            // pair is centred in the cell as one block: left-aligned, a big glyph
-            // with a short caption under one corner of it reads as two unrelated
-            // things that happen to share a box.
-            let glyph = (span_h * 0.46).min(content_w * 0.72).max(16.0);
-            let caption_px = (span_h * 0.12).clamp(11.0, 34.0);
+            // Sized as one block, not as a glyph and a caption that each guessed at
+            // the cell: the glyph is the reading and the words are its caption, so
+            // their ratio belongs in [`sky_node`] and the pair is fitted together.
+            // Sizing them apart is what put a 316px glyph and 34px words in a 699x688
+            // cell.
+            //
+            // The centring wrapper is outside the fit because `width: 100%` inside a
+            // measured node measures as the measuring viewport, not as the cell.
             vec![
-                Node::container(vec![
-                    icon_node(
-                        &Icon::Svg {
-                            markup: (*svg).to_owned(),
-                            ink: None,
-                        },
-                        glyph,
-                        ink,
-                    ),
-                    fitted(fonts, content_w, caption_px, |size| {
-                        text_node(
-                            condition,
-                            one_line(
-                                text_style(size, 400.0, UI_FAMILY)
-                                    .with(StyleDeclaration::color(ink.colour())),
-                            ),
-                        )
-                    }),
-                ])
+                Node::container(vec![fitted_box(
+                    fonts,
+                    content_w,
+                    content_h,
+                    content_h,
+                    |size| sky_node(svg, condition, ink, size),
+                )])
                 .with_style(
                     Style::default()
                         .with(StyleDeclaration::display(Display::Flex))
-                        .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-                        .with(StyleDeclaration::align_items(AlignItems::Center))
                         .with(StyleDeclaration::justify_content(JustifyContent::Center))
-                        .with(StyleDeclaration::width(Length::Percentage(100.0)))
-                        .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(
-                            caption_px * 0.5,
-                        )))),
+                        .with(StyleDeclaration::width(Length::Percentage(100.0))),
                 ),
             ]
         }
 
         Body::Beacon { on } => {
-            let dot = (span_h * 0.20).clamp(14.0, 64.0);
+            // The dot is the reading, so it takes the height it is given, bounded by
+            // the width it has to share with the word beside it.
+            let dot = (content_h * 0.42).min(content_w * 0.35).max(14.0);
             vec![
                 Node::container(vec![
                     // Drawn as a shape rather than a glyph so the indicator does not
@@ -568,7 +563,8 @@ fn body_nodes(
         }
 
         Body::Prose(text) => {
-            let lines = ((span_h - label_px * 2.0) / (prose_px * 1.35)).floor();
+            let prose_px = (content_h * 0.14).max(MIN_TYPE_PX);
+            let lines = (content_h / (prose_px * 1.35)).floor();
             vec![text_node(
                 text,
                 text_style(prose_px, 400.0, UI_FAMILY)
@@ -584,7 +580,10 @@ fn body_nodes(
         }
 
         Body::Rows(rows) => {
-            let row_px = (span_h / (rows.len().max(1) as f32 + 1.6)).clamp(11.0, 30.0);
+            // Every row plus every gap between them fills the box: a row's line box
+            // is about 1.2 of its size and the gaps are 0.28 of it, so `n` rows want
+            // `1.48n - 0.28` sizes' worth of height.
+            let row_px = (content_h / (rows.len().max(1) as f32 * 1.48 - 0.28)).max(MIN_TYPE_PX);
             let children = rows
                 .iter()
                 .map(|row| row_node(row, row_px, ink))
@@ -605,7 +604,7 @@ fn body_nodes(
         Body::Absent(reason) => vec![fitted(
             fonts,
             content_w,
-            (span_h * 0.14).clamp(12.0, 30.0),
+            (content_h * 0.16).max(MIN_TYPE_PX),
             |size| {
                 text_node(
                     reason,
@@ -671,6 +670,50 @@ fn figure_node(text: &str, unit: Option<&str>, ink: Ink, size: f32) -> Node {
     )
 }
 
+/// The sky block: the condition as a glyph, with the condition in words beneath it.
+///
+/// `size` is the glyph's side and the caption is a fixed fraction of it, so one
+/// number sizes the pair and [`fitted_box`] can fit them to a cell together. The
+/// two are centred as one block: a big glyph with a short caption under one corner
+/// of it reads as two unrelated things sharing a box.
+fn sky_node(svg: &str, condition: &str, ink: Ink, size: f32) -> Node {
+    let caption_px = size * SKY_CAPTION_SCALE;
+    Node::container(vec![
+        icon_node(
+            &Icon::Svg {
+                markup: svg.to_owned(),
+                ink: None,
+            },
+            size,
+            ink,
+        ),
+        text_node(
+            condition,
+            one_line(
+                text_style(caption_px, 400.0, UI_FAMILY)
+                    .with(StyleDeclaration::color(ink.colour())),
+            ),
+        ),
+    ])
+    .with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::flex_direction(FlexDirection::Column))
+            .with(StyleDeclaration::align_items(AlignItems::Center))
+            .with(StyleDeclaration::justify_content(JustifyContent::Center))
+            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(
+                caption_px * 0.5,
+            )))),
+    )
+}
+
+/// The sky caption's size, as a fraction of the glyph's side.
+///
+/// The glyph is the reading and the words underneath confirm it, so the caption is
+/// deliberately a sixth of the glyph: large enough to read across a room, small
+/// enough that it never competes with the picture for the eye.
+const SKY_CAPTION_SCALE: f32 = 0.16;
+
 /// How far the unit must be lifted to share the figure's baseline, as a fraction
 /// of the size difference between the two runs.
 ///
@@ -711,6 +754,30 @@ fn fitted(fonts: &Fonts, available: f32, design: f32, build: impl Fn(f32) -> Nod
     build(size)
 }
 
+/// Builds a node at the largest size, up to `design`, at which it fits inside
+/// `available_w` by `available_h`.
+///
+/// Two axes because a cell is a box and not a line. Fitting width alone sized a
+/// figure by how many glyphs it happened to have and left the rest of the cell
+/// empty; the height is a real constraint too, and on the panel in service it is
+/// often the looser of the two, which is where the space went. Whichever axis
+/// overflows by more decides, and one corrective step is exact for both because
+/// every length in these nodes is proportional to `size`.
+fn fitted_box(
+    fonts: &Fonts,
+    available_w: f32,
+    available_h: f32,
+    design: f32,
+    build: impl Fn(f32) -> Node,
+) -> Node {
+    let (width, height) = intrinsic_size(fonts, build(design));
+    let size = fit_size(width, available_w, design).min(fit_size(height, available_h, design));
+    if size == design {
+        return build(design);
+    }
+    build(size)
+}
+
 /// The size a run measuring `intrinsic` pixels wide at `design` should be set at
 /// to fit `available`.
 ///
@@ -730,21 +797,45 @@ fn fit_size(intrinsic: f32, available: f32, design: f32) -> f32 {
 }
 
 /// How wide a node wants to be, with nothing constraining it.
-///
-/// Measured in a viewport far wider than any panel so that no wrapping or
-/// shrink-to-fit has kicked in: the answer wanted here is the run's natural
-/// advance, not what it would do in a box. Returns `0.0` if measurement fails,
-/// which leaves the design size in place — the same outcome as before this
-/// existed, and better than refusing to draw the cell.
 fn intrinsic_width(fonts: &Fonts, node: Node) -> f32 {
+    intrinsic_size(fonts, node).0
+}
+
+/// How large a node wants to be, with nothing constraining it, as `(width,
+/// height)`.
+///
+/// Measured in a viewport far larger than any panel so that no wrapping or
+/// shrink-to-fit has kicked in: the answer wanted here is the node's natural size,
+/// not what it would do in a box. Returns `(0.0, 0.0)` if measurement fails, which
+/// leaves the design size in place — better than refusing to draw the cell.
+///
+/// **The node is wrapped in a flex row before measuring, and that wrapper is not
+/// cosmetic.** A bare text node is block-level, so it reports its *container's*
+/// width — against this viewport, 32768px — and every run measured that way was
+/// shrunk to [`MIN_TYPE_PX`] regardless of how short it was. That is why a label
+/// asking for 45px was set at 12. A flex container is sized to its content, so
+/// wrapping asks the question that was meant: how wide is this run?
+///
+/// Nothing measured here may size itself as a percentage of its container, because
+/// against this viewport that resolves to a number with no relation to the cell.
+fn intrinsic_size(fonts: &Fonts, node: Node) -> (f32, f32) {
+    let probe = Node::container(vec![node]).with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::flex_direction(FlexDirection::Row))
+            .with(StyleDeclaration::align_items(AlignItems::Start)),
+    );
     let options = RenderOptions::builder()
-        .viewport(Viewport::new((crate::config::MAX_DIMENSION * 8, 1)))
-        .node(node)
+        .viewport(Viewport::new((
+            crate::config::MAX_DIMENSION * 8,
+            crate::config::MAX_DIMENSION * 8,
+        )))
+        .node(probe)
         .fonts(fonts)
         .build();
     takumi::measure(options)
-        .map(|measured| measured.width)
-        .unwrap_or(0.0)
+        .map(|measured| (measured.width, measured.height))
+        .unwrap_or((0.0, 0.0))
 }
 
 /// A grey level as a colour, for an icon that asked for one.
@@ -1672,6 +1763,112 @@ mod tests {
                 .0
         };
         (mode(0, split), mode(split, width))
+    }
+
+    /// How much of a widget's cell its content actually inks, as fractions of the
+    /// cell's width and height.
+    ///
+    /// Measured off the rasterised frame rather than from the style declarations,
+    /// because the number that matters is the one on the glass: every size in a cell
+    /// is chosen by measurement and fitting, so nothing short of pixels says whether
+    /// a reading used the cell it was given.
+    fn cell_fill(
+        device: &Device,
+        widget_id: &str,
+        content: &HashMap<String, ContentRecord>,
+        ha: &HashMap<Reading, Reported>,
+    ) -> (f32, f32) {
+        let widget = device
+            .widgets
+            .iter()
+            .find(|w| w.id == widget_id)
+            .expect("the widget must be on the device");
+        let inputs = RenderInputs {
+            device,
+            content,
+            ha_states: ha,
+            icons: &HashMap::new(),
+            now: now(),
+        };
+        let raster = rasterise(
+            &FONTS,
+            dashboard_node(&FONTS, &inputs),
+            device.width,
+            device.height,
+        )
+        .expect("should rasterise");
+
+        let (x, y, w, h) = Layout::for_device(device).rect(widget);
+        // Inset past the cell's own rule, which would otherwise ink every cell fully.
+        let (x0, y0) = ((x + 3.0) as u32, (y + 3.0) as u32);
+        let (x1, y1) = ((x + w - 3.0) as u32, (y + h - 3.0) as u32);
+        let dark = |x: u32, y: u32| raster[((y * device.width + x) * 4) as usize] < 128;
+
+        let inked_x: Vec<u32> = (x0..x1).filter(|&x| (y0..y1).any(|y| dark(x, y))).collect();
+        let inked_y: Vec<u32> = (y0..y1).filter(|&y| (x0..x1).any(|x| dark(x, y))).collect();
+        assert!(
+            !inked_x.is_empty() && !inked_y.is_empty(),
+            "widget `{widget_id}` inked nothing"
+        );
+        (
+            (inked_x[inked_x.len() - 1] - inked_x[0] + 1) as f32 / (x1 - x0) as f32,
+            (inked_y[inked_y.len() - 1] - inked_y[0] + 1) as f32 / (y1 - y0) as f32,
+        )
+    }
+
+    /// The panel in service: a 6-inch Kindle Paperwhite, landscape, on a 4x3 grid.
+    fn panel(widgets: Vec<Widget>) -> Device {
+        Device {
+            width: 1448,
+            height: 1072,
+            grid: Grid { cols: 4, rows: 3 },
+            ..device(widgets)
+        }
+    }
+
+    #[test]
+    fn a_reading_fills_the_cell_it_is_given() {
+        // The defect this pins: every type size was a fraction of the cell capped at
+        // a pixel count chosen against the 400x300 test device, and fitting only ever
+        // shrank to width. On the real panel a 2x2 weather cell is 699x688 and held a
+        // 316px glyph with 34px words — under half of each axis — while a figure cell
+        // used 40% of its height. Both axes are asserted because either one alone
+        // passes with the cell half empty.
+        let mut weather = ha_widget("sky", "weather.braga", WidgetKind::Weather);
+        weather.col_span = 2;
+        weather.row_span = 2;
+        let mut figure = widget("temp", WidgetKind::Value, 2, 0);
+        figure.unit = Some("\u{b0}C".to_owned());
+        let device = panel(vec![weather, figure]);
+
+        let content =
+            HashMap::from([("temp".to_owned(), record(serde_json::json!("23.4"), now()))]);
+        let ha = HashMap::from([(
+            Reading::state("weather.braga"),
+            Reported::Fresh("partlycloudy".to_owned()),
+        )]);
+
+        let (sky_w, sky_h) = cell_fill(&device, "sky", &content, &ha);
+        assert!(
+            sky_w > 0.7 && sky_h > 0.7,
+            "the weather block must use its cell: {sky_w:.2} of the width, {sky_h:.2} \
+             of the height"
+        );
+
+        let (figure_w, figure_h) = cell_fill(&device, "temp", &content, &ha);
+        assert!(
+            figure_w > 0.9,
+            "a figure is width-bound on this grid, so it must use nearly all of it: \
+             {figure_w:.2}"
+        );
+        // Not higher, and this is the honest limit of the fix: a four-glyph reading
+        // with a unit is width-bound on a 350x344 cell, so the leftover height is
+        // structural. Buying it back means a wider cell — a grid choice, not a
+        // rendering one.
+        assert!(
+            figure_h > 0.55,
+            "and it must still use over half the height it is given: {figure_h:.2}"
+        );
     }
 
     #[test]
