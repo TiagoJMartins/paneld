@@ -47,8 +47,7 @@ grid = {{ cols = {cols}, rows = {rows} }}
                 Ok(config) => config,
                 Err(_) => continue,
             };
-            let (runtime, _wake) =
-                paneld::app::Runtime::with_home_assistant(config, None).unwrap();
+            let (runtime, _wake) = paneld::app::Runtime::with_home_assistant(config, None).unwrap();
             for widget in 0..(cols * rows) {
                 let row = widget / cols;
                 let col = widget % cols;

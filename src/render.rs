@@ -216,8 +216,8 @@ fn dashboard_node(inputs: &RenderInputs<'_>) -> Node {
     // Usable cell size, needed to scale type to the cell rather than fixing it.
     let cell_w =
         (device.width as f32 - spacing.gutter * (grid.cols + 1) as f32).max(1.0) / grid.cols as f32;
-    let cell_h =
-        (device.height as f32 - spacing.gutter * (grid.rows + 1) as f32).max(1.0) / grid.rows as f32;
+    let cell_h = (device.height as f32 - spacing.gutter * (grid.rows + 1) as f32).max(1.0)
+        / grid.rows as f32;
 
     let children = device
         .widgets
@@ -278,7 +278,9 @@ fn cell_node(widget: &Widget, body: &Body, cell_w: f32, cell_h: f32, spacing: Sp
             one_line(
                 text_style(label_px, 700.0, UI_FAMILY)
                     .with(StyleDeclaration::color(muted()))
-                    .with(StyleDeclaration::letter_spacing(Length::Px(label_px * 0.06)))
+                    .with(StyleDeclaration::letter_spacing(Length::Px(
+                        label_px * 0.06,
+                    )))
                     .with(StyleDeclaration::text_transform(TextTransform::Uppercase)),
             ),
         ));
@@ -313,7 +315,9 @@ fn cell_node(widget: &Widget, body: &Body, cell_w: f32, cell_h: f32, spacing: Sp
             ))))
             .with(StyleDeclaration::padding_top(Length::Px(spacing.padding)))
             .with(StyleDeclaration::padding_right(Length::Px(spacing.padding)))
-            .with(StyleDeclaration::padding_bottom(Length::Px(spacing.padding)))
+            .with(StyleDeclaration::padding_bottom(Length::Px(
+                spacing.padding,
+            )))
             .with(StyleDeclaration::padding_left(Length::Px(spacing.padding)))
             .with(StyleDeclaration::border_top_width(hairline()))
             .with(StyleDeclaration::border_right_width(hairline()))
@@ -377,57 +381,59 @@ fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node>
 
         Body::Beacon { on } => {
             let dot = (span_h * 0.20).clamp(14.0, 64.0);
-            vec![Node::container(vec![
-                // Drawn as a shape rather than a glyph so the indicator does not
-                // depend on the embedded faces covering any particular symbol.
-                Node::container(Vec::new()).with_style(
+            vec![
+                Node::container(vec![
+                    // Drawn as a shape rather than a glyph so the indicator does not
+                    // depend on the embedded faces covering any particular symbol.
+                    Node::container(Vec::new()).with_style(
+                        Style::default()
+                            .with(StyleDeclaration::width(Length::Px(dot)))
+                            .with(StyleDeclaration::height(Length::Px(dot)))
+                            .with(StyleDeclaration::border_top_left_radius(radius(dot)))
+                            .with(StyleDeclaration::border_top_right_radius(radius(dot)))
+                            .with(StyleDeclaration::border_bottom_right_radius(radius(dot)))
+                            .with(StyleDeclaration::border_bottom_left_radius(radius(dot)))
+                            .with(StyleDeclaration::background_color(if *on {
+                                ink()
+                            } else {
+                                paper()
+                            }))
+                            .with(StyleDeclaration::border_top_width(LineWidth::Length(
+                                Length::Px(2.0),
+                            )))
+                            .with(StyleDeclaration::border_right_width(LineWidth::Length(
+                                Length::Px(2.0),
+                            )))
+                            .with(StyleDeclaration::border_bottom_width(LineWidth::Length(
+                                Length::Px(2.0),
+                            )))
+                            .with(StyleDeclaration::border_left_width(LineWidth::Length(
+                                Length::Px(2.0),
+                            )))
+                            .with(StyleDeclaration::border_top_style(BorderStyle::Solid))
+                            .with(StyleDeclaration::border_right_style(BorderStyle::Solid))
+                            .with(StyleDeclaration::border_bottom_style(BorderStyle::Solid))
+                            .with(StyleDeclaration::border_left_style(BorderStyle::Solid))
+                            .with(StyleDeclaration::border_top_color(ink()))
+                            .with(StyleDeclaration::border_right_color(ink()))
+                            .with(StyleDeclaration::border_bottom_color(ink()))
+                            .with(StyleDeclaration::border_left_color(ink())),
+                    ),
+                    text_node(
+                        if *on { "ON" } else { "OFF" },
+                        one_line(text_style((dot * 0.78).max(13.0), 700.0, UI_FAMILY)),
+                    ),
+                ])
+                .with_style(
                     Style::default()
-                        .with(StyleDeclaration::width(Length::Px(dot)))
-                        .with(StyleDeclaration::height(Length::Px(dot)))
-                        .with(StyleDeclaration::border_top_left_radius(radius(dot)))
-                        .with(StyleDeclaration::border_top_right_radius(radius(dot)))
-                        .with(StyleDeclaration::border_bottom_right_radius(radius(dot)))
-                        .with(StyleDeclaration::border_bottom_left_radius(radius(dot)))
-                        .with(StyleDeclaration::background_color(if *on {
-                            ink()
-                        } else {
-                            paper()
-                        }))
-                        .with(StyleDeclaration::border_top_width(LineWidth::Length(
-                            Length::Px(2.0),
-                        )))
-                        .with(StyleDeclaration::border_right_width(LineWidth::Length(
-                            Length::Px(2.0),
-                        )))
-                        .with(StyleDeclaration::border_bottom_width(LineWidth::Length(
-                            Length::Px(2.0),
-                        )))
-                        .with(StyleDeclaration::border_left_width(LineWidth::Length(
-                            Length::Px(2.0),
-                        )))
-                        .with(StyleDeclaration::border_top_style(BorderStyle::Solid))
-                        .with(StyleDeclaration::border_right_style(BorderStyle::Solid))
-                        .with(StyleDeclaration::border_bottom_style(BorderStyle::Solid))
-                        .with(StyleDeclaration::border_left_style(BorderStyle::Solid))
-                        .with(StyleDeclaration::border_top_color(ink()))
-                        .with(StyleDeclaration::border_right_color(ink()))
-                        .with(StyleDeclaration::border_bottom_color(ink()))
-                        .with(StyleDeclaration::border_left_color(ink())),
+                        .with(StyleDeclaration::display(Display::Flex))
+                        .with(StyleDeclaration::flex_direction(FlexDirection::Row))
+                        .with(StyleDeclaration::align_items(AlignItems::Center))
+                        .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
+                            dot * 0.5,
+                        )))),
                 ),
-                text_node(
-                    if *on { "ON" } else { "OFF" },
-                    one_line(text_style((dot * 0.78).max(13.0), 700.0, UI_FAMILY)),
-                ),
-            ])
-            .with_style(
-                Style::default()
-                    .with(StyleDeclaration::display(Display::Flex))
-                    .with(StyleDeclaration::flex_direction(FlexDirection::Row))
-                    .with(StyleDeclaration::align_items(AlignItems::Center))
-                    .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
-                        dot * 0.5,
-                    )))),
-            )]
+            ]
         }
 
         Body::Prose(text) => {
@@ -912,7 +918,10 @@ mod tests {
 
         let mut alerting = record(serde_json::json!("off"), now());
         alerting.state = Some("alert".to_owned());
-        assert!(beacon_is_on(&alerting, &on_values), "state decides when present");
+        assert!(
+            beacon_is_on(&alerting, &on_values),
+            "state decides when present"
+        );
 
         // A non-matching state means off. Falling through to `value` would report
         // on for a publisher that explicitly said it was idle.
@@ -924,16 +933,31 @@ mod tests {
     #[test]
     fn a_beacon_falls_back_to_value_when_no_state_is_pushed() {
         let on_values = vec!["on".to_owned(), "true".to_owned()];
-        assert!(beacon_is_on(&record(serde_json::json!("on"), now()), &on_values));
-        assert!(beacon_is_on(&record(serde_json::json!(true), now()), &on_values));
-        assert!(!beacon_is_on(&record(serde_json::json!("off"), now()), &on_values));
-        assert!(!beacon_is_on(&record(serde_json::json!(false), now()), &on_values));
+        assert!(beacon_is_on(
+            &record(serde_json::json!("on"), now()),
+            &on_values
+        ));
+        assert!(beacon_is_on(
+            &record(serde_json::json!(true), now()),
+            &on_values
+        ));
+        assert!(!beacon_is_on(
+            &record(serde_json::json!("off"), now()),
+            &on_values
+        ));
+        assert!(!beacon_is_on(
+            &record(serde_json::json!(false), now()),
+            &on_values
+        ));
     }
 
     #[test]
     fn beacon_matching_ignores_case_and_surrounding_space() {
         let on_values = vec!["on".to_owned()];
-        assert!(beacon_is_on(&record(serde_json::json!(" ON "), now()), &on_values));
+        assert!(beacon_is_on(
+            &record(serde_json::json!(" ON "), now()),
+            &on_values
+        ));
     }
 
     #[test]
@@ -1023,7 +1047,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(dimensions(&broken), (400, 300));
-        assert_ne!(broken, healthy, "unavailable must look different from a value");
+        assert_ne!(
+            broken, healthy,
+            "unavailable must look different from a value"
+        );
     }
 
     #[test]
@@ -1180,7 +1207,10 @@ mod tests {
         )
         .unwrap();
         let (w, h) = dimensions(&bytes);
-        assert_eq!((w, h), (crate::config::MAX_DIMENSION, crate::config::MAX_DIMENSION));
+        assert_eq!(
+            (w, h),
+            (crate::config::MAX_DIMENSION, crate::config::MAX_DIMENSION)
+        );
     }
 
     #[test]
@@ -1196,4 +1226,3 @@ mod tests {
         assert_eq!(truncate("abcdef", 3), "abc\u{2026}");
     }
 }
-

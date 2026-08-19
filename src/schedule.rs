@@ -67,10 +67,18 @@ mod tests {
         let base = base();
         let rendered = last_render(&[("kitchen", base)]);
 
-        let elapsed = due_devices([("kitchen", 300)], &rendered, base + Duration::from_secs(301));
+        let elapsed = due_devices(
+            [("kitchen", 300)],
+            &rendered,
+            base + Duration::from_secs(301),
+        );
         assert_eq!(elapsed, ["kitchen"]);
 
-        let unelapsed = due_devices([("kitchen", 300)], &rendered, base + Duration::from_secs(299));
+        let unelapsed = due_devices(
+            [("kitchen", 300)],
+            &rendered,
+            base + Duration::from_secs(299),
+        );
         assert!(unelapsed.is_empty());
     }
 
@@ -109,7 +117,11 @@ mod tests {
         let devices = [("fast", 5), ("slow", 600)];
 
         let due = due_devices(devices, &rendered, base + Duration::from_secs(10));
-        assert_eq!(due, ["fast"], "slow is absent until its own interval elapses");
+        assert_eq!(
+            due,
+            ["fast"],
+            "slow is absent until its own interval elapses"
+        );
 
         let due = due_devices(devices, &rendered, base + Duration::from_secs(600));
         assert_eq!(due, ["fast", "slow"]);

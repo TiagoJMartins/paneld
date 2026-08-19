@@ -13,3 +13,6 @@ paneld-content.json
 
 Dockerfile
 .dockerignore
+
+# Workflow definitions are not part of the build.
+.github

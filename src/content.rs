@@ -242,9 +242,8 @@ impl ContentStore {
 
         if let Err(err) = std::fs::rename(&tmp, &self.path) {
             let _ = std::fs::remove_file(&tmp);
-            return Err(err).with_context(|| {
-                format!("replacing content store {}", self.path.display())
-            });
+            return Err(err)
+                .with_context(|| format!("replacing content store {}", self.path.display()));
         }
         Ok(())
     }
@@ -458,7 +457,8 @@ mod tests {
 
     #[test]
     fn parses_the_documented_body() {
-        let parsed = body(r#"{"value":"on","state":"alert","unit":null,"rows":null,"render":false}"#);
+        let parsed =
+            body(r#"{"value":"on","state":"alert","unit":null,"rows":null,"render":false}"#);
         assert_eq!(parsed.value, Some(Some(Value::from("on"))));
         assert_eq!(parsed.state.as_deref(), Some("alert"));
         assert_eq!(parsed.unit, None);
@@ -496,14 +496,21 @@ mod tests {
                 widget_id: "sensor".to_owned()
             }
         );
-        assert!(store.get("sensor").is_none(), "a rejected push stores nothing");
+        assert!(
+            store.get("sensor").is_none(),
+            "a rejected push stores nothing"
+        );
         assert!(error.to_string().contains("sensor"), "{error}");
     }
 
     #[test]
     fn a_null_rows_key_does_not_count_as_content() {
         let store = store();
-        assert!(store.put("sensor", body(r#"{"rows":null}"#), at(0)).is_err());
+        assert!(
+            store
+                .put("sensor", body(r#"{"rows":null}"#), at(0))
+                .is_err()
+        );
     }
 
     #[test]
@@ -534,8 +541,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(second.value, Value::from("off"));
-        assert_eq!(second.state, None, "a field absent from the second put does not survive it");
-        assert_eq!(second.unit, None, "a field absent from the second put does not survive it");
+        assert_eq!(
+            second.state, None,
+            "a field absent from the second put does not survive it"
+        );
+        assert_eq!(
+            second.unit, None,
+            "a field absent from the second put does not survive it"
+        );
         assert_eq!(second.received_at, at(60));
         assert_eq!(store.get("sensor").unwrap(), second);
     }
@@ -543,8 +556,12 @@ mod tests {
     #[test]
     fn an_older_stamp_still_wins_because_last_write_wins_unconditionally() {
         let store = store();
-        store.put("sensor", body(r#"{"value":"new"}"#), at(600)).unwrap();
-        store.put("sensor", body(r#"{"value":"old"}"#), at(0)).unwrap();
+        store
+            .put("sensor", body(r#"{"value":"new"}"#), at(600))
+            .unwrap();
+        store
+            .put("sensor", body(r#"{"value":"old"}"#), at(0))
+            .unwrap();
 
         let stored = store.get("sensor").unwrap();
         assert_eq!(stored.value, Value::from("old"));
@@ -562,7 +579,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(record.value, Value::Null, "rows present means value is ignored");
+        assert_eq!(
+            record.value,
+            Value::Null,
+            "rows present means value is ignored"
+        );
         let rows = record.rows.expect("rows are stored");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id.as_deref(), Some("a"));
@@ -573,7 +594,11 @@ mod tests {
     fn rows_alone_are_content_enough() {
         let store = store();
         let record = store
-            .put("group", body(r#"{"rows":[{"label":"A","value":1}]}"#), at(0))
+            .put(
+                "group",
+                body(r#"{"rows":[{"label":"A","value":1}]}"#),
+                at(0),
+            )
             .expect("rows satisfy the requirement that value would otherwise");
         assert_eq!(record.value, Value::Null);
     }
@@ -614,7 +639,11 @@ mod tests {
         let store = store();
         let text = "u".repeat(MAX_STRING_BYTES);
         store
-            .put("sensor", body(&format!(r#"{{"value":1,"unit":"{text}"}}"#)), at(0))
+            .put(
+                "sensor",
+                body(&format!(r#"{{"value":1,"unit":"{text}"}}"#)),
+                at(0),
+            )
             .expect("the bound is inclusive");
     }
 
@@ -770,7 +799,10 @@ mod tests {
         std::fs::write(dir.file(), "{not json at all").unwrap();
 
         let store = ContentStore::load(dir.file());
-        assert!(store.snapshot().is_empty(), "a damaged store must not stop the boot");
+        assert!(
+            store.snapshot().is_empty(),
+            "a damaged store must not stop the boot"
+        );
 
         // And the store is usable afterwards, replacing the bad file on persist.
         store.put("sensor", body(r#"{"value":1}"#), at(0)).unwrap();

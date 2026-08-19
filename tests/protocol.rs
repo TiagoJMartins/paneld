@@ -233,7 +233,8 @@ async fn the_filename_is_a_content_addressed_png_name_that_ends_the_image_url() 
          to the first 7 plus last 17 characters, so a longer stem risks collision: {stem}"
     );
     assert!(
-        stem.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        stem.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "the stem must be lowercase hex: {stem}"
     );
 }
@@ -373,7 +374,10 @@ async fn setup_answers_the_onboarding_constants_with_a_fetchable_png() {
     assert_eq!(body["friendly_id"], json!("kindle"), "{body}");
     assert_eq!(body["message"], json!("ok"), "{body}");
     assert!(
-        !body["api_key"].as_str().expect("api_key should be a string").is_empty(),
+        !body["api_key"]
+            .as_str()
+            .expect("api_key should be a string")
+            .is_empty(),
         "an empty api_key is stored by the client and never questioned again: {body}"
     );
 
@@ -520,7 +524,9 @@ async fn a_poll_missing_a_header_does_not_erase_the_previously_reported_value() 
             &[("percent-charged", "72"), ("battery-voltage", "3900")],
         )
         .await;
-    harness.poll_with("kindle", &[("percent-charged", "70")]).await;
+    harness
+        .poll_with("kindle", &[("percent-charged", "70")])
+        .await;
 
     let status = harness.status().await;
     let telemetry = &status["kindle"]["telemetry"];
@@ -611,7 +617,10 @@ async fn absurdly_reported_placeholder_dimensions_are_clamped() {
     // not be able to ask the server to allocate an enormous buffer.
     let harness = Harness::start(ONE_DEVICE).await;
     let body = harness
-        .poll_with(UNKNOWN, &[("png-width", "999999"), ("png-height", "999999")])
+        .poll_with(
+            UNKNOWN,
+            &[("png-width", "999999"), ("png-height", "999999")],
+        )
         .await;
 
     let (status, bytes) = harness.get_bytes(&frame_path(&body)).await;

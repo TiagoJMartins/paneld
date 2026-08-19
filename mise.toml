@@ -17,3 +17,14 @@ run = "cargo test"
 [tasks.preview]
 description = "Render one device to a PNG and exit (usage: mise run preview <device> <out.png>)"
 run = "cargo run -- preview"
+
+[tasks.fmt]
+description = "Format all code"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Check formatting and lint with warnings denied"
+run = [
+    "cargo fmt --all --check",
+    "cargo clippy --all-targets --all-features -- -D warnings",
+]

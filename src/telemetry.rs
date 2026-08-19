@@ -140,7 +140,10 @@ mod tests {
 
     #[test]
     fn reads_nothing_from_an_empty_poll() {
-        assert_eq!(Telemetry::from_headers(&HeaderMap::new()), Telemetry::default());
+        assert_eq!(
+            Telemetry::from_headers(&HeaderMap::new()),
+            Telemetry::default()
+        );
     }
 
     #[test]
@@ -159,8 +162,14 @@ mod tests {
 
     #[test]
     fn accepts_either_battery_percent_spelling() {
-        assert_eq!(read(&[("percent-charged", "41")]).battery_percent, Some(41.0));
-        assert_eq!(read(&[("battery-percent", "41")]).battery_percent, Some(41.0));
+        assert_eq!(
+            read(&[("percent-charged", "41")]).battery_percent,
+            Some(41.0)
+        );
+        assert_eq!(
+            read(&[("battery-percent", "41")]).battery_percent,
+            Some(41.0)
+        );
     }
 
     #[test]
@@ -198,24 +207,39 @@ mod tests {
     #[test]
     fn user_agent_stands_in_when_fw_version_is_absent() {
         let telemetry = read(&[("user-agent", "KOReader/2024.10")]);
-        assert_eq!(telemetry.firmware_version.as_deref(), Some("KOReader/2024.10"));
+        assert_eq!(
+            telemetry.firmware_version.as_deref(),
+            Some("KOReader/2024.10")
+        );
     }
 
     #[test]
     fn integer_voltage_is_already_millivolts() {
-        assert_eq!(read(&[("battery-voltage", "3700")]).battery_millivolts, Some(3700.0));
+        assert_eq!(
+            read(&[("battery-voltage", "3700")]).battery_millivolts,
+            Some(3700.0)
+        );
     }
 
     #[test]
     fn decimal_voltage_is_scaled_to_millivolts() {
-        assert_eq!(read(&[("battery-voltage", "3.7")]).battery_millivolts, Some(3700.0));
+        assert_eq!(
+            read(&[("battery-voltage", "3.7")]).battery_millivolts,
+            Some(3700.0)
+        );
     }
 
     #[test]
     fn voltage_of_exactly_one_hundred_is_millivolts() {
-        assert_eq!(read(&[("battery-voltage", "100")]).battery_millivolts, Some(100.0));
+        assert_eq!(
+            read(&[("battery-voltage", "100")]).battery_millivolts,
+            Some(100.0)
+        );
         // Just under the boundary is still read as volts.
-        assert_eq!(read(&[("battery-voltage", "99")]).battery_millivolts, Some(99_000.0));
+        assert_eq!(
+            read(&[("battery-voltage", "99")]).battery_millivolts,
+            Some(99_000.0)
+        );
     }
 
     #[test]

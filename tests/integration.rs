@@ -6,8 +6,6 @@
 //! constructs the real HTTP client, so the `base_url` in these fixtures is never
 //! resolved let alone contacted.
 
-// The shared harness serves several test binaries; this one does not use all of it.
-#[allow(dead_code)]
 mod common;
 
 use std::collections::HashMap;
@@ -144,8 +142,10 @@ impl HaFixture {
     /// fixtures sharing a tag would share a content store and confound a
     /// byte-for-byte comparison.
     async fn start(toml: &str, tag: &str, answers: &[(&str, Result<&str, &str>)]) -> Self {
-        let content_path = std::env::temp_dir()
-            .join(format!("paneld-integration-{}-{tag}.json", std::process::id()));
+        let content_path = std::env::temp_dir().join(format!(
+            "paneld-integration-{}-{tag}.json",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&content_path);
 
         let mut config = paneld::config::parse(toml).expect("fixture config should be valid");
@@ -432,7 +432,11 @@ async fn rendering_one_device_leaves_the_other_devices_filename_alone() {
         kitchen_before,
         "kitchen was not rendered, so it must not be told to repaint"
     );
-    assert_eq!(harness.render_count("kitchen").await, 1, "startup render only");
+    assert_eq!(
+        harness.render_count("kitchen").await,
+        1,
+        "startup render only"
+    );
 }
 
 #[tokio::test]
@@ -527,7 +531,8 @@ async fn an_explicit_render_interval_is_independent_of_refresh_rate() {
         Harness::start(&cadence_fixture("refresh_rate = 300\nrender_interval = 5")).await;
 
     assert_eq!(
-        harness.poll("kindle").await["refresh_rate"], 300,
+        harness.poll("kindle").await["refresh_rate"],
+        300,
         "the device is still told to sleep for its own refresh_rate"
     );
     assert_eq!(

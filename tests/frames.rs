@@ -70,7 +70,10 @@ async fn a_push_without_render_does_not_change_the_filename_until_a_render_happe
     let before = harness.filename("kindle").await;
 
     // Both the explicit `false` and the field being absent.
-    for body in [json!({ "value": 11, "render": false }), json!({ "value": 12 })] {
+    for body in [
+        json!({ "value": 11, "render": false }),
+        json!({ "value": 12 }),
+    ] {
         let (status, _) = harness.put("/api/content/office_temp", body).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
@@ -169,7 +172,10 @@ async fn a_burst_of_pushes_collapses_into_one_render_per_device() {
     const PUSHES: u64 = 20;
     for value in 0..PUSHES {
         let (status, _) = harness
-            .put("/api/content/shared", json!({ "value": value, "render": true }))
+            .put(
+                "/api/content/shared",
+                json!({ "value": value, "render": true }),
+            )
             .await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -216,7 +222,12 @@ async fn every_device_has_a_real_frame_before_the_first_poll() {
 
         let body = harness.poll(device).await;
         let (status, bytes) = harness
-            .get_bytes(body["image_url"].as_str().unwrap().trim_start_matches("http://192.168.0.50:4444"))
+            .get_bytes(
+                body["image_url"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("http://192.168.0.50:4444"),
+            )
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
@@ -274,7 +285,10 @@ async fn exactly_one_previous_generation_stays_fetchable() {
         urls.push(url);
     }
 
-    let path = |url: &str| url.trim_start_matches("http://192.168.0.50:4444").to_owned();
+    let path = |url: &str| {
+        url.trim_start_matches("http://192.168.0.50:4444")
+            .to_owned()
+    };
 
     let (status, bytes) = harness.get_bytes(&path(&urls[2])).await;
     assert_eq!(status, StatusCode::OK, "the current frame");
@@ -366,7 +380,9 @@ async fn a_malformed_push_is_rejected_without_disturbing_what_is_stored() {
         .await;
 
     assert_eq!(
-        harness.put_raw("/api/content/office_temp", "{not json").await,
+        harness
+            .put_raw("/api/content/office_temp", "{not json")
+            .await,
         StatusCode::BAD_REQUEST
     );
     // Neither `value` nor `rows`: there is nothing to store.

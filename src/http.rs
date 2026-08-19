@@ -61,7 +61,10 @@ fn routes(runtime: Arc<Runtime>) -> Router {
         .route("/d/{device}/api/setup", get(setup))
         .route("/d/{device}/api/log", post(device_log))
         .route("/d/{device}/frames/{file}", get(frame_file))
-        .route("/api/content/{widget_id}", put(put_content).get(get_content))
+        .route(
+            "/api/content/{widget_id}",
+            put(put_content).get(get_content),
+        )
         .route("/api/status", get(status))
         .with_state(runtime)
 }
@@ -260,7 +263,11 @@ fn placeholder_response(
                 error = format!("{error:#}"),
                 "rendering the placeholder failed"
             );
-            (StatusCode::OK, Json(DisplayResponse::unavailable(refresh_rate))).into_response()
+            (
+                StatusCode::OK,
+                Json(DisplayResponse::unavailable(refresh_rate)),
+            )
+                .into_response()
         }
     }
 }

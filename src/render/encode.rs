@@ -213,7 +213,13 @@ fn diffuse(
 /// on its own value and its coordinates. That is what makes frames stable — a
 /// change in one part of the dashboard leaves every other pixel byte-identical,
 /// so the frame hash only moves when something visible actually moved.
-fn ordered_dither(linear: &mut [f32], w: usize, h: usize, spec: &PaletteSpec, targets: &Palette32F) {
+fn ordered_dither(
+    linear: &mut [f32],
+    w: usize,
+    h: usize,
+    spec: &PaletteSpec,
+    targets: &Palette32F,
+) {
     let grey_levels = spec.grayscale.then(|| spec.grey_ramp());
 
     for y in 0..h {
@@ -356,10 +362,9 @@ impl PaletteSpec {
             // Four entries need two bits.
             Palette::Bwry => Self::indexed(vec![BLACK, WHITE, RED, YELLOW], BitDepth::Two),
             // Six entries do not fit in two bits.
-            Palette::Spectra6 => Self::indexed(
-                vec![BLACK, WHITE, YELLOW, RED, BLUE, GREEN],
-                BitDepth::Four,
-            ),
+            Palette::Spectra6 => {
+                Self::indexed(vec![BLACK, WHITE, YELLOW, RED, BLUE, GREEN], BitDepth::Four)
+            }
         }
     }
 
@@ -606,11 +611,7 @@ mod tests {
             let after = levels_4bit(
                 &quantise_and_encode(&changed, 64, 64, Palette::Gray16, dither).unwrap(),
             );
-            before
-                .iter()
-                .zip(&after)
-                .filter(|(a, b)| a != b)
-                .count()
+            before.iter().zip(&after).filter(|(a, b)| a != b).count()
         };
 
         let ordered = differing(Dither::Bayer);
@@ -688,7 +689,9 @@ mod tests {
                 quantise_and_encode(&flat(16, 16, shade), 16, 16, Palette::Gray16, Dither::Bayer)
                     .unwrap();
             assert!(
-                levels_4bit(&bytes).iter().all(|&level| u32::from(level) == k),
+                levels_4bit(&bytes)
+                    .iter()
+                    .all(|&level| u32::from(level) == k),
                 "level {k} (sRGB {shade}) should round-trip exactly"
             );
         }
@@ -765,7 +768,10 @@ mod tests {
     fn frame_hash_is_thirty_two_lowercase_hex_characters() {
         let hash = frame_hash(b"anything");
         assert_eq!(hash.len(), 32);
-        assert!(hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        assert!(
+            hash.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
         assert_ne!(hash, frame_hash(b"anything else"));
     }
 

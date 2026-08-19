@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  assets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+
+      - run: mise run build
+
+      # One archive, for x86_64 glibc Linux. There is deliberately no musl build
+      # and no cross-compilation: both are out of scope for this project, so the
+      # binary is dynamically linked and needs a glibc at least as new as the one
+      # on the runner that built it. Run the container image instead if that does
+      # not suit the target host.
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stage="paneld-${version}-x86_64-unknown-linux-gnu"
+          mkdir "$stage"
+          cp target/release/paneld "$stage"/
+          cp paneld.example.toml LICENSE "$stage"/
+          # The embedded typefaces are OFL 1.1, which requires its licence to
+          # travel with any redistribution of the font — including inside a binary.
+          cp assets/fonts/*LICENSE*.txt "$stage"/
+          tar czf "$stage.tar.gz" "$stage"
+          sha256sum "$stage.tar.gz" > "$stage.tar.gz.sha256"
+          echo "archive=$stage.tar.gz" >> "$GITHUB_OUTPUT"
+          ldd --version | head -1
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      # GITHUB_TOKEN is enough to publish to this repository's own GHCR
+      # namespace; no personal access token is involved.
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          # Lowercased by the action, which matters because a GitHub owner may
+          # contain capitals and a registry reference may not.
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      # amd64 only, for the same reason there is one binary asset: emulated or
+      # cross builds are out of scope.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

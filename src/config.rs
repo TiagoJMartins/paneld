@@ -645,10 +645,7 @@ unit = "°C"
 
     #[test]
     fn strips_a_trailing_slash_from_the_public_base_url() {
-        let text = BASE.replace(
-            "http://192.168.0.50:4444",
-            "http://192.168.0.50:4444/",
-        );
+        let text = BASE.replace("http://192.168.0.50:4444", "http://192.168.0.50:4444/");
         assert_eq!(
             parse(&text).unwrap().server.public_base_url,
             "http://192.168.0.50:4444",
@@ -834,10 +831,12 @@ entity = "sensor.office_temperature"
         for palette in ["gray16", "gray4", "mono", "bwry", "spectra6"] {
             for dither in ["atkinson", "floyd-steinberg", "bayer", "none"] {
                 let text = BASE
-                    .replace(r#"palette = "gray16""#, &format!(r#"palette = "{palette}""#))
+                    .replace(
+                        r#"palette = "gray16""#,
+                        &format!(r#"palette = "{palette}""#),
+                    )
                     .replace(r#"dither = "atkinson""#, &format!(r#"dither = "{dither}""#));
-                parse(&text)
-                    .unwrap_or_else(|e| panic!("{palette}/{dither} should parse: {e:#}"));
+                parse(&text).unwrap_or_else(|e| panic!("{palette}/{dither} should parse: {e:#}"));
             }
         }
     }
@@ -855,7 +854,10 @@ entity = "sensor.office_temperature"
     #[test]
     fn rejects_a_grid_too_dense_for_its_panel() {
         // Not cosmetic: cells this small make the text layout engine panic.
-        let message = err(&BASE.replace("grid = { cols = 4, rows = 3 }", "grid = { cols = 40, rows = 3 }"));
+        let message = err(&BASE.replace(
+            "grid = { cols = 4, rows = 3 }",
+            "grid = { cols = 40, rows = 3 }",
+        ));
         assert!(message.contains("kindle"), "{message}");
         assert!(message.contains("cells"), "{message}");
     }
@@ -873,7 +875,10 @@ entity = "sensor.office_temperature"
         let text = BASE
             .replace("width = 1024", "width = 1")
             .replace("height = 758", "height = 1")
-            .replace("grid = { cols = 4, rows = 3 }", "grid = { cols = 1, rows = 1 }");
+            .replace(
+                "grid = { cols = 4, rows = 3 }",
+                "grid = { cols = 1, rows = 1 }",
+            );
         let message = err(&text);
         assert!(message.contains("cells"), "{message}");
     }
@@ -898,7 +903,10 @@ entity = "sensor.office_temperature"
 
     #[test]
     fn content_path_has_a_default_and_is_overridable() {
-        assert_eq!(parse(BASE).unwrap().server.content_path, "paneld-content.json");
+        assert_eq!(
+            parse(BASE).unwrap().server.content_path,
+            "paneld-content.json"
+        );
         let text = BASE.replace(
             "public_base_url =",
             "content_path = \"/var/lib/paneld/content.json\"\npublic_base_url =",
