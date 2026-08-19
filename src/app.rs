@@ -14,9 +14,11 @@ use tokio::sync::mpsc;
 use crate::config::{Config, Device};
 use crate::content::ContentStore;
 use crate::frame::{Frame, FrameStore};
-use crate::ha::{HaClient, HttpHaClient, Reading, fetch_readings};
+use crate::ha::{HaClient, HttpHaClient, LastGood, Reading, Reported, fetch_readings};
+use crate::icon;
 use crate::render::{self, RenderInputs};
 use crate::status::StatusStore;
+use crate::tap::{self, Taps};
 
 /// How many device ids the render loop's wake channel can hold before a sender
 /// gives up.
@@ -48,6 +50,19 @@ pub struct Runtime {
     pub status: StatusStore,
     fonts: Fonts,
     ha: Option<Box<dyn HaClient>>,
+    /// The last value successfully read for each Home Assistant reading, per
+    /// device, so a failed fetch mutes a cell instead of emptying it.
+    ///
+    /// Keyed by device because pruning is per device: each render folds one
+    /// device's results, and a shared map would evict the readings of every
+    /// device that was not being rendered.
+    last_good: Mutex<HashMap<String, LastGood>>,
+    /// Fetches and caches widget icons. `None` when the cache directory could not
+    /// be created, in which case cells render without icons rather than not at
+    /// all.
+    icons: Option<icon::Store>,
+    /// Recent tap event ids, so a client that retries does not act twice.
+    taps: Taps,
     wake_tx: mpsc::Sender<String>,
     /// Placeholders for unconfigured device ids, rendered on demand.
     placeholders: Mutex<HashMap<PlaceholderKey, Frame>>,
@@ -75,6 +90,20 @@ impl Runtime {
         let content = ContentStore::load(config.server.content_path.clone());
         let (wake_tx, wake_rx) = mpsc::channel(WAKE_CHANNEL_CAPACITY);
 
+        // A cache directory that cannot be created is logged once here rather than
+        // on every frame: icons then simply do not resolve, which costs decoration
+        // and nothing else.
+        let icons = match icon::Store::new(&config.server.icon_cache_path) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                tracing::error!(
+                    error = format!("{error:#}"),
+                    "widget icons are disabled for this run"
+                );
+                None
+            }
+        };
+
         let runtime = Arc::new(Self {
             config: RwLock::new(Arc::new(config)),
             content,
@@ -82,6 +111,9 @@ impl Runtime {
             status: StatusStore::new(),
             fonts: render::fonts().context("loading the embedded fonts")?,
             ha,
+            last_good: Mutex::new(HashMap::new()),
+            icons,
+            taps: Taps::new(),
             wake_tx,
             placeholders: Mutex::new(HashMap::new()),
         });
@@ -146,9 +178,10 @@ impl Runtime {
             .find(|device| device.id == device_id)
             .with_context(|| format!("device `{device_id}` is not configured"))?;
 
-        // Fetched before the pure render so that rendering itself stays
+        // Both fetched before the pure render so that rendering itself stays
         // synchronous and reproducible.
-        let ha_states = self.fetch_ha_states(device).await;
+        let ha_states = self.ha_states(device).await;
+        let icons = self.icons(device).await;
         let content = self.content.snapshot();
 
         // The layout engine asserts internally on degenerate geometry, so a panic
@@ -163,6 +196,7 @@ impl Runtime {
                     device,
                     content: &content,
                     ha_states: &ha_states,
+                    icons: &icons,
                     now,
                 },
             )
@@ -186,11 +220,12 @@ impl Runtime {
         Ok(changed)
     }
 
-    /// Resolves every Home Assistant entity this device's dashboard references.
+    /// Resolves every Home Assistant reading this device's dashboard references,
+    /// folded against what was last known good.
     ///
-    /// A missing client or a per-entity failure leaves that cell unavailable
-    /// rather than failing the frame.
-    async fn fetch_ha_states(&self, device: &Device) -> HashMap<Reading, Result<String, String>> {
+    /// A missing client or a per-reading failure leaves that cell showing its last
+    /// value, muted, rather than failing the frame.
+    async fn ha_states(&self, device: &Device) -> HashMap<Reading, Reported> {
         let readings: Vec<Reading> = device
             .widgets
             .iter()
@@ -206,13 +241,75 @@ impl Runtime {
             return HashMap::new();
         }
 
-        match &self.ha {
+        let results = match &self.ha {
             Some(client) => fetch_readings(client.as_ref(), &readings).await,
             None => readings
                 .into_iter()
                 .map(|reading| (reading, Err("Home Assistant is not configured".to_owned())))
                 .collect(),
+        };
+
+        self.last_good
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(device.id.clone())
+            .or_default()
+            .fold(results)
+    }
+
+    /// Resolves every icon this device's dashboard references.
+    ///
+    /// Keyed by the spec rather than by widget, so two cells asking for the same
+    /// icon share one fetch and one cache entry.
+    async fn icons(&self, device: &Device) -> HashMap<String, crate::icon::Icon> {
+        let Some(store) = &self.icons else {
+            return HashMap::new();
+        };
+        let specs: Vec<String> = device
+            .widgets
+            .iter()
+            .filter_map(|widget| widget.icon.clone())
+            .collect();
+        if specs.is_empty() {
+            return HashMap::new();
         }
+        store.fetch(&specs).await
+    }
+
+    /// Resolves a tap against a device's dashboard and performs whatever it names.
+    ///
+    /// Never fails and never writes a frame: a tap that changed something asks the
+    /// render loop for a rebuild like every other change, so the panel sees it at
+    /// its next poll rather than through a second, parallel render path.
+    pub async fn tap(
+        &self,
+        device_id: &str,
+        x: f32,
+        y: f32,
+        event_id: Option<&str>,
+    ) -> tap::Report {
+        let config = self.config();
+        let Some(device) = config.devices.iter().find(|device| device.id == device_id) else {
+            return tap::Report::bare(tap::Outcome::NoTarget);
+        };
+
+        // Deduplicated before the hit test, so a retry costs nothing and cannot act
+        // even when it lands squarely on a cell.
+        if let Some(event_id) = event_id
+            && self.taps.seen(device_id, event_id)
+        {
+            tracing::debug!(
+                device = device_id,
+                event = event_id,
+                "tap already handled; ignoring the repeat"
+            );
+            return tap::Report::bare(tap::Outcome::Deduped);
+        }
+
+        let Some(widget) = render::Layout::for_device(device).hit(device, x, y) else {
+            return tap::Report::bare(tap::Outcome::NoTarget);
+        };
+        tap::dispatch(self.ha.as_deref(), widget).await
     }
 
     /// Renders every configured device once.

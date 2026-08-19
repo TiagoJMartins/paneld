@@ -10,8 +10,11 @@
 //! on every poll.
 
 mod encode;
+mod grid;
+mod icon;
 
 pub use encode::{frame_hash, quantise_and_encode};
+pub use grid::Layout;
 
 use std::collections::HashMap;
 
@@ -21,7 +24,8 @@ use time::OffsetDateTime;
 
 use crate::config::{Device, Dither, Palette, Widget, WidgetKind};
 use crate::content::{ContentRecord, Row};
-use crate::ha::Reading;
+use crate::ha::{Reading, Reported};
+use crate::icon::Icon;
 
 /// Family name the UI text is registered and requested under.
 ///
@@ -38,38 +42,32 @@ const INTER_BOLD: &[u8] = include_bytes!("../assets/fonts/Inter-Bold.ttf");
 const MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf");
 const MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Bold.ttf");
 
-/// Gutter and cell padding, scaled to the cell rather than fixed.
+/// A unit's size relative to the figure it belongs to.
 ///
-/// Fixed spacing is a trap on a small panel or a dense grid: once padding exceeds
-/// the cell it is inside, the text layout engine is handed a negative content box
-/// and panics. Scaling keeps the content box positive for every grid a validated
-/// config can express.
-#[derive(Debug, Clone, Copy)]
-struct Spacing {
-    /// Between cells, and around the frame.
-    gutter: f32,
-    /// Inside a cell.
-    padding: f32,
-}
-
-impl Spacing {
-    fn for_cell(smallest_side: f32) -> Self {
-        Self {
-            gutter: (smallest_side * 0.06).clamp(1.0, 10.0),
-            padding: (smallest_side * 0.10).clamp(2.0, 12.0),
-        }
-    }
-}
+/// Slightly smaller, not much: the unit is part of the reading, and shrinking it
+/// to caption size makes `23.4 °C` read as a number with a footnote. Big enough
+/// to be read at the same glance, small enough that the number is still the thing
+/// the eye lands on.
+const UNIT_SCALE: f32 = 0.55;
 
 /// Everything one frame is rendered from.
+///
+/// Every field is already resolved: nothing here is fetched, and nothing reads a
+/// clock. That is what makes [`render_frame`] reproducible, which the device's
+/// filename-based frame cache depends on.
 pub struct RenderInputs<'a> {
     pub device: &'a Device,
     /// Pushed content, keyed by widget id.
     pub content: &'a HashMap<String, ContentRecord>,
-    /// Home Assistant entity states, keyed by entity id, fetched by the caller so
-    /// that rendering itself stays pure and synchronous. A per-entity `Err`
-    /// degrades that one cell.
-    pub ha_states: &'a HashMap<Reading, Result<String, String>>,
+    /// Home Assistant readings, keyed by what was read. A reading the latest
+    /// request failed to confirm arrives as [`Reported::Held`], carrying the last
+    /// value that was, so one unreachable integration mutes a cell rather than
+    /// emptying it.
+    pub ha_states: &'a HashMap<Reading, Reported>,
+    /// Resolved widget icons, keyed by the `icon` spec that asked for them. A
+    /// spec absent from this map could not be resolved, and its cell simply
+    /// renders without an icon.
+    pub icons: &'a HashMap<String, Icon>,
     /// The instant staleness is measured against. A parameter rather than a call
     /// to `now_utc()` so a frame is reproducible.
     pub now: OffsetDateTime,
@@ -109,7 +107,7 @@ pub fn fonts() -> Result<Fonts> {
 /// Renders one device's dashboard to encoded PNG bytes.
 pub fn render_frame(fonts: &Fonts, inputs: RenderInputs<'_>) -> Result<Vec<u8>> {
     let device = inputs.device;
-    let node = dashboard_node(&inputs);
+    let node = dashboard_node(fonts, &inputs);
     let raster = rasterise(fonts, node, device.width, device.height)?;
     let bytes = quantise_and_encode(
         &raster,
@@ -220,27 +218,16 @@ fn rasterise(fonts: &Fonts, node: Node, width: u32, height: u32) -> Result<Vec<u
 }
 
 /// The whole dashboard: a CSS grid container with one child per widget.
-fn dashboard_node(inputs: &RenderInputs<'_>) -> Node {
+fn dashboard_node(fonts: &Fonts, inputs: &RenderInputs<'_>) -> Node {
     let device = inputs.device;
     let grid = device.grid;
-
-    let spacing = Spacing::for_cell(
-        (device.width as f32 / grid.cols as f32).min(device.height as f32 / grid.rows as f32),
-    );
-
-    // Usable cell size, needed to scale type to the cell rather than fixing it.
-    let cell_w =
-        (device.width as f32 - spacing.gutter * (grid.cols + 1) as f32).max(1.0) / grid.cols as f32;
-    let cell_h = (device.height as f32 - spacing.gutter * (grid.rows + 1) as f32).max(1.0)
-        / grid.rows as f32;
+    let layout = Layout::for_device(device);
+    let gutter = layout.gutter();
 
     let children = device
         .widgets
         .iter()
-        .map(|widget| {
-            let body = resolve(widget, inputs);
-            cell_node(widget, &body, cell_w, cell_h, spacing)
-        })
+        .map(|widget| cell_node(fonts, widget, &resolve(widget, inputs), inputs, &layout))
         .collect::<Vec<_>>();
 
     Node::container(children).with_style(
@@ -258,15 +245,13 @@ fn dashboard_node(inputs: &RenderInputs<'_>) -> Node {
                 grid.rows,
             ))))
             .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
-                spacing.gutter,
+                gutter,
             ))))
-            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(
-                spacing.gutter,
-            ))))
-            .with(StyleDeclaration::padding_top(Length::Px(spacing.gutter)))
-            .with(StyleDeclaration::padding_right(Length::Px(spacing.gutter)))
-            .with(StyleDeclaration::padding_bottom(Length::Px(spacing.gutter)))
-            .with(StyleDeclaration::padding_left(Length::Px(spacing.gutter)))
+            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(gutter))))
+            .with(StyleDeclaration::padding_top(Length::Px(gutter)))
+            .with(StyleDeclaration::padding_right(Length::Px(gutter)))
+            .with(StyleDeclaration::padding_bottom(Length::Px(gutter)))
+            .with(StyleDeclaration::padding_left(Length::Px(gutter)))
             .with(StyleDeclaration::background_color(paper()))
             .with(StyleDeclaration::color(ink()))
             .with(StyleDeclaration::font_family(family(UI_FAMILY))),
@@ -281,31 +266,34 @@ fn equal_tracks(n: u32) -> GridTemplateComponents {
 }
 
 /// One widget's cell, placed explicitly on the grid.
-fn cell_node(widget: &Widget, body: &Body, cell_w: f32, cell_h: f32, spacing: Spacing) -> Node {
+fn cell_node(
+    fonts: &Fonts,
+    widget: &Widget,
+    cell: &Cell,
+    inputs: &RenderInputs<'_>,
+    layout: &Layout,
+) -> Node {
+    let (cell_w, cell_h) = layout.cell();
     let span_w = cell_w * widget.col_span as f32;
     let span_h = cell_h * widget.row_span as f32;
-    let label_px = (span_h * 0.13).clamp(11.0, 24.0);
+    let label_px = (span_h * 0.13).clamp(11.0, 32.0);
+    let padding = layout.padding();
+    // What a cell's contents actually have to fit inside, which is the span less
+    // its own padding and the hairline rule on each side.
+    let content_w = (span_w - padding * 2.0 - 2.0).max(1.0);
 
-    let mut children = Vec::new();
-    if let Some(label) = &widget.label {
-        children.push(text_node(
-            label,
-            one_line(
-                text_style(label_px, 700.0, UI_FAMILY)
-                    .with(StyleDeclaration::color(muted()))
-                    .with(StyleDeclaration::letter_spacing(Length::Px(
-                        label_px * 0.06,
-                    )))
-                    .with(StyleDeclaration::text_transform(TextTransform::Uppercase)),
-            ),
-        ));
-    }
-    // The body sits in its own growing box so that the label is pinned to the top
+    let mut children = vec![header_node(
+        fonts, widget, cell, inputs, content_w, label_px,
+    )];
+    // The body sits in its own growing box so that the header is pinned to the top
     // of every cell while the body is centred in whatever space is left. Laying
     // both out in one column instead would centre them as a group, which makes a
     // label's height depend on how tall its neighbour's content happens to be.
     children.push(
-        Node::container(body_nodes(body, span_w, span_h, label_px)).with_style(
+        Node::container(body_nodes(
+            fonts, &cell.body, cell.ink, content_w, span_h, label_px,
+        ))
+        .with_style(
             Style::default()
                 .with(StyleDeclaration::display(Display::Flex))
                 .with(StyleDeclaration::flex_direction(FlexDirection::Column))
@@ -328,12 +316,10 @@ fn cell_node(widget: &Widget, body: &Body, cell_w: f32, cell_h: f32, spacing: Sp
             .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(
                 (span_h * 0.03).clamp(2.0, 8.0),
             ))))
-            .with(StyleDeclaration::padding_top(Length::Px(spacing.padding)))
-            .with(StyleDeclaration::padding_right(Length::Px(spacing.padding)))
-            .with(StyleDeclaration::padding_bottom(Length::Px(
-                spacing.padding,
-            )))
-            .with(StyleDeclaration::padding_left(Length::Px(spacing.padding)))
+            .with(StyleDeclaration::padding_top(Length::Px(padding)))
+            .with(StyleDeclaration::padding_right(Length::Px(padding)))
+            .with(StyleDeclaration::padding_bottom(Length::Px(padding)))
+            .with(StyleDeclaration::padding_left(Length::Px(padding)))
             .with(StyleDeclaration::border_top_width(hairline()))
             .with(StyleDeclaration::border_right_width(hairline()))
             .with(StyleDeclaration::border_bottom_width(hairline()))
@@ -357,6 +343,92 @@ fn cell_node(widget: &Widget, body: &Body, cell_w: f32, cell_h: f32, spacing: Sp
     )
 }
 
+/// The strip across the top of a cell: its icon and label on the left, and on
+/// the right the mark that says the value below is not confirmed current.
+///
+/// Always emitted, even for a cell with no label and no icon, because the mark
+/// has to have somewhere to sit. An empty header collapses to nothing taller than
+/// its own zero-height children, so it costs an unlabelled cell no space.
+fn header_node(
+    fonts: &Fonts,
+    widget: &Widget,
+    cell: &Cell,
+    inputs: &RenderInputs<'_>,
+    content_w: f32,
+    label_px: f32,
+) -> Node {
+    let icon = widget.icon.as_ref().and_then(|spec| inputs.icons.get(spec));
+    // Kept inside the label's own line box, so a cell going stale does not grow its
+    // header and shove the value down. A dashboard where cells shift as sensors
+    // come and go reads as broken even when every number on it is right.
+    let mark_w = match cell.ink {
+        Ink::Held => (label_px * 1.15).min(content_w * 0.2),
+        Ink::Current => 0.0,
+    };
+    // Sized to the label rather than to the cell, so an icon and its label read as
+    // one line of chrome however tall the cell is.
+    let icon_w = icon.map_or(0.0, |_| label_px * 1.15 + label_px * 0.35);
+    let label_w = (content_w - mark_w - icon_w - label_px * 0.3).max(1.0);
+
+    let mut left = Vec::new();
+    if let Some(icon) = icon {
+        left.push(icon_node(icon, label_px * 1.15, cell.ink));
+    }
+    if let Some(label) = &widget.label {
+        left.push(fitted(fonts, label_w, label_px, |size| {
+            text_node(
+                label,
+                one_line(
+                    text_style(size, 700.0, UI_FAMILY)
+                        .with(StyleDeclaration::color(muted()))
+                        .with(StyleDeclaration::letter_spacing(Length::Px(size * 0.06)))
+                        .with(StyleDeclaration::text_transform(TextTransform::Uppercase)),
+                ),
+            )
+        }));
+    }
+
+    let mut children = vec![
+        Node::container(left).with_style(
+            Style::default()
+                .with(StyleDeclaration::display(Display::Flex))
+                .with(StyleDeclaration::flex_direction(FlexDirection::Row))
+                .with(StyleDeclaration::align_items(AlignItems::Center))
+                .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
+                    label_px * 0.35,
+                ))))
+                // Shrinks before the mark does: the label has already been sized to
+                // fit, so if anything still has to give it should not be the mark,
+                // which is the only thing saying the value cannot be trusted.
+                .with(StyleDeclaration::flex_shrink(Some(FlexGrow(1.0)))),
+        ),
+    ];
+    if cell.ink == Ink::Held {
+        children.push(icon_node(
+            &Icon::Svg {
+                markup: icon::NOT_CONFIRMED.to_owned(),
+                ink: None,
+            },
+            mark_w,
+            Ink::Held,
+        ));
+    }
+
+    Node::container(children).with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::flex_direction(FlexDirection::Row))
+            .with(StyleDeclaration::justify_content(
+                JustifyContent::SpaceBetween,
+            ))
+            .with(StyleDeclaration::align_items(AlignItems::Center))
+            .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
+                label_px * 0.3,
+            ))))
+            .with(StyleDeclaration::width(Length::Percentage(100.0))),
+    )
+}
+
 /// A zero-based grid coordinate as a CSS grid line.
 ///
 /// Grid lines are 1-based, so line `n` is the start edge of cell `n`. Config
@@ -367,34 +439,65 @@ fn line(coordinate: u32) -> GridPlacement {
     GridPlacement::Line(coordinate as i16 + 1)
 }
 
-/// The nodes that make up a cell below its label.
-fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node> {
-    let figure_px = (span_h * 0.40).clamp(18.0, 108.0);
-    let prose_px = (span_h * 0.11).clamp(12.0, 26.0);
+/// The nodes that make up a cell below its header.
+fn body_nodes(
+    fonts: &Fonts,
+    body: &Body,
+    ink: Ink,
+    content_w: f32,
+    span_h: f32,
+    label_px: f32,
+) -> Vec<Node> {
+    let figure_px = (span_h * 0.40).clamp(18.0, 168.0);
+    let prose_px = (span_h * 0.11).clamp(12.0, 34.0);
 
     match body {
         Body::Figure { text, unit } => {
-            // The figure is sized down as it gets longer so a five-digit reading
-            // still fits the cell it was laid out for.
-            // 1.40 rather than a tighter fit to the glyph advance: a long reading
-            // should keep visible air between itself and the cell rule, or it reads
-            // as having overflowed even when it technically fits.
-            let width_limited = span_w * 1.40 / text.chars().count().max(1) as f32;
-            let size = figure_px.min(width_limited).max(14.0);
-            let mut nodes = vec![text_node(
-                text,
-                one_line(text_style(size, 700.0, NUMERIC_FAMILY)),
-            )];
-            if let Some(unit) = unit {
-                nodes.push(text_node(
-                    unit,
-                    one_line(
-                        text_style((size * 0.30).max(11.0), 400.0, UI_FAMILY)
-                            .with(StyleDeclaration::color(muted())),
+            vec![fitted(fonts, content_w, figure_px, |size| {
+                figure_node(text, unit.as_deref(), ink, size)
+            })]
+        }
+
+        Body::Sky { svg, condition } => {
+            // The icon *is* the reading here, so it takes the space a figure would
+            // and the words are its caption rather than the other way round. The
+            // pair is centred in the cell as one block: left-aligned, a big glyph
+            // with a short caption under one corner of it reads as two unrelated
+            // things that happen to share a box.
+            let glyph = (span_h * 0.46).min(content_w * 0.72).max(16.0);
+            let caption_px = (span_h * 0.12).clamp(11.0, 34.0);
+            vec![
+                Node::container(vec![
+                    icon_node(
+                        &Icon::Svg {
+                            markup: (*svg).to_owned(),
+                            ink: None,
+                        },
+                        glyph,
+                        ink,
                     ),
-                ));
-            }
-            nodes
+                    fitted(fonts, content_w, caption_px, |size| {
+                        text_node(
+                            condition,
+                            one_line(
+                                text_style(size, 400.0, UI_FAMILY)
+                                    .with(StyleDeclaration::color(ink.colour())),
+                            ),
+                        )
+                    }),
+                ])
+                .with_style(
+                    Style::default()
+                        .with(StyleDeclaration::display(Display::Flex))
+                        .with(StyleDeclaration::flex_direction(FlexDirection::Column))
+                        .with(StyleDeclaration::align_items(AlignItems::Center))
+                        .with(StyleDeclaration::justify_content(JustifyContent::Center))
+                        .with(StyleDeclaration::width(Length::Percentage(100.0)))
+                        .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(
+                            caption_px * 0.5,
+                        )))),
+                ),
+            ]
         }
 
         Body::Beacon { on } => {
@@ -412,7 +515,7 @@ fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node>
                             .with(StyleDeclaration::border_bottom_right_radius(radius(dot)))
                             .with(StyleDeclaration::border_bottom_left_radius(radius(dot)))
                             .with(StyleDeclaration::background_color(if *on {
-                                ink()
+                                ink.colour()
                             } else {
                                 paper()
                             }))
@@ -432,14 +535,24 @@ fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node>
                             .with(StyleDeclaration::border_right_style(BorderStyle::Solid))
                             .with(StyleDeclaration::border_bottom_style(BorderStyle::Solid))
                             .with(StyleDeclaration::border_left_style(BorderStyle::Solid))
-                            .with(StyleDeclaration::border_top_color(ink()))
-                            .with(StyleDeclaration::border_right_color(ink()))
-                            .with(StyleDeclaration::border_bottom_color(ink()))
-                            .with(StyleDeclaration::border_left_color(ink())),
+                            .with(StyleDeclaration::border_top_color(ink.colour()))
+                            .with(StyleDeclaration::border_right_color(ink.colour()))
+                            .with(StyleDeclaration::border_bottom_color(ink.colour()))
+                            .with(StyleDeclaration::border_left_color(ink.colour())),
                     ),
-                    text_node(
-                        if *on { "ON" } else { "OFF" },
-                        one_line(text_style((dot * 0.78).max(13.0), 700.0, UI_FAMILY)),
+                    fitted(
+                        fonts,
+                        (content_w - dot * 1.5).max(1.0),
+                        (dot * 0.78).max(13.0),
+                        |size| {
+                            text_node(
+                                if *on { "ON" } else { "OFF" },
+                                one_line(
+                                    text_style(size, 700.0, UI_FAMILY)
+                                        .with(StyleDeclaration::color(ink.colour())),
+                                ),
+                            )
+                        },
                     ),
                 ])
                 .with_style(
@@ -459,6 +572,7 @@ fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node>
             vec![text_node(
                 text,
                 text_style(prose_px, 400.0, UI_FAMILY)
+                    .with(StyleDeclaration::color(ink.colour()))
                     .with(StyleDeclaration::line_height(LineHeight::Unitless(1.3)))
                     // Bounded so a long push is clipped to the cell instead of
                     // pushing the layout around.
@@ -473,7 +587,7 @@ fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node>
             let row_px = (span_h / (rows.len().max(1) as f32 + 1.6)).clamp(11.0, 30.0);
             let children = rows
                 .iter()
-                .map(|row| row_node(row, row_px))
+                .map(|row| row_node(row, row_px, ink))
                 .collect::<Vec<_>>();
             vec![
                 Node::container(children).with_style(
@@ -488,34 +602,234 @@ fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node>
             ]
         }
 
-        Body::Stale { since } => vec![
-            text_node(
-                "last seen",
-                one_line(
-                    text_style((span_h * 0.11).clamp(11.0, 20.0), 400.0, UI_FAMILY)
-                        .with(StyleDeclaration::color(muted())),
-                ),
-            ),
-            text_node(
-                since,
-                one_line(
-                    text_style((span_h * 0.20).clamp(14.0, 40.0), 700.0, UI_FAMILY)
-                        .with(StyleDeclaration::color(muted())),
-                ),
-            ),
-        ],
-
-        Body::Absent(reason) => vec![text_node(
-            reason,
-            text_style((span_h * 0.14).clamp(12.0, 26.0), 400.0, UI_FAMILY)
-                .with(StyleDeclaration::color(muted()))
-                .with(StyleDeclaration::max_lines(Some(2))),
+        Body::Absent(reason) => vec![fitted(
+            fonts,
+            content_w,
+            (span_h * 0.14).clamp(12.0, 30.0),
+            |size| {
+                text_node(
+                    reason,
+                    one_line(
+                        text_style(size, 400.0, UI_FAMILY).with(StyleDeclaration::color(muted())),
+                    ),
+                )
+            },
         )],
     }
 }
 
+/// A large figure with its unit set beside it.
+///
+/// The unit shares the figure's line and sits on its baseline, at a little over
+/// half its size. Stacking it underneath, as this once did, reads as a caption
+/// about the number rather than as part of it — `23.4` and `°C` are one reading,
+/// and a panel should say so the way a thermometer does.
+///
+/// Takes its size rather than choosing one: [`fitted`] decides that, so the unit
+/// is measured into the fit rather than estimated around it.
+fn figure_node(text: &str, unit: Option<&str>, ink: Ink, size: f32) -> Node {
+    let mut children = vec![text_node(
+        text,
+        one_line(
+            text_style(size, 700.0, NUMERIC_FAMILY).with(StyleDeclaration::color(ink.colour())),
+        ),
+    )];
+    if let Some(unit) = unit {
+        children.push(
+            // Nudged up by the difference in descender depth. `align_items: End`
+            // aligns the two runs' *boxes*, and each run's baseline sits its own
+            // descender above its box bottom — so the smaller run lands low by
+            // exactly the difference. `AlignItems::Baseline` is the property that
+            // should do this, but it leaves the unit sitting visibly below the
+            // figure, so the correction is applied here where it can be seen and
+            // checked.
+            Node::container(vec![text_node(
+                unit,
+                one_line(
+                    text_style(size * UNIT_SCALE, 400.0, UI_FAMILY)
+                        .with(StyleDeclaration::color(ink.colour())),
+                ),
+            )])
+            .with_style(
+                Style::default()
+                    .with(StyleDeclaration::display(Display::Flex))
+                    .with(StyleDeclaration::padding_bottom(Length::Px(
+                        size * (1.0 - UNIT_SCALE) * UNIT_BASELINE_LIFT,
+                    ))),
+            ),
+        );
+    }
+
+    Node::container(children).with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::flex_direction(FlexDirection::Row))
+            .with(StyleDeclaration::align_items(AlignItems::End))
+            .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
+                size * 0.06,
+            )))),
+    )
+}
+
+/// How far the unit must be lifted to share the figure's baseline, as a fraction
+/// of the size difference between the two runs.
+///
+/// Two runs in a row are laid out with their boxes bottom-aligned, and each run's
+/// baseline sits a fixed fraction of its own font size above its box bottom — so
+/// the smaller run lands low in proportion to how much smaller it is. That makes
+/// the correction exactly linear in `size * (1 - UNIT_SCALE)`, which is why one
+/// coefficient covers every size.
+///
+/// Measured rather than derived from the faces' metrics: the value that matters is
+/// the layout engine's line box, not the font's declared descender, and the two
+/// are not the same number. `a_unit_sits_on_the_figures_baseline` is what pins it.
+const UNIT_BASELINE_LIFT: f32 = 0.279;
+
+/// Smallest type this will shrink to, in pixels.
+///
+/// A floor rather than an assertion that everything fits: past this the glyphs
+/// stop being readable on the glass, and a reading nobody can read is no better
+/// than one that overflows. A value long enough to hit this is a config or
+/// publisher problem, and it should look like one.
+const MIN_TYPE_PX: f32 = 12.0;
+
+/// Builds a run at the largest size, up to `design`, at which it fits `available`
+/// pixels wide.
+///
+/// Measured, not estimated. The estimate this replaces assumed a fixed advance per
+/// character, which in a proportional face is wrong by more than a factor of two
+/// between `1` and `W`: it shrank readings that would have fitted and let wide ones
+/// overflow, where the one-line bound then cut them off mid-glyph. A clipped
+/// reading is the worst failure a panel has, because it looks like a value rather
+/// than like an error.
+fn fitted(fonts: &Fonts, available: f32, design: f32, build: impl Fn(f32) -> Node) -> Node {
+    let intrinsic = intrinsic_width(fonts, build(design));
+    let size = fit_size(intrinsic, available, design);
+    if size == design {
+        return build(design);
+    }
+    build(size)
+}
+
+/// The size a run measuring `intrinsic` pixels wide at `design` should be set at
+/// to fit `available`.
+///
+/// One corrective step is exact rather than iterative, because a text run's
+/// advance is proportional to its font size: the ratio of overflow *is* the ratio
+/// to shrink by. The result is shaved slightly, because a run set to exactly the
+/// space it has is a rounding error away from wrapping.
+///
+/// The readable floor is itself bounded by `design`. A grid dense enough to put a
+/// cell's design size under [`MIN_TYPE_PX`] is legal configuration, and a floor
+/// above the ceiling is a panic rather than a small glyph.
+fn fit_size(intrinsic: f32, available: f32, design: f32) -> f32 {
+    if intrinsic <= available || intrinsic <= 0.0 {
+        return design;
+    }
+    (design * available / intrinsic * 0.99).clamp(MIN_TYPE_PX.min(design), design)
+}
+
+/// How wide a node wants to be, with nothing constraining it.
+///
+/// Measured in a viewport far wider than any panel so that no wrapping or
+/// shrink-to-fit has kicked in: the answer wanted here is the run's natural
+/// advance, not what it would do in a box. Returns `0.0` if measurement fails,
+/// which leaves the design size in place — the same outcome as before this
+/// existed, and better than refusing to draw the cell.
+fn intrinsic_width(fonts: &Fonts, node: Node) -> f32 {
+    let options = RenderOptions::builder()
+        .viewport(Viewport::new((crate::config::MAX_DIMENSION * 8, 1)))
+        .node(node)
+        .fonts(fonts)
+        .build();
+    takumi::measure(options)
+        .map(|measured| measured.width)
+        .unwrap_or(0.0)
+}
+
+/// A grey level as a colour, for an icon that asked for one.
+fn grey_ink(level: u8) -> ColorInput {
+    ColorInput::Value(Color([level, level, level, 255]))
+}
+
+/// A square icon node, drawn in `ink` unless the icon asked for a grey of its own.
+///
+/// SVG markup is handed to the rasteriser with the colour injected as a root
+/// `color` presentation attribute rather than left to the cascade. takumi resolves
+/// `currentColor` against the SVG root's own `color` when one is set, so this makes
+/// an icon's colour a property of the node that asked for it — which is what lets
+/// the same weather glyph draw black in a live cell and grey in a held one.
+///
+/// A held cell always wins over an icon's own grey. The muting is what the corner
+/// mark means, and an icon that stayed its configured colour would undercut it.
+fn icon_node(icon: &Icon, size: f32, ink: Ink) -> Node {
+    let data = match icon {
+        Icon::Svg { markup, ink: own } => {
+            let colour = match (ink, own) {
+                (Ink::Current, Some(grey)) => grey_ink(*grey),
+                _ => ink.colour(),
+            };
+            ImageData {
+                src: ImageSourceInput::Url(paint_svg(markup, colour).into()),
+                width: None,
+                height: None,
+            }
+        }
+        Icon::Raster {
+            data,
+            width,
+            height,
+        } => match RgbaImage::new(data.clone(), *width, *height, false) {
+            Ok(raw) => ImageData {
+                src: ImageSourceInput::Rgba(raw),
+                width: None,
+                height: None,
+            },
+            // Decoding already checked the buffer against the dimensions, so this
+            // is unreachable from a real icon; an empty box is still better than a
+            // panic in the render task.
+            Err(_) => return Node::container(Vec::new()),
+        },
+    };
+
+    Node::image(data).with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::width(Length::Px(size)))
+            .with(StyleDeclaration::height(Length::Px(size)))
+            .with(StyleDeclaration::flex_shrink(Some(FlexGrow(0.0))))
+            .with(StyleDeclaration::object_fit(ObjectFit::Contain)),
+    )
+}
+
+/// Injects a `color` presentation attribute on an SVG's root element.
+///
+/// Written as a string edit rather than through a parsed tree because the
+/// rasteriser takes markup: it parses this once and caches by content, so handing
+/// it text is the cheap path as well as the simple one.
+fn paint_svg(markup: &str, colour: ColorInput) -> String {
+    let ColorInput::Value(Color([red, green, blue, alpha])) = colour else {
+        return markup.to_owned();
+    };
+    let Some(open) = markup.find("<svg") else {
+        return markup.to_owned();
+    };
+    let at = open + "<svg".len();
+    // Only when the tag really ends there, so `<svgfoo` is left alone.
+    if !matches!(markup[at..].chars().next(), Some(c) if c == '>' || c == '/' || c.is_whitespace())
+    {
+        return markup.to_owned();
+    }
+    format!(
+        "{}{}{}",
+        &markup[..at],
+        format_args!(" color=\"#{red:02x}{green:02x}{blue:02x}{alpha:02x}\""),
+        &markup[at..]
+    )
+}
+
 /// One line of a multi-reading widget: label on the left, value on the right.
-fn row_node(row: &Row, size: f32) -> Node {
+fn row_node(row: &Row, size: f32, ink: Ink) -> Node {
     let label = row
         .label
         .clone()
@@ -532,7 +846,12 @@ fn row_node(row: &Row, size: f32) -> Node {
             &label,
             one_line(text_style(size, 400.0, UI_FAMILY).with(StyleDeclaration::color(muted()))),
         ),
-        text_node(&value, one_line(text_style(size, 700.0, NUMERIC_FAMILY))),
+        text_node(
+            &value,
+            one_line(
+                text_style(size, 700.0, NUMERIC_FAMILY).with(StyleDeclaration::color(ink.colour())),
+            ),
+        ),
     ])
     .with_style(
         Style::default()
@@ -609,43 +928,93 @@ fn rule() -> ColorInput {
 /// Extracted from node building so that "what should this cell say" is decided
 /// once, in one readable place, rather than tangled through style declarations.
 #[derive(Debug, Clone, PartialEq)]
+struct Cell {
+    body: Body,
+    ink: Ink,
+}
+
+/// How much a cell's contents can be trusted.
+///
+/// A cell renders its last known value either way; this is what stops that being
+/// a lie. A held value is drawn in the secondary grey and its cell carries a mark,
+/// so "21.4, as of the last time we could ask" is visibly not "21.4, now".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ink {
+    /// Confirmed by the request or push that produced this frame.
+    Current,
+    /// The last value that was confirmed, kept because the newest attempt to
+    /// confirm it failed.
+    Held,
+}
+
+impl Ink {
+    fn colour(self) -> ColorInput {
+        match self {
+            Self::Current => ink(),
+            Self::Held => muted(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum Body {
     /// A large figure with an optional unit.
     Figure { text: String, unit: Option<String> },
+    /// A weather condition: its icon, and its name underneath.
+    Sky {
+        svg: &'static str,
+        condition: String,
+    },
     /// A two-state indicator.
     Beacon { on: bool },
     /// Free text, wrapped to the cell.
     Prose(String),
     /// A small group of related readings.
     Rows(Vec<Row>),
-    /// The publisher has gone quiet: how long ago it was last seen, never the
-    /// last value styled as though it were current.
-    Stale { since: String },
-    /// Nothing has ever been pushed, or the integration could not be reached.
+    /// Nothing has ever been pushed, or nothing has ever been read.
+    ///
+    /// Distinct from a held value, and the distinction is the point: "no data"
+    /// says a publisher has never spoken, which is a wiring problem, whereas a
+    /// muted value with a mark says the source is known but currently unreachable.
     Absent(&'static str),
 }
 
-fn resolve(widget: &Widget, inputs: &RenderInputs<'_>) -> Body {
-    if widget.kind == WidgetKind::HaEntity {
-        return resolve_ha(widget, inputs);
+fn resolve(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
+    match widget.kind {
+        WidgetKind::HaEntity | WidgetKind::Weather => resolve_ha(widget, inputs),
+        _ => resolve_pushed(widget, inputs),
     }
+}
 
+/// A cell fed by `PUT /api/content/{id}`.
+fn resolve_pushed(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
     let Some(record) = inputs.content.get(&widget.id) else {
-        return Body::Absent("no data");
+        return Cell {
+            body: Body::Absent("no data"),
+            ink: Ink::Current,
+        };
     };
 
-    if let Some(since) = staleness(widget, record, inputs.now) {
-        return Body::Stale { since };
-    }
+    // A publisher that has gone quiet past its `stale_after` keeps its last value
+    // on the glass, muted and marked. It is still the most recent thing anyone
+    // said, and replacing it with a countdown throws away the only information
+    // the cell had.
+    let ink = match is_stale(widget, record, inputs.now) {
+        true => Ink::Held,
+        false => Ink::Current,
+    };
 
     // `rows` is a presentation override available to any kind: when it is present
     // the scalar `value` is ignored, which is what lets one widget show a small
     // group of related readings.
     if let Some(rows) = &record.rows {
-        return Body::Rows(rows.clone());
+        return Cell {
+            body: Body::Rows(rows.clone()),
+            ink,
+        };
     }
 
-    match widget.kind {
+    let body = match widget.kind {
         WidgetKind::Value => Body::Figure {
             text: value_text(&record.value),
             unit: record.unit.clone().or_else(|| widget.unit.clone()),
@@ -654,70 +1023,73 @@ fn resolve(widget: &Widget, inputs: &RenderInputs<'_>) -> Body {
             on: beacon_is_on(record, &widget.on_values),
         },
         WidgetKind::Text => Body::Prose(value_text(&record.value)),
-        WidgetKind::HaEntity => unreachable!("handled above"),
-    }
+        WidgetKind::HaEntity | WidgetKind::Weather => unreachable!("handled by resolve_ha"),
+    };
+    Cell { body, ink }
 }
 
-/// An `ha_entity` cell. A fetch failure degrades this cell only: the frame still
-/// renders, because one unreachable integration must not blank the dashboard.
-fn resolve_ha(widget: &Widget, inputs: &RenderInputs<'_>) -> Body {
+/// A cell read from Home Assistant. A fetch failure degrades this cell only: the
+/// frame still renders, because one unreachable integration must not blank the
+/// dashboard.
+fn resolve_ha(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
     let Some(entity) = &widget.entity else {
         // Config validation rejects this, so it cannot happen from a config file.
-        return Body::Absent("no entity");
+        return Cell {
+            body: Body::Absent("no entity"),
+            ink: Ink::Current,
+        };
     };
     let reading = match &widget.attribute {
         Some(attribute) => Reading::attribute(entity, attribute),
         None => Reading::state(entity),
     };
-    match inputs.ha_states.get(&reading) {
-        // Home Assistant reports a missing or dropped-out entity as the literal
-        // state `unavailable` or `unknown`. Rendering that as a figure would put
-        // the word where a number goes, in the confident numeric style — the same
-        // mistake as showing a dead publisher's last value as though it were
-        // current. It is an absence, so it is drawn as one.
-        Some(Ok(value)) if is_sentinel(value) => Body::Absent("unavailable"),
-        Some(Ok(value)) => Body::Figure {
-            text: value.clone(),
+
+    let (value, ink) = match inputs.ha_states.get(&reading) {
+        Some(Reported::Fresh(value)) => (value.as_str(), Ink::Current),
+        Some(Reported::Held(value)) => (value.as_str(), Ink::Held),
+        // Nothing was ever read. A missing key means the caller never asked,
+        // which for a validated config means Home Assistant is not configured.
+        Some(Reported::Lost) | None => {
+            return Cell {
+                body: Body::Absent("no data"),
+                ink: Ink::Held,
+            };
+        }
+    };
+
+    let body = match widget.kind {
+        WidgetKind::Weather => match icon::Condition::parse(value) {
+            Some(condition) => Body::Sky {
+                svg: condition.svg(),
+                condition: condition.label().to_owned(),
+            },
+            // An unrecognised condition still shows what Home Assistant said,
+            // because a new condition slug is a thing to notice rather than hide.
+            None => Body::Sky {
+                svg: icon::UNKNOWN_SKY,
+                condition: value.to_owned(),
+            },
+        },
+        _ => Body::Figure {
+            text: value.to_owned(),
             unit: widget.unit.clone(),
         },
-        Some(Err(_)) | None => Body::Absent("unavailable"),
-    }
+    };
+    Cell { body, ink }
 }
 
-/// Whether a Home Assistant state means "no reading" rather than a value.
-fn is_sentinel(state: &str) -> bool {
-    let state = state.trim();
-    state.is_empty()
-        || state.eq_ignore_ascii_case("unavailable")
-        || state.eq_ignore_ascii_case("unknown")
-        || state.eq_ignore_ascii_case("none")
-}
-
-/// How long ago the record was received, if that exceeds the widget's
-/// `stale_after`.
+/// Whether a pushed record is older than its widget's `stale_after`.
 ///
 /// Computed at render time rather than stamped at push time, so raising or
-/// lowering `stale_after` takes effect on the next frame.
-fn staleness(widget: &Widget, record: &ContentRecord, now: OffsetDateTime) -> Option<String> {
+/// lowering `stale_after` takes effect on the next frame. A record stamped in the
+/// future is never stale: that is a clock disagreement, not freshness
+/// information, and treating it as stale would mute a cell that is fine.
+fn is_stale(widget: &Widget, record: &ContentRecord, now: OffsetDateTime) -> bool {
     if widget.stale_after == 0 {
-        return None;
+        return false;
     }
     let age = now - record.received_at;
-    if age.whole_seconds() < 0 {
-        return None;
-    }
-    let age = age.unsigned_abs().as_secs();
-    (age > widget.stale_after).then(|| format!("{} ago", humanise(age)))
-}
-
-/// A duration as a short human-readable string.
-fn humanise(seconds: u64) -> String {
-    match seconds {
-        s if s < 60 => format!("{s}s"),
-        s if s < 3_600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3_600),
-        s => format!("{}d", s / 86_400),
-    }
+    age.whole_seconds() >= 0 && age.unsigned_abs().as_secs() > widget.stale_after
 }
 
 /// Whether a beacon reads as "on".
@@ -797,6 +1169,16 @@ mod tests {
             entity: None,
             attribute: None,
             on_values: vec!["on".to_owned(), "true".to_owned(), "alert".to_owned()],
+            icon: None,
+            tap: None,
+        }
+    }
+
+    /// An `ha_entity` widget reading `entity`'s own state.
+    fn ha_widget(id: &str, entity: &str, kind: WidgetKind) -> Widget {
+        Widget {
+            entity: Some(entity.to_owned()),
+            ..widget(id, kind, 0, 0)
         }
     }
 
@@ -815,17 +1197,41 @@ mod tests {
     }
 
     fn render(device: &Device, content: &HashMap<String, ContentRecord>) -> Vec<u8> {
-        let ha = HashMap::new();
+        render_with(device, content, &HashMap::new(), &HashMap::new())
+    }
+
+    fn render_with(
+        device: &Device,
+        content: &HashMap<String, ContentRecord>,
+        ha_states: &HashMap<Reading, Reported>,
+        icons: &HashMap<String, Icon>,
+    ) -> Vec<u8> {
         render_frame(
             &FONTS,
             RenderInputs {
                 device,
                 content,
-                ha_states: &ha,
+                ha_states,
+                icons,
                 now: now(),
             },
         )
         .expect("frame should render")
+    }
+
+    /// The cell one widget resolves to, given only Home Assistant readings.
+    fn resolved(widget: &Widget, ha_states: &HashMap<Reading, Reported>) -> Cell {
+        let device = device(vec![widget.clone()]);
+        resolve(
+            widget,
+            &RenderInputs {
+                device: &device,
+                content: &HashMap::new(),
+                ha_states,
+                icons: &HashMap::new(),
+                now: now(),
+            },
+        )
     }
 
     fn dimensions(png: &[u8]) -> (u32, u32) {
@@ -904,7 +1310,7 @@ mod tests {
         let w = widget("a", WidgetKind::Value, 0, 0);
         assert_eq!(w.stale_after, 0);
         let ancient = record(serde_json::json!(1), now() - Duration::days(400));
-        assert_eq!(staleness(&w, &ancient, now()), None);
+        assert!(!is_stale(&w, &ancient, now()));
     }
 
     #[test]
@@ -912,21 +1318,12 @@ mod tests {
         let mut w = widget("a", WidgetKind::Value, 0, 0);
         w.stale_after = 60;
         let at_limit = record(serde_json::json!(1), now() - Duration::seconds(60));
-        assert_eq!(
-            staleness(&w, &at_limit, now()),
-            None,
+        assert!(
+            !is_stale(&w, &at_limit, now()),
             "exactly at the window is still fresh"
         );
         let past = record(serde_json::json!(1), now() - Duration::seconds(61));
-        assert_eq!(staleness(&w, &past, now()), Some("1m ago".to_owned()));
-    }
-
-    #[test]
-    fn staleness_reports_the_age_at_a_seconds_scale_for_a_short_window() {
-        let mut w = widget("a", WidgetKind::Value, 0, 0);
-        w.stale_after = 10;
-        let past = record(serde_json::json!(1), now() - Duration::seconds(45));
-        assert_eq!(staleness(&w, &past, now()), Some("45s ago".to_owned()));
+        assert!(is_stale(&w, &past, now()));
     }
 
     #[test]
@@ -937,19 +1334,43 @@ mod tests {
         let mut w = widget("a", WidgetKind::Value, 0, 0);
         w.stale_after = 60;
         let ahead = record(serde_json::json!(1), now() + Duration::seconds(500));
-        assert_eq!(staleness(&w, &ahead, now()), None);
+        assert!(!is_stale(&w, &ahead, now()));
     }
 
     #[test]
-    fn humanises_each_duration_scale() {
-        assert_eq!(humanise(0), "0s");
-        assert_eq!(humanise(59), "59s");
-        assert_eq!(humanise(60), "1m");
-        assert_eq!(humanise(3_599), "59m");
-        assert_eq!(humanise(3_600), "1h");
-        assert_eq!(humanise(86_399), "23h");
-        assert_eq!(humanise(86_400), "1d");
-        assert_eq!(humanise(86_400 * 9), "9d");
+    fn a_stale_push_keeps_its_value_and_is_marked_not_confirmed() {
+        // The whole point of holding a value: the last thing a publisher said is
+        // still the best answer the panel has, so it stays on the glass, muted,
+        // rather than being replaced by a countdown that says nothing.
+        let mut w = widget("a", WidgetKind::Value, 0, 0);
+        w.stale_after = 60;
+        let device = device(vec![w.clone()]);
+        let mut content = HashMap::new();
+        content.insert(
+            "a".to_owned(),
+            record(serde_json::json!(42), now() - Duration::seconds(3_600)),
+        );
+
+        let cell = resolve(
+            &w,
+            &RenderInputs {
+                device: &device,
+                content: &content,
+                ha_states: &HashMap::new(),
+                icons: &HashMap::new(),
+                now: now(),
+            },
+        );
+        assert_eq!(
+            cell,
+            Cell {
+                body: Body::Figure {
+                    text: "42".to_owned(),
+                    unit: None
+                },
+                ink: Ink::Held,
+            }
+        );
     }
 
     #[test]
@@ -1050,140 +1471,372 @@ mod tests {
     }
 
     #[test]
-    fn a_home_assistant_failure_renders_the_frame_with_that_cell_unavailable() {
-        let mut w = widget("temp", WidgetKind::HaEntity, 0, 0);
-        w.entity = Some("sensor.office".to_owned());
-        let device = device(vec![w]);
-        let content = HashMap::new();
+    fn a_home_assistant_failure_holds_the_last_value_rather_than_blanking_the_cell() {
+        let w = ha_widget("temp", "sensor.office", WidgetKind::HaEntity);
+        let device = device(vec![w.clone()]);
+        let reading = Reading::state("sensor.office");
 
-        let mut failed = HashMap::new();
-        failed.insert(
-            Reading::state("sensor.office"),
-            Err("connection refused".to_owned()),
-        );
-        let mut ok = HashMap::new();
-        ok.insert(Reading::state("sensor.office"), Ok("21.4".to_owned()));
+        let held = HashMap::from([(reading.clone(), Reported::Held("21.4".to_owned()))]);
+        let fresh = HashMap::from([(reading, Reported::Fresh("21.4".to_owned()))]);
 
-        let broken = render_frame(
-            &FONTS,
-            RenderInputs {
-                device: &device,
-                content: &content,
-                ha_states: &failed,
-                now: now(),
-            },
-        )
-        .expect("a Home Assistant failure must not fail the frame");
+        let muted_frame = render_with(&device, &HashMap::new(), &held, &HashMap::new());
+        let live_frame = render_with(&device, &HashMap::new(), &fresh, &HashMap::new());
 
-        let healthy = render_frame(
-            &FONTS,
-            RenderInputs {
-                device: &device,
-                content: &content,
-                ha_states: &ok,
-                now: now(),
-            },
-        )
-        .unwrap();
-
-        assert_eq!(dimensions(&broken), (400, 300));
+        assert_eq!(dimensions(&muted_frame), (400, 300));
         assert_ne!(
-            broken, healthy,
-            "unavailable must look different from a value"
+            muted_frame, live_frame,
+            "a held value must be visibly distinct from a confirmed one"
         );
     }
 
     #[test]
-    fn a_home_assistant_sentinel_state_is_an_absence_not_a_value() {
-        // A dropped-out Zigbee sensor reports the literal string "unavailable".
-        // Drawing that as a big figure reads as a confident reading, which is the
-        // thing the staleness rules exist to prevent.
-        let mut w = widget("temp", WidgetKind::HaEntity, 0, 0);
-        w.entity = Some("sensor.office".to_owned());
-        let content = HashMap::new();
+    fn a_held_reading_keeps_its_value_and_a_lost_one_says_so() {
+        // The distinction that matters: "the request failed but I know what it said
+        // last" is a muted figure, whereas "nothing has ever been read" is an
+        // absence. Collapsing both to the word `unavailable`, as this once did,
+        // threw away the reading a viewer actually wanted.
+        let w = ha_widget("temp", "sensor.office", WidgetKind::HaEntity);
+        let reading = Reading::state("sensor.office");
 
-        for sentinel in ["unavailable", "unknown", "Unavailable", "  ", "none"] {
-            let mut ha = HashMap::new();
-            ha.insert(Reading::state("sensor.office"), Ok(sentinel.to_owned()));
-            assert_eq!(
-                resolve(
-                    &w,
-                    &RenderInputs {
-                        device: &device(vec![]),
-                        content: &content,
-                        ha_states: &ha,
-                        now: now(),
-                    }
-                ),
-                Body::Absent("unavailable"),
-                "{sentinel:?} should render as an absence"
-            );
-        }
-
-        // A real reading is still a figure.
-        let mut ha = HashMap::new();
-        ha.insert(Reading::state("sensor.office"), Ok("21.4".to_owned()));
         assert_eq!(
-            resolve(
+            resolved(
                 &w,
-                &RenderInputs {
-                    device: &device(vec![]),
-                    content: &content,
-                    ha_states: &ha,
-                    now: now(),
-                }
+                &HashMap::from([(reading.clone(), Reported::Held("21.4".to_owned()))])
             ),
-            Body::Figure {
-                text: "21.4".to_owned(),
-                unit: None
+            Cell {
+                body: Body::Figure {
+                    text: "21.4".to_owned(),
+                    unit: None
+                },
+                ink: Ink::Held,
+            }
+        );
+        assert_eq!(
+            resolved(
+                &w,
+                &HashMap::from([(reading.clone(), Reported::Fresh("21.4".to_owned()))])
+            ),
+            Cell {
+                body: Body::Figure {
+                    text: "21.4".to_owned(),
+                    unit: None
+                },
+                ink: Ink::Current,
+            }
+        );
+        assert_eq!(
+            resolved(&w, &HashMap::from([(reading, Reported::Lost)])),
+            Cell {
+                body: Body::Absent("no data"),
+                ink: Ink::Held,
             }
         );
     }
 
     #[test]
-    fn a_home_assistant_entity_that_was_never_fetched_reads_as_unavailable() {
-        let mut w = widget("temp", WidgetKind::HaEntity, 0, 0);
-        w.entity = Some("sensor.office".to_owned());
-        let inputs_content = HashMap::new();
-        let empty = HashMap::new();
+    fn a_reading_that_was_never_fetched_reads_as_no_data() {
+        // A missing key means the caller never asked, which for a validated config
+        // means Home Assistant is not configured at all.
+        let w = ha_widget("temp", "sensor.office", WidgetKind::HaEntity);
         assert_eq!(
-            resolve(
-                &w,
-                &RenderInputs {
-                    device: &device(vec![]),
-                    content: &inputs_content,
-                    ha_states: &empty,
-                    now: now(),
-                }
-            ),
-            Body::Absent("unavailable")
+            resolved(&w, &HashMap::new()),
+            Cell {
+                body: Body::Absent("no data"),
+                ink: Ink::Held,
+            }
         );
+    }
+
+    #[test]
+    fn a_weather_cell_draws_a_condition_as_an_icon_and_a_name() {
+        // `partlycloudy` in the tabular-numeric figure style was the defect: a word
+        // from a closed set put where a number goes.
+        let w = ha_widget("sky", "weather.braga", WidgetKind::Weather);
+        let reading = Reading::state("weather.braga");
+
+        let cell = resolved(
+            &w,
+            &HashMap::from([(reading.clone(), Reported::Fresh("partlycloudy".to_owned()))]),
+        );
+        assert_eq!(
+            cell,
+            Cell {
+                body: Body::Sky {
+                    svg: icon::Condition::PartlyCloudy.svg(),
+                    condition: "Partly cloudy".to_owned(),
+                },
+                ink: Ink::Current,
+            }
+        );
+
+        // An unrecognised slug still shows what Home Assistant said, because a new
+        // condition is a thing to notice rather than to hide.
+        let unknown = resolved(
+            &w,
+            &HashMap::from([(reading, Reported::Fresh("meteor-shower".to_owned()))]),
+        );
+        assert_eq!(
+            unknown,
+            Cell {
+                body: Body::Sky {
+                    svg: icon::UNKNOWN_SKY,
+                    condition: "meteor-shower".to_owned(),
+                },
+                ink: Ink::Current,
+            }
+        );
+    }
+
+    #[test]
+    fn every_weather_condition_renders_a_frame() {
+        // The rasteriser silently draws nothing for markup usvg rejects, so the
+        // only assertion worth making is that a real frame comes out with ink in it.
+        let mut w = ha_widget("sky", "weather.braga", WidgetKind::Weather);
+        w.col_span = 2;
+        w.row_span = 2;
+        let device = device(vec![w]);
+        let reading = Reading::state("weather.braga");
+
+        let mut frames = std::collections::HashSet::new();
+        for slug in [
+            "clear-night",
+            "cloudy",
+            "exceptional",
+            "fog",
+            "hail",
+            "lightning",
+            "lightning-rainy",
+            "partlycloudy",
+            "pouring",
+            "rainy",
+            "snowy",
+            "snowy-rainy",
+            "sunny",
+            "windy",
+            "windy-variant",
+        ] {
+            let ha = HashMap::from([(reading.clone(), Reported::Fresh(slug.to_owned()))]);
+            let frame = render_with(&device, &HashMap::new(), &ha, &HashMap::new());
+            assert_eq!(dimensions(&frame), (400, 300), "rendering {slug}");
+            frames.insert(frame);
+        }
+        assert_eq!(
+            frames.len(),
+            15,
+            "every condition must be visually distinguishable, so no two frames may match"
+        );
+    }
+
+    /// The lowest inked row per column of a rasterised node, split into the run
+    /// left of the widest internal gap and the run right of it.
+    ///
+    /// The baseline is taken as the *mode* of those rows rather than the maximum, so
+    /// a descender, a decimal point or a curve's overshoot does not move it.
+    fn baselines(node: Node, width: u32, height: u32) -> (u32, u32) {
+        let raster = rasterise(&FONTS, node, width, height).expect("should rasterise");
+        let dark = |x: u32, y: u32| raster[((y * width + x) * 4 + 3) as usize] > 128;
+
+        let mut lowest = Vec::new();
+        for x in 0..width {
+            let low = (0..height).rfind(|&y| dark(x, y));
+            lowest.push(low);
+        }
+
+        // The widest run of empty columns between two inked ones is the gap between
+        // the figure and its unit.
+        let inked: Vec<u32> = (0..width)
+            .filter(|&x| lowest[x as usize].is_some())
+            .collect();
+        assert!(inked.len() > 4, "nothing was drawn");
+        let (mut split, mut widest) = (0, 0);
+        for pair in inked.windows(2) {
+            let gap = pair[1] - pair[0];
+            if gap > widest {
+                widest = gap;
+                split = pair[0] + gap / 2;
+            }
+        }
+        assert!(widest > 1, "the figure and its unit are not separable");
+
+        let mode = |from: u32, to: u32| {
+            let mut counts: HashMap<u32, usize> = HashMap::new();
+            for x in from..to {
+                if let Some(y) = lowest[x as usize] {
+                    *counts.entry(y).or_default() += 1;
+                }
+            }
+            *counts
+                .iter()
+                .max_by_key(|(y, n)| (*n, std::cmp::Reverse(**y)))
+                .expect("a run must have ink")
+                .0
+        };
+        (mode(0, split), mode(split, width))
+    }
+
+    #[test]
+    fn a_unit_sits_on_the_figures_baseline() {
+        // Measured in pixels because this is the kind of thing that looks right in
+        // the style declarations and wrong on the glass: `align_items: Baseline`
+        // does not give two runs at different sizes a shared baseline here, and the
+        // unit ended up sitting a quarter of its height below the number it belongs
+        // to.
+        //
+        // Both runs are the same digits on purpose. The question is where the layout
+        // puts a smaller run, and a real unit string would confound the measurement:
+        // the lowest inked row under `°` is the degree sign's bottom, nowhere near
+        // the baseline, and the `p` of `hPa` has a descender below it.
+        for size in [40.0, 60.0, 100.0, 143.0, 168.0] {
+            let node = figure_node("88", Some("88"), Ink::Current, size);
+            let (value, unit) = baselines(node, 1_400, 500);
+            let delta = unit as i64 - value as i64;
+            assert!(
+                delta.abs() <= 2,
+                "at {size}px the unit's baseline is {delta:+}px off the figure's \
+                 ({value} vs {unit})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_painted_icon_carries_exactly_one_colour_attribute() {
+        // The composed result of both stages. `icon::decode` sets
+        // `fill="currentColor"` on a single-colour icon and this sets the `color`
+        // that `currentColor` resolves against. When both wrote a colour there were
+        // two `color` attributes on one element — malformed XML that usvg rejects
+        // outright, so every icon on the dashboard drew nothing and no test noticed.
+        let fetched = r#"<svg fill="currentColor" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h8v8z"/></svg>"#;
+        let painted = paint_svg(fetched, muted());
+        assert_eq!(
+            painted.matches("color=").count(),
+            1,
+            "exactly one colour attribute may reach the rasteriser: {painted}"
+        );
+        assert!(painted.contains(r##"color="#666666ff""##), "{painted}");
+
+        // And it must still draw: markup usvg rejects rasterises to nothing at all,
+        // which is the failure mode this whole pair of tests exists to catch.
+        let node = icon_node(
+            &Icon::Svg {
+                markup: fetched.to_owned(),
+                ink: None,
+            },
+            48.0,
+            Ink::Current,
+        );
+        let raster = rasterise(&FONTS, node, 48, 48).expect("should rasterise");
+        let inked = raster.chunks_exact(4).filter(|px| px[3] > 128).count();
+        assert!(
+            inked > 20,
+            "a painted icon must actually draw ink, got {inked}"
+        );
+    }
+
+    #[test]
+    fn a_widget_icon_changes_the_frame_and_a_missing_one_does_not_fail_it() {
+        let mut w = widget("a", WidgetKind::Value, 0, 0);
+        w.icon = Some("mdi-thermometer".to_owned());
+        let device = device(vec![w]);
+
+        let unresolved = render_with(&device, &HashMap::new(), &HashMap::new(), &HashMap::new());
+        let icons = HashMap::from([(
+            "mdi-thermometer".to_owned(),
+            Icon::Svg {
+                markup: r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="9"/></svg>"#
+                    .to_owned(),
+                ink: None,
+            },
+        )]);
+        let resolved_frame = render_with(&device, &HashMap::new(), &HashMap::new(), &icons);
+
+        assert_eq!(dimensions(&unresolved), (400, 300));
+        assert_ne!(
+            unresolved, resolved_frame,
+            "an icon that resolved must actually be drawn"
+        );
+    }
+
+    #[test]
+    fn a_long_figure_scales_down_rather_than_being_clipped() {
+        // Measured fitting, not a character-count estimate: the point is that the
+        // run's real advance decides the size, so nothing is ever cut mid-glyph.
+        let short = figure_px_for("7", None);
+        let long = figure_px_for("123456789", None);
+        assert!(
+            long < short,
+            "a wide reading must shrink: {long} should be under {short}"
+        );
+
+        // And the unit is counted in, so adding one shrinks the figure further.
+        let bare = figure_px_for("1234", None);
+        let with_unit = figure_px_for("1234", Some("kWh"));
+        assert!(
+            with_unit <= bare,
+            "a unit competes for the same width: {with_unit} should not exceed {bare}"
+        );
+    }
+
+    /// The size a figure settles on inside a 200px-wide box, measured with the real
+    /// font metrics rather than estimated from a character count.
+    fn figure_px_for(text: &str, unit: Option<&str>) -> f32 {
+        const DESIGN: f32 = 96.0;
+        let intrinsic = intrinsic_width(&FONTS, figure_node(text, unit, Ink::Current, DESIGN));
+        assert!(intrinsic > 0.0, "measuring {text:?} must produce a width");
+        fit_size(intrinsic, 200.0, DESIGN)
+    }
+
+    #[test]
+    fn a_figure_that_already_fits_keeps_the_design_size() {
+        assert_eq!(figure_px_for("7", None), 96.0);
+    }
+
+    #[test]
+    fn fitting_never_clamps_to_a_floor_above_its_ceiling() {
+        // A 40x40 cell is legal configuration and puts the design size under the
+        // readable floor. Clamping to a floor above the ceiling panics, and a panic
+        // in the render task is the one failure mode that leaves a stale frame on
+        // the glass with nothing to say why.
+        //
+        // Below the floor the answer is the design size: shrinking an 11px reading
+        // to fit would take it to a fraction of a pixel, so it is better to set it
+        // as designed and let the one-line bound clip what will not fit.
+        assert_eq!(fit_size(500.0, 10.0, 11.0), 11.0);
+
+        // Above the floor, shrinking happens and stops at the floor.
+        assert_eq!(fit_size(1_000.0, 10.0, 96.0), MIN_TYPE_PX);
+        assert!(fit_size(200.0, 100.0, 96.0) < 96.0);
     }
 
     #[test]
     fn an_ha_entity_ignores_pushed_content() {
         // The kind reads from Home Assistant, so a push to the same id must not
         // masquerade as the entity's state.
-        let mut w = widget("temp", WidgetKind::HaEntity, 0, 0);
-        w.entity = Some("sensor.office".to_owned());
+        let w = ha_widget("temp", "sensor.office", WidgetKind::HaEntity);
+        let device = device(vec![w.clone()]);
         let mut content = HashMap::new();
         content.insert("temp".to_owned(), record(serde_json::json!("99"), now()));
-        let mut ha = HashMap::new();
-        ha.insert(Reading::state("sensor.office"), Ok("21.4".to_owned()));
+        let ha = HashMap::from([(
+            Reading::state("sensor.office"),
+            Reported::Fresh("21.4".to_owned()),
+        )]);
 
         assert_eq!(
             resolve(
                 &w,
                 &RenderInputs {
-                    device: &device(vec![]),
+                    device: &device,
                     content: &content,
                     ha_states: &ha,
+                    icons: &HashMap::new(),
                     now: now(),
                 }
             ),
-            Body::Figure {
-                text: "21.4".to_owned(),
-                unit: None
+            Cell {
+                body: Body::Figure {
+                    text: "21.4".to_owned(),
+                    unit: None
+                },
+                ink: Ink::Current,
             }
         );
     }

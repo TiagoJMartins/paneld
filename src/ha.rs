@@ -1,10 +1,11 @@
-//! Home Assistant entity states, for `ha_entity` widgets.
+//! Home Assistant: entity states for `ha_entity` widgets, and service calls for
+//! taps.
 //!
 //! [`HaClient`] is the seam. Everything above this module talks to the trait, so
 //! a test supplies canned answers without a network and without a mocking
-//! framework. It is deliberately narrow — one entity id in, one state string out
-//! — because config already supplies a widget's label and unit, so we never need
-//! an entity's attributes.
+//! framework. It is deliberately narrow — one reading in, one string out; one
+//! resolved call in, nothing out — because every decision about *what* to read or
+//! call is config's, resolved long before it gets here.
 //!
 //! [`fetch_states`] is the only entry point the renderer uses. It cannot fail as
 //! a whole: a per-entity failure comes back as `Err(message)` so one unreachable
@@ -17,7 +18,9 @@ use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+
+use crate::config::ServiceCall;
 
 /// How long a single Home Assistant request may take.
 ///
@@ -65,11 +68,94 @@ impl std::fmt::Display for Reading {
     }
 }
 
+/// What a reading currently shows, and how much the panel should trust it.
+///
+/// The distinction exists because "the request failed" and "there is no value"
+/// are different facts that used to render the same. A temperature that read
+/// 21.4 five minutes ago is still the best answer this panel has; replacing it
+/// with the word `unavailable` throws away information a reader wants and makes
+/// a momentary timeout look like a dead sensor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reported {
+    /// Read successfully just now.
+    Fresh(String),
+    /// The last value read successfully, kept because the newest request did not
+    /// confirm it. Rendered muted, and its cell carries a mark saying so.
+    Held(String),
+    /// No value has ever been read, and the newest request did not produce one.
+    Lost,
+}
+
+/// The last value successfully read for each reading.
+///
+/// Lives across renders, which is the whole point: a frame is built from a
+/// single round of fetches, so without somewhere to remember yesterday's answer
+/// a failed request has nothing to fall back on.
+///
+/// Bounded by the configuration rather than by a cap. Every fold prunes to the
+/// readings that round asked about, so a dashboard that stops referencing an
+/// entity stops paying for it, and a reload cannot make this grow without limit.
+#[derive(Debug, Default)]
+pub struct LastGood {
+    values: HashMap<Reading, String>,
+}
+
+impl LastGood {
+    /// Folds one round of results against what was last known good.
+    ///
+    /// A sentinel state counts as a failure, not as a value: Home Assistant
+    /// reports a dropped-out entity as the literal string `unavailable`, and that
+    /// is a successful HTTP request carrying no reading. Treating it as a value
+    /// would put a word where a number goes; treating it as a failure keeps the
+    /// last real number on the glass, which is what a dropped-out sensor calls
+    /// for.
+    pub fn fold(
+        &mut self,
+        results: HashMap<Reading, Result<String, String>>,
+    ) -> HashMap<Reading, Reported> {
+        let mut reported = HashMap::with_capacity(results.len());
+        for (reading, result) in results {
+            let value = match result {
+                Ok(value) if !is_sentinel(&value) => {
+                    self.values.insert(reading.clone(), value.clone());
+                    Reported::Fresh(value)
+                }
+                _ => match self.values.get(&reading) {
+                    Some(held) => Reported::Held(held.clone()),
+                    None => Reported::Lost,
+                },
+            };
+            reported.insert(reading, value);
+        }
+        self.values
+            .retain(|reading, _| reported.contains_key(reading));
+        reported
+    }
+}
+
+/// Whether a Home Assistant state means "no reading" rather than a value.
+///
+/// These are the strings Home Assistant itself uses for an entity that is
+/// missing, has dropped off its radio, or has not reported since a restart.
+pub fn is_sentinel(state: &str) -> bool {
+    let state = state.trim();
+    state.is_empty()
+        || state.eq_ignore_ascii_case("unavailable")
+        || state.eq_ignore_ascii_case("unknown")
+        || state.eq_ignore_ascii_case("none")
+}
+
 #[async_trait::async_trait]
 pub trait HaClient: Send + Sync {
     /// Returns the entity's current state as Home Assistant reports it, e.g.
     /// `"21.4"`, `"on"` or `"unavailable"`.
     async fn read(&self, reading: &Reading) -> Result<String>;
+
+    /// Calls a Home Assistant service, e.g. `POST /api/services/light/toggle`.
+    ///
+    /// The whole body is the caller's `data`, already carrying `entity_id` when
+    /// there is a target, so nothing is decided here.
+    async fn call(&self, call: &ServiceCall) -> Result<()>;
 }
 
 /// A [`HaClient`] speaking to a real Home Assistant over HTTP.
@@ -168,6 +254,54 @@ impl HttpHaClient {
             other => other.to_string(),
         })
     }
+
+    /// The request, with every failure reported as its own message. `call` wraps
+    /// this in the context naming the service.
+    async fn post_service(&self, call: &ServiceCall) -> Result<()> {
+        // Config validated both of these, but this is the boundary that builds a
+        // URL out of them, and a boundary that trusts its caller is one bug away
+        // from posting to a path nobody wrote.
+        validate_segment(&call.domain, "service domain")?;
+        validate_segment(&call.service, "service name")?;
+
+        let url = format!(
+            "{}/api/services/{}/{}",
+            self.base_url, call.domain, call.service
+        );
+        // Serialised here rather than through reqwest's `json` feature, matching how
+        // `fetch_reading` decodes: this crate owns its JSON, and the transport only
+        // carries bytes.
+        let payload = serde_json::to_vec(&call.data)
+            .with_context(|| format!("serialising the service data for POST {url}"))?;
+
+        // No `return_response`: Home Assistant answers 400 to an actuator asked to
+        // return a payload, and nothing here reads one.
+        let response = self
+            .http
+            .post(&url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(payload)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+
+        let status = response.status();
+        // Read the body before asserting the status: Home Assistant explains why it
+        // refused a call in the body, and that explanation is the whole value of the
+        // log line an operator will read.
+        let body = response
+            .text()
+            .await
+            .with_context(|| format!("reading the response body of POST {url}"))?;
+
+        ensure!(
+            status.is_success(),
+            "Home Assistant returned HTTP {status}: {}",
+            snippet(&body)
+        );
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -176,6 +310,12 @@ impl HaClient for HttpHaClient {
         self.fetch_reading(reading)
             .await
             .with_context(|| format!("Home Assistant reading `{reading}`"))
+    }
+
+    async fn call(&self, call: &ServiceCall) -> Result<()> {
+        self.post_service(call)
+            .await
+            .with_context(|| format!("Home Assistant service call `{call}`"))
     }
 }
 
@@ -271,10 +411,7 @@ fn distinct_readings(readings: &[Reading]) -> Vec<&Reading> {
 fn validate_entity_id(entity_id: &str) -> Result<()> {
     ensure!(!entity_id.is_empty(), "entity id is empty");
 
-    if let Some(bad) = entity_id
-        .chars()
-        .find(|c| matches!(c, '/' | '?' | '#') || c.is_whitespace())
-    {
+    if let Some(bad) = entity_id.chars().find(path_forging) {
         bail!(
             "entity id `{entity_id}` contains {bad:?}, which would change the \
              request path; expected a plain `domain.object_id`"
@@ -282,6 +419,34 @@ fn validate_entity_id(entity_id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Rejects a service domain or name that could forge a different request path.
+///
+/// Config already refused anything but lower-case letters, digits and
+/// underscores, so this can only fire on a call built in code. It exists anyway
+/// because this is the function that concatenates a URL, and the day someone adds
+/// a second way to build a [`ServiceCall`] is the day that stops being true.
+fn validate_segment(value: &str, what: &str) -> Result<()> {
+    ensure!(!value.is_empty(), "{what} is empty");
+
+    if let Some(bad) = value.chars().find(path_forging) {
+        bail!(
+            "{what} `{value}` contains {bad:?}, which would change the request \
+             path; expected a plain Home Assistant identifier"
+        );
+    }
+
+    Ok(())
+}
+
+/// Characters that would change a request path if they reached a URL unescaped.
+///
+/// Refused outright rather than percent-encoded: an entity id and a service name
+/// are both already URL-safe, so one of these is a mistake to report, never a
+/// value to carry.
+fn path_forging(c: &char) -> bool {
+    matches!(c, '/' | '?' | '#') || c.is_whitespace()
 }
 
 /// A body prefix short enough to log, at a character boundary.
@@ -341,6 +506,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -352,11 +518,15 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    /// Canned answers and call counts, so a test can assert what was fetched and
-    /// how often without a network.
+    /// Canned answers, read counts and every service call posted, so a test can
+    /// assert what was fetched, how often, and what was actuated, without a
+    /// network.
     struct StubHaClient {
         answers: HashMap<String, Canned>,
         total_calls: AtomicUsize,
+        /// Every call, in the order it was made. A `Mutex` rather than a counter
+        /// because a tap's whole payload is the thing worth asserting on.
+        services: Mutex<Vec<ServiceCall>>,
     }
 
     impl StubHaClient {
@@ -380,6 +550,7 @@ mod tests {
             Self {
                 answers,
                 total_calls: AtomicUsize::new(0),
+                services: Mutex::new(Vec::new()),
             }
         }
 
@@ -391,6 +562,10 @@ mod tests {
 
         fn total_calls(&self) -> usize {
             self.total_calls.load(Ordering::Relaxed)
+        }
+
+        fn services(&self) -> Vec<ServiceCall> {
+            self.services.lock().unwrap().clone()
         }
     }
 
@@ -410,6 +585,11 @@ mod tests {
                 Ok(state) => Ok(state.clone()),
                 Err(message) => bail!("{message}"),
             }
+        }
+
+        async fn call(&self, call: &ServiceCall) -> Result<()> {
+            self.services.lock().unwrap().push(call.clone());
+            Ok(())
         }
     }
 
@@ -507,6 +687,21 @@ mod tests {
         assert_eq!(client.total_calls(), 0);
     }
 
+    /// The render path is a read, and must stay one. A loop that could actuate
+    /// something would make repainting a panel a side effect, which is the kind of
+    /// surprise nobody debugs quickly.
+    #[tokio::test]
+    async fn fetching_readings_never_calls_a_service() {
+        let client = StubHaClient::new(&[("sensor.office_temp", Ok("21.4"))]);
+
+        fetch_readings(&client, &readings(&["sensor.office_temp"])).await;
+
+        assert!(
+            client.services().is_empty(),
+            "reading state must never post to /api/services"
+        );
+    }
+
     /// Both entities wait on a two-party barrier, so neither can finish until
     /// the other has started. A sequential implementation deadlocks; the
     /// timeout turns that into a failure rather than a hung test.
@@ -521,6 +716,10 @@ mod tests {
             async fn read(&self, reading: &Reading) -> Result<String> {
                 self.barrier.wait().await;
                 Ok(reading.entity_id.clone())
+            }
+
+            async fn call(&self, call: &ServiceCall) -> Result<()> {
+                bail!("this case actuates nothing, yet was asked for `{call}`")
             }
         }
 
@@ -651,5 +850,179 @@ mod tests {
         .expect_err("an unset variable must be an error, not an empty token")
         .to_string();
         assert!(message.contains(name), "{message}");
+    }
+
+    fn toggle() -> ServiceCall {
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "entity_id".to_owned(),
+            serde_json::Value::String("light.desk".to_owned()),
+        );
+        ServiceCall {
+            domain: "light".to_owned(),
+            service: "toggle".to_owned(),
+            data,
+        }
+    }
+
+    /// Serves exactly one request on loopback and hands back what was received.
+    ///
+    /// Hand-rolled over a socket rather than mocked: the value of this fixture is
+    /// that it observes the bytes the real client puts on the wire, which is the one
+    /// thing a stub implementation of the trait can never tell us.
+    async fn one_shot(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback is bindable");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+        let served = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("one connection arrives");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            // Read until the head and its whole declared body have arrived, rather
+            // than until EOF: the client keeps the connection alive, so waiting for
+            // a close here would hang the test instead of failing it.
+            while !framed(&request) {
+                let read = socket.read(&mut buffer).await.expect("the socket reads");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("the socket writes");
+            socket.flush().await.expect("the response is flushed");
+            String::from_utf8_lossy(&request).into_owned()
+        });
+
+        (base_url, served)
+    }
+
+    /// Whether a complete request has arrived: a head, then as many body bytes as
+    /// its `content-length` promised.
+    fn framed(request: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(request);
+        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+            return false;
+        };
+        let declared: usize = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())?
+            })
+            .unwrap_or(0);
+        body.len() >= declared
+    }
+
+    #[tokio::test]
+    async fn a_service_call_posts_its_data_as_the_body_of_the_services_path() {
+        let (base_url, served) = one_shot("200 OK", "[]").await;
+        let client = HttpHaClient::new(&HomeAssistant {
+            base_url,
+            token: Some("tok".to_owned()),
+            token_env: None,
+        })
+        .unwrap();
+
+        client.call(&toggle()).await.expect("a 200 is a success");
+
+        let request = served.await.expect("the fixture served one request");
+        assert!(
+            request.starts_with("POST /api/services/light/toggle HTTP/1.1\r\n"),
+            "the domain and service are the last two path segments: {request}"
+        );
+        assert!(
+            request.ends_with(r#"{"entity_id":"light.desk"}"#),
+            "the body is the caller's data verbatim: {request}"
+        );
+        assert!(
+            !request.contains("return_response"),
+            "Home Assistant 400s an actuator asked to return a payload: {request}"
+        );
+        assert!(
+            request.to_lowercase().contains("authorization: bearer tok"),
+            "the token travels as a default header: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_service_call_carries_home_assistants_own_explanation() {
+        let (base_url, served) = one_shot(
+            "400 Bad Request",
+            r#"{"message":"extra keys not allowed @ data['brightness']"}"#,
+        )
+        .await;
+        let client = HttpHaClient::new(&HomeAssistant {
+            base_url,
+            token: Some("tok".to_owned()),
+            token_env: None,
+        })
+        .unwrap();
+
+        let error = client
+            .call(&toggle())
+            .await
+            .expect_err("a 400 is not a success");
+        let message = format!("{error:#}");
+
+        served.await.expect("the fixture served one request");
+        assert!(message.contains("400"), "{message}");
+        assert!(
+            message.contains("extra keys not allowed"),
+            "an operator needs Home Assistant's reason, not just the status: {message}"
+        );
+        assert!(
+            message.contains("light.toggle"),
+            "and needs to know which call it was: {message}"
+        );
+    }
+
+    /// Config already refuses these, so this is the boundary asserting for itself
+    /// rather than trusting the layer above. Validation runs before any request, so
+    /// nothing here touches the network despite the base URL being unreachable.
+    #[tokio::test]
+    async fn call_rejects_a_domain_or_service_that_could_forge_a_request_path() {
+        let client = HttpHaClient::new(&config()).unwrap();
+        let cases: &[(&str, &str, &str)] = &[
+            ("a slash in the domain", "light/../../config", "toggle"),
+            ("a slash in the service", "light", "toggle/../states"),
+            ("a query in the service", "light", "toggle?return_response"),
+            ("a space in the domain", "light switch", "toggle"),
+            ("an empty domain", "", "toggle"),
+            ("an empty service", "light", ""),
+        ];
+
+        for (what, domain, service) in cases {
+            let call = ServiceCall {
+                domain: (*domain).to_owned(),
+                service: (*service).to_owned(),
+                data: serde_json::Map::new(),
+            };
+            let error = client
+                .call(&call)
+                .await
+                .expect_err(&format!("{what} must be rejected before any request"));
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("request path") || message.contains("is empty"),
+                "{what}: the error must say why it was refused: {message}"
+            );
+        }
     }
 }

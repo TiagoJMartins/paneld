@@ -2,6 +2,12 @@
 //! palette, pack it at the narrowest bit depth that palette allows, and encode a
 //! PNG.
 //!
+//! PNG rather than BMP is a protocol requirement, not a preference. The TRMNL
+//! firmware's BMP path is rigid — it accepts only exactly 800x480, 1 bpp, a
+//! 48000-byte data section and a two-entry palette — while its PNG path is
+//! flexible and decoded into whatever framebuffer the device has. There is
+//! deliberately no BMP encoder here to reach for.
+//!
 //! Three decisions here are load-bearing and easy to get wrong.
 //!
 //! **Quantisation happens in linear light.** Error diffusion is an averaging

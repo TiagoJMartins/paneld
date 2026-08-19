@@ -72,10 +72,23 @@ pub struct Server {
     /// process working directory.
     #[serde(default = "default_content_path")]
     pub content_path: String,
+    /// Where fetched widget icons are cached. Relative paths resolve against the
+    /// process working directory.
+    ///
+    /// A cache rather than a store: every entry is re-fetchable, so losing the
+    /// directory costs one round trip per icon and nothing else. It exists so
+    /// that rendering never reaches the network, which is what keeps a frame
+    /// reproducible and keeps a dashboard drawable while the internet is down.
+    #[serde(default = "default_icon_cache_path")]
+    pub icon_cache_path: String,
 }
 
 fn default_content_path() -> String {
     "paneld-content.json".to_owned()
+}
+
+fn default_icon_cache_path() -> String {
+    "paneld-icons".to_owned()
 }
 
 /// Home Assistant connection details, required by any `ha_entity` widget.
@@ -131,26 +144,26 @@ pub struct Grid {
 
 /// One widget, placed explicitly on the grid rather than inferred from document
 /// order.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// A *validated* widget: [`RawWidget`] is the file's shape, and everything the
+/// rest of the program should not have to re-decide — chiefly a `tap`, which the
+/// file may spell three ways — is resolved on the way here.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Widget {
     /// Also the content push address: `PUT /api/content/<id>`.
     pub id: String,
     pub kind: WidgetKind,
     pub col: u32,
     pub row: u32,
-    #[serde(default = "one")]
     pub col_span: u32,
-    #[serde(default = "one")]
     pub row_span: u32,
     pub label: Option<String>,
     pub unit: Option<String>,
     /// How long pushed content stays fresh, in seconds. `0` disables the
     /// staleness timer, which is the default: a widget should not start
     /// reporting itself stale just because its author never thought about it.
-    #[serde(default)]
     pub stale_after: u64,
-    /// Home Assistant entity id, for `kind = "ha_entity"`.
+    /// Home Assistant entity id, for `kind = "ha_entity"` and `kind = "weather"`.
     pub entity: Option<String>,
     /// Read this attribute of the entity instead of its own state.
     ///
@@ -159,8 +172,49 @@ pub struct Widget {
     /// show is an attribute.
     pub attribute: Option<String>,
     /// Values that put a `beacon` in its "on" state.
-    #[serde(default = "default_on_values")]
     pub on_values: Vec<String>,
+    /// An icon drawn beside the cell's label, spelt the way
+    /// [gethomepage](https://gethomepage.dev) spells one. See [`crate::icon`].
+    pub icon: Option<String>,
+    /// What tapping this cell does. See [`crate::tap`].
+    pub tap: Option<Tap>,
+}
+
+/// What tapping a widget's cell does.
+///
+/// Deliberately two verbs rather than a general grammar. paneld has no pages and
+/// no rotations, so the navigation verbs a browser-rendered dashboard needs have
+/// no meaning here, and a webhook verb would be an outbound-request surface
+/// nobody asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Tap {
+    /// Rebuild this device's frame now. Useful on its own cell as a manual
+    /// "refresh the panel", and the only action that reaches nothing outside
+    /// this process.
+    Refresh,
+    /// Call a Home Assistant service.
+    Service(ServiceCall),
+}
+
+/// A Home Assistant service call, resolved from a widget's `tap`.
+///
+/// `data` already carries `entity_id` when there is a target, so dispatching is
+/// a `POST` of this struct's `data` to `/api/services/{domain}/{service}` with
+/// nothing left to decide.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServiceCall {
+    /// e.g. `light`.
+    pub domain: String,
+    /// e.g. `toggle`.
+    pub service: String,
+    /// The service data, as posted.
+    pub data: serde_json::Map<String, serde_json::Value>,
+}
+
+impl std::fmt::Display for ServiceCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.domain, self.service)
+    }
 }
 
 fn one() -> u32 {
@@ -190,6 +244,26 @@ pub enum WidgetKind {
     /// An entity's state read from Home Assistant rather than from a push.
     #[serde(rename = "ha_entity")]
     HaEntity,
+    /// A `weather.*` entity's condition, as an icon and a named condition.
+    ///
+    /// Its own kind rather than an `ha_entity` that sniffs the entity id,
+    /// because the two render nothing alike: a condition is a word from a closed
+    /// set that wants a picture, not a figure in tabular numerals.
+    #[serde(rename = "weather")]
+    Weather,
+}
+
+impl std::fmt::Display for WidgetKind {
+    /// The spelling the config file uses, so an error names what the author wrote.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Value => "value",
+            Self::Beacon => "beacon",
+            Self::Text => "text",
+            Self::HaEntity => "ha_entity",
+            Self::Weather => "weather",
+        })
+    }
 }
 
 /// A panel's colour capability. Configuration, not code, so that a mono,
@@ -246,7 +320,11 @@ pub fn parse(text: &str) -> Result<Config> {
     let file: File = toml::from_str(text).context("parsing TOML")?;
 
     let server = Server {
-        public_base_url: validate_base_url(&file.server.public_base_url, "server.public_base_url")?,
+        public_base_url: validate_base_url(
+            &file.server.public_base_url,
+            "server.public_base_url",
+            true,
+        )?,
         ..file.server
     };
 
@@ -263,7 +341,7 @@ pub fn parse(text: &str) -> Result<Config> {
                 );
             }
             Some(HomeAssistant {
-                base_url: validate_base_url(&ha.base_url, "home_assistant.base_url")?,
+                base_url: validate_base_url(&ha.base_url, "home_assistant.base_url", false)?,
                 token: ha.token,
                 token_env: ha.token_env,
             })
@@ -290,12 +368,19 @@ pub fn parse(text: &str) -> Result<Config> {
     })
 }
 
-/// Rejects a base URL the device could not reach, and strips any trailing slash.
+/// Normalises a base URL, and says whether the panel has to be able to reach it.
 ///
 /// A trailing slash is the single most likely cause of a silently blank panel:
 /// both client families concatenate the base URL with the endpoint path without
 /// normalising, so `http://host:4444/` yields `http://host:4444//api/display`.
-fn validate_base_url(raw: &str, field: &str) -> Result<String> {
+/// That applies to any base URL here, so it is stripped from all of them.
+///
+/// `reachable_by_panel` is what differs, and conflating the two was a real defect.
+/// The panel dials `public_base_url` itself, so a loopback there is a dashboard
+/// nobody ever sees. Home Assistant is dialled by *this process*, so loopback and
+/// container-internal names are not merely allowed but ordinary — a sidecar, a
+/// tunnel, or Home Assistant on the same host.
+fn validate_base_url(raw: &str, field: &str, reachable_by_panel: bool) -> Result<String> {
     let trimmed = raw.trim_end_matches('/');
     ensure!(!trimmed.is_empty(), "{field} must not be empty");
 
@@ -314,7 +399,7 @@ fn validate_base_url(raw: &str, field: &str) -> Result<String> {
     let host = host.trim_start_matches('[').trim_end_matches(']');
     ensure!(!host.is_empty(), "{field} must include a host");
 
-    if is_unreachable_host(host) {
+    if reachable_by_panel && is_unreachable_host(host) {
         bail!(
             "{field} is `{raw}`, which the device cannot reach; \
              it must be a LAN or tailnet address, never localhost or a container-internal name"
@@ -394,23 +479,11 @@ fn validate_device(device: RawDevice, has_home_assistant: bool) -> Result<Device
         grid.rows
     );
 
+    let widgets = widgets
+        .into_iter()
+        .map(|widget| validate_widget(widget, &id, has_home_assistant))
+        .collect::<Result<Vec<_>>>()?;
     validate_placement(&id, grid, &widgets)?;
-
-    for widget in &widgets {
-        if widget.kind == WidgetKind::HaEntity {
-            ensure!(
-                widget.entity.is_some(),
-                "widget `{}` on device `{id}` has kind ha_entity but no `entity`",
-                widget.id
-            );
-            ensure!(
-                has_home_assistant,
-                "widget `{}` on device `{id}` has kind ha_entity, \
-                 which requires a [home_assistant] section with base_url and token",
-                widget.id
-            );
-        }
-    }
 
     Ok(Device {
         id,
@@ -466,6 +539,169 @@ fn validate_placement(device_id: &str, grid: Grid, widgets: &[Widget]) -> Result
     Ok(())
 }
 
+/// Resolves one widget, rejecting a combination of fields that cannot render.
+fn validate_widget(raw: RawWidget, device_id: &str, has_home_assistant: bool) -> Result<Widget> {
+    let RawWidget {
+        id,
+        kind,
+        col,
+        row,
+        col_span,
+        row_span,
+        label,
+        unit,
+        stale_after,
+        entity,
+        attribute,
+        on_values,
+        icon,
+        tap,
+    } = raw;
+
+    let reads_home_assistant = matches!(kind, WidgetKind::HaEntity | WidgetKind::Weather);
+    if reads_home_assistant {
+        ensure!(
+            entity.is_some(),
+            "widget `{id}` on device `{device_id}` has kind {kind} but no `entity`"
+        );
+    }
+
+    // A weather condition *is* the entity's state, so an `attribute` here is not
+    // a harmless extra: it says "read something else", which this kind cannot do.
+    // Silently ignoring it would leave an author staring at an icon that never
+    // matches the number they asked for.
+    ensure!(
+        !(kind == WidgetKind::Weather && attribute.is_some()),
+        "widget `{id}` on device `{device_id}` has kind weather and an `attribute`; \
+         a weather cell draws the entity's own condition. Use kind `ha_entity` \
+         with an `attribute` to show one of its numbers"
+    );
+
+    if let Some(icon) = &icon {
+        crate::icon::validate(icon).with_context(|| {
+            format!("widget `{id}` on device `{device_id}` has an invalid icon")
+        })?;
+    }
+
+    let tap = match tap {
+        Some(raw) => Some(validate_tap(raw, &id, device_id, entity.as_deref())?),
+        None => None,
+    };
+
+    // Checked once, after both the kind and the tap have had their say, so the
+    // error names every reason Home Assistant is needed rather than only the
+    // first.
+    ensure!(
+        has_home_assistant || !(reads_home_assistant || matches!(tap, Some(Tap::Service(_)))),
+        "widget `{id}` on device `{device_id}` needs Home Assistant, \
+         so the config needs a [home_assistant] section with base_url and a token"
+    );
+
+    Ok(Widget {
+        id,
+        kind,
+        col,
+        row,
+        col_span,
+        row_span,
+        label,
+        unit,
+        stale_after,
+        entity,
+        attribute,
+        on_values,
+        icon,
+        tap,
+    })
+}
+
+/// Resolves a `tap`, whichever of its spellings the file used.
+///
+/// The terse form aims at the widget's own `entity` because that is the case
+/// worth making short: a cell that already reads `light.desk` should be able to
+/// say `tap = "light.toggle"` and mean it.
+fn validate_tap(
+    raw: RawTap,
+    widget_id: &str,
+    device_id: &str,
+    widget_entity: Option<&str>,
+) -> Result<Tap> {
+    let (service, target, extra) = match raw {
+        RawTap::Terse(verb) if verb == "refresh" => return Ok(Tap::Refresh),
+        RawTap::Terse(verb) => {
+            let entity = widget_entity.with_context(|| {
+                format!(
+                    "widget `{widget_id}` on device `{device_id}` has tap = \"{verb}\" \
+                     but no `entity` for it to aim at; give the widget an `entity`, \
+                     or use the table form: tap = {{ service = \"{verb}\", entity = \"...\" }}"
+                )
+            })?;
+            (verb, Some(entity.to_owned()), toml::Table::new())
+        }
+        RawTap::Table(table) => {
+            let target = table.entity.or_else(|| widget_entity.map(str::to_owned));
+            (table.service, target, table.data)
+        }
+    };
+
+    let (domain, service) = service.split_once('.').with_context(|| {
+        format!(
+            "widget `{widget_id}` on device `{device_id}` has tap service `{service}`, \
+             which is not a Home Assistant service. Write it as `domain.service`, \
+             e.g. `light.toggle`, or use the one bare verb, `refresh`"
+        )
+    })?;
+    for (part, what) in [(domain, "domain"), (service, "service")] {
+        ensure!(
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+            "widget `{widget_id}` on device `{device_id}` has tap service \
+             `{domain}.{service}`, whose {what} is not a Home Assistant identifier; \
+             those are lower-case letters, digits and underscores"
+        );
+    }
+
+    let mut data = serde_json::Map::new();
+    for (key, value) in extra {
+        data.insert(key, to_json(value));
+    }
+    // Set after the extra data so a caller who really means to aim at several
+    // entities can write `data = { entity_id = [..] }` and have it win.
+    if let Some(target) = target {
+        data.entry("entity_id")
+            .or_insert_with(|| serde_json::Value::String(target));
+    }
+
+    Ok(Tap::Service(ServiceCall {
+        domain: domain.to_owned(),
+        service: service.to_owned(),
+        data,
+    }))
+}
+
+/// TOML service data as the JSON body Home Assistant expects.
+///
+/// TOML dates have no JSON counterpart and no meaning to a service call, so they
+/// go across as their RFC 3339 text, which is what a Home Assistant service that
+/// takes a datetime wants anyway.
+fn to_json(value: toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::String(s) => serde_json::Value::String(s),
+        toml::Value::Integer(i) => serde_json::Value::from(i),
+        toml::Value::Float(f) => serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        toml::Value::Boolean(b) => serde_json::Value::Bool(b),
+        toml::Value::Datetime(d) => serde_json::Value::String(d.to_string()),
+        toml::Value::Array(items) => items.into_iter().map(to_json).collect(),
+        toml::Value::Table(table) => {
+            serde_json::Value::Object(table.into_iter().map(|(k, v)| (k, to_json(v))).collect())
+        }
+    }
+}
+
 /// The TOML document's shape.
 ///
 /// Distinct from [`Config`] only where the file is allowed to omit something the
@@ -496,7 +732,54 @@ struct RawDevice {
     max_frame_bytes: usize,
     grid: Grid,
     #[serde(default, rename = "widget")]
-    widgets: Vec<Widget>,
+    widgets: Vec<RawWidget>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWidget {
+    id: String,
+    kind: WidgetKind,
+    col: u32,
+    row: u32,
+    #[serde(default = "one")]
+    col_span: u32,
+    #[serde(default = "one")]
+    row_span: u32,
+    label: Option<String>,
+    unit: Option<String>,
+    #[serde(default)]
+    stale_after: u64,
+    entity: Option<String>,
+    attribute: Option<String>,
+    #[serde(default = "default_on_values")]
+    on_values: Vec<String>,
+    icon: Option<String>,
+    tap: Option<RawTap>,
+}
+
+/// A `tap` as the file may spell it.
+///
+/// Untagged, so both spellings are the same key. The short one is a string
+/// because that is how it reads in a file — `tap = "light.toggle"` — and the long
+/// one is a table because a service with data has nowhere else to put it.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawTap {
+    Terse(String),
+    Table(RawTapTable),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTapTable {
+    /// `domain.service`, e.g. `light.turn_on`.
+    service: String,
+    /// The entity to aim at, overriding the widget's own.
+    entity: Option<String>,
+    /// Extra service data, merged under the resolved `entity_id`.
+    #[serde(default)]
+    data: toml::Table,
 }
 
 #[cfg(test)]
@@ -688,6 +971,53 @@ unit = "°C"
             let text = BASE.replace("http://192.168.0.50:4444", host);
             assert_eq!(parse(&text).unwrap().server.public_base_url, host);
         }
+    }
+
+    #[test]
+    fn a_home_assistant_base_url_may_be_one_the_panel_could_never_reach() {
+        // The panel never dials Home Assistant — this process does. A loopback or a
+        // container-internal name there is ordinary rather than a mistake: a
+        // sidecar, a tunnel, or Home Assistant on the same host. Rejecting it with
+        // "the device cannot reach this" was a rule borrowed from the wrong field.
+        for base in [
+            "http://127.0.0.1:8123",
+            "http://localhost:8123",
+            "http://homeassistant.default.svc.cluster.local:8123",
+            "http://[::1]:8123",
+        ] {
+            let text = format!("{BASE}\n[home_assistant]\nbase_url = \"{base}\"\ntoken = \"t\"\n");
+            let config = parse(&text).unwrap_or_else(|e| panic!("{base} rejected: {e:#}"));
+            assert_eq!(config.home_assistant.unwrap().base_url, base);
+        }
+    }
+
+    #[test]
+    fn a_home_assistant_base_url_still_needs_a_scheme_and_a_host() {
+        for (base, expected) in [
+            ("homeassistant.local:8123", "http:// or https://"),
+            ("http://:8123", "must include a host"),
+            ("", "must not be empty"),
+        ] {
+            let text = format!("{BASE}\n[home_assistant]\nbase_url = \"{base}\"\ntoken = \"t\"\n");
+            let message = err(&text);
+            assert!(
+                message.contains("home_assistant.base_url") && message.contains(expected),
+                "{base:?} should be rejected for {expected}, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn strips_a_trailing_slash_from_the_home_assistant_base_url() {
+        // Not for the panel's sake here, but for ours: request paths are built by
+        // plain concatenation on this side too.
+        let text = format!(
+            "{BASE}\n[home_assistant]\nbase_url = \"http://ha.local:8123/\"\ntoken = \"t\"\n"
+        );
+        assert_eq!(
+            parse(&text).unwrap().home_assistant.unwrap().base_url,
+            "http://ha.local:8123"
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router, middleware};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
 
@@ -32,6 +32,7 @@ use crate::config::{Config, Device, REFRESH_RATE_BOUNDS};
 use crate::content::{ContentBody, PutError};
 use crate::frame::Frame;
 use crate::render::frame_hash;
+use crate::tap::{Outcome, Report};
 use crate::telemetry::Telemetry;
 
 /// Longest device log line kept, in bytes.
@@ -40,6 +41,12 @@ use crate::telemetry::Telemetry;
 /// the body is logged and discarded. Capped so a misbehaving client cannot fill
 /// the disk.
 const MAX_LOG_BYTES: usize = 2_048;
+
+/// Longest tap request body accepted, in bytes.
+///
+/// Three numbers and a short id. Capped because this endpoint is reachable by
+/// anything on the network and the body is buffered before it is parsed.
+const MAX_TAP_BYTES: usize = 1_024;
 
 /// Builds the router.
 ///
@@ -59,6 +66,7 @@ fn routes(runtime: Arc<Runtime>) -> Router {
     Router::new()
         .route("/d/{device}/api/display", get(display))
         .route("/d/{device}/api/setup", get(setup))
+        .route("/d/{device}/api/tap", post(tap))
         .route("/d/{device}/api/log", post(device_log))
         .route("/d/{device}/frames/{file}", get(frame_file))
         .route("/d/{device}/current.png", get(current_frame))
@@ -181,10 +189,16 @@ fn frame_url(base_url: &str, device_id: &str, hash: &str) -> String {
     format!("{base_url}/d/{device_id}/frames/{hash}.png")
 }
 
-/// `GET /d/{device}/api/display` — the poll. A pure read; it never renders.
+/// `GET /d/{device}/api/display` — the poll. A pure read of the frame store; it
+/// never renders.
+///
+/// `touch_x` / `touch_y` / `touch_event_id` may ride along on the query string, for
+/// a client that can only decorate the request it already makes. They are the one
+/// thing here with a side effect, and they still cannot change what this answers.
 async fn display(
     State(runtime): State<Arc<Runtime>>,
     Path(device_id): Path<String>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Response {
     let now = OffsetDateTime::now_utc();
@@ -203,6 +217,23 @@ async fn display(
     };
 
     runtime.status.record_poll(&device.id, telemetry, now);
+
+    // Dispatched before the frame is read, so a client that can only decorate its
+    // poll gets the effect of its tap on the same wake rather than the one after.
+    // Never allowed to change the answer: whatever came of the tap, the response
+    // below is the one this device would have received anyway.
+    if let Some(touch) = Touch::from_query(uri.query()) {
+        let report = runtime
+            .tap(&device.id, touch.x, touch.y, touch.event_id.as_deref())
+            .await;
+        rebuild_after(&runtime, &device.id, &report);
+        tracing::info!(
+            device = %device.id,
+            outcome = %report.outcome,
+            widget = report.widget.as_deref().unwrap_or("-"),
+            "tap carried on a display poll"
+        );
+    }
 
     let Some(frame) = runtime.frames.current(&device.id) else {
         // Every configured device is rendered before the listener accepts, so
@@ -270,6 +301,175 @@ fn placeholder_response(
             )
                 .into_response()
         }
+    }
+}
+
+/// Touch coordinates a client may decorate its display poll with.
+///
+/// Parsed by hand out of the raw query rather than with an extractor, because an
+/// extractor's rejection is an HTTP 4xx and this poll must answer 200 whatever a
+/// client appends to its URL. Nothing is percent-decoded: two numbers and an opaque
+/// id have no reason to be escaped, and a decoder here would be a second parser to
+/// keep honest.
+struct Touch {
+    x: f32,
+    y: f32,
+    event_id: Option<String>,
+}
+
+impl Touch {
+    /// `Some` only when both coordinates are present and numeric.
+    ///
+    /// One coordinate alone is not half a tap, it is a client bug; supplying the
+    /// other from thin air would fire an action nobody aimed at.
+    fn from_query(query: Option<&str>) -> Option<Self> {
+        let mut x = None;
+        let mut y = None;
+        let mut event_id = None;
+
+        for pair in query?.split('&') {
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            match name {
+                "touch_x" => x = value.parse().ok(),
+                "touch_y" => y = value.parse().ok(),
+                "touch_event_id" => event_id = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+
+        Some(Self {
+            x: x?,
+            y: y?,
+            event_id,
+        })
+    }
+}
+
+/// A tap, as a caller posts it.
+///
+/// `x0` / `y0` are accepted as aliases because that is tesserae's spelling for the
+/// same two numbers, so a client written against it works here unchanged.
+#[derive(Debug, Deserialize)]
+struct TapBody {
+    #[serde(alias = "x0")]
+    x: f32,
+    #[serde(alias = "y0")]
+    y: f32,
+    /// Absent means "never deduplicate", because there is nothing to compare.
+    #[serde(default)]
+    event_id: Option<String>,
+}
+
+/// The tap response.
+///
+/// Always HTTP 200, like everything under `/d/`. A caller may be firmware that
+/// treats any other status as a transport failure and backs off, and a tap landing
+/// in a gutter is not worth teaching a panel to sleep longer over.
+#[derive(Debug, Serialize)]
+struct TapResponse {
+    /// `0` means the tap was understood, exactly as the display poll uses it.
+    /// Anything else is an error the body then explains, never a status line.
+    status: u16,
+    outcome: Outcome,
+    /// The widget the point landed on, `null` when it landed on nothing.
+    widget: Option<String>,
+    /// What the outcome was about: the `domain.service` dispatched, or why the
+    /// request named nothing at all.
+    detail: Option<String>,
+}
+
+impl TapResponse {
+    fn understood(report: &Report) -> Self {
+        Self {
+            status: 0,
+            outcome: report.outcome,
+            widget: report.widget.clone(),
+            detail: report.detail.clone(),
+        }
+    }
+
+    /// A request that never got as far as a point on a dashboard.
+    fn refused(status: u16, detail: &str) -> Self {
+        Self {
+            status,
+            outcome: Outcome::NoTarget,
+            widget: None,
+            detail: Some(detail.to_owned()),
+        }
+    }
+}
+
+/// `POST /d/{device}/api/tap` — resolve a point to a cell and do what it says.
+///
+/// The body is taken as bytes and parsed here rather than through the `Json`
+/// extractor, whose rejection would be a 4xx: this endpoint lives under `/d/` and
+/// answers 200 even when it refuses.
+async fn tap(
+    State(runtime): State<Arc<Runtime>>,
+    Path(device_id): Path<String>,
+    body: Bytes,
+) -> Response {
+    if body.len() > MAX_TAP_BYTES {
+        return tap_response(TapResponse::refused(
+            400,
+            "the body is longer than a tap can be",
+        ));
+    }
+
+    let tap: TapBody = match serde_json::from_slice(&body) {
+        Ok(tap) => tap,
+        Err(error) => {
+            tracing::warn!(
+                device = %device_id,
+                error = %error,
+                "tap body could not be read"
+            );
+            return tap_response(TapResponse::refused(
+                400,
+                r#"expected {"x": <number>, "y": <number>, "event_id": <string, optional>}"#,
+            ));
+        }
+    };
+
+    // Checked here rather than left to the dispatcher so that an unconfigured id
+    // reads as the server-side error it is, the way a poll for one does.
+    if find_device(&runtime.config(), &device_id).is_none() {
+        tracing::warn!(device = %device_id, "tap for an unconfigured device id");
+        return tap_response(TapResponse::refused(
+            500,
+            "no device is configured under that id",
+        ));
+    }
+
+    let report = runtime
+        .tap(&device_id, tap.x, tap.y, tap.event_id.as_deref())
+        .await;
+    rebuild_after(&runtime, &device_id, &report);
+
+    tracing::info!(
+        device = %device_id,
+        x = tap.x,
+        y = tap.y,
+        outcome = %report.outcome,
+        widget = report.widget.as_deref().unwrap_or("-"),
+        "tap handled"
+    );
+    tap_response(TapResponse::understood(&report))
+}
+
+fn tap_response(body: TapResponse) -> Response {
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Asks the render loop to rebuild the device when a tap changed something.
+///
+/// Without this a tap reads as having done nothing: the light is on, but the panel
+/// goes on showing the frame it had before, until its own interval comes round.
+fn rebuild_after(runtime: &Runtime, device_id: &str, report: &Report) {
+    if matches!(report.outcome, Outcome::Dispatched | Outcome::Refreshed) {
+        runtime.request_render(device_id);
     }
 }
 

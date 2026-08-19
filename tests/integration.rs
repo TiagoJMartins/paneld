@@ -10,17 +10,23 @@ mod common;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use common::{Harness, TWO_DEVICES, is_png, png_dimensions};
+use http_body_util::BodyExt;
 use paneld::app::Runtime;
+use paneld::config::ServiceCall;
 use paneld::frame::Frame;
 use paneld::ha::HaClient;
-use serde_json::json;
+use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Receiver;
+use tower::ServiceExt;
 
 /// Matches `public_base_url` in every fixture here, so an `image_url` off the wire
 /// can be turned back into a request path.
@@ -111,6 +117,13 @@ entity = "binary_sensor.hall_door"
 struct StubHa {
     answers: HashMap<String, Result<String, String>>,
     calls: Arc<AtomicUsize>,
+    /// Every service call posted, in order. A `Mutex` rather than a counter
+    /// because a tap's whole point is the body it sends, and asserting on that is
+    /// the only way to know the right entity was actuated.
+    services: Arc<Mutex<Vec<ServiceCall>>>,
+    /// What Home Assistant says when asked to call a service, so the refusal path
+    /// is exercised over the same wire as the success path.
+    refuses: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -123,6 +136,14 @@ impl HaClient for StubHa {
             None => Err(anyhow::anyhow!("the stub has no answer for `{reading}`")),
         }
     }
+
+    async fn call(&self, call: &ServiceCall) -> anyhow::Result<()> {
+        self.services.lock().unwrap().push(call.clone());
+        match &self.refuses {
+            Some(message) => Err(anyhow::anyhow!(message.clone())),
+            None => Ok(()),
+        }
+    }
 }
 
 /// A runtime built over a stub Home Assistant, driven by `render_device` directly.
@@ -132,6 +153,7 @@ impl HaClient for StubHa {
 struct HaFixture {
     runtime: Arc<Runtime>,
     calls: Arc<AtomicUsize>,
+    services: Arc<Mutex<Vec<ServiceCall>>>,
     /// Held only to keep the wake channel open for the runtime's lifetime.
     _wake: Receiver<String>,
     content_path: PathBuf,
@@ -142,6 +164,26 @@ impl HaFixture {
     /// fixtures sharing a tag would share a content store and confound a
     /// byte-for-byte comparison.
     async fn start(toml: &str, tag: &str, answers: &[(&str, Result<&str, &str>)]) -> Self {
+        Self::start_with(toml, tag, answers, None).await
+    }
+
+    /// Starts with a Home Assistant that refuses every service call, so a tap's
+    /// failure path runs through the same composition root as its success path.
+    async fn start_refusing(
+        toml: &str,
+        tag: &str,
+        answers: &[(&str, Result<&str, &str>)],
+        message: &str,
+    ) -> Self {
+        Self::start_with(toml, tag, answers, Some(message.to_owned())).await
+    }
+
+    async fn start_with(
+        toml: &str,
+        tag: &str,
+        answers: &[(&str, Result<&str, &str>)],
+        refuses: Option<String>,
+    ) -> Self {
         let content_path = std::env::temp_dir().join(format!(
             "paneld-integration-{}-{tag}.json",
             std::process::id()
@@ -152,6 +194,7 @@ impl HaFixture {
         config.server.content_path = content_path.to_string_lossy().into_owned();
 
         let calls = Arc::new(AtomicUsize::new(0));
+        let services = Arc::new(Mutex::new(Vec::new()));
         let stub = StubHa {
             answers: answers
                 .iter()
@@ -164,6 +207,8 @@ impl HaFixture {
                 })
                 .collect(),
             calls: Arc::clone(&calls),
+            services: Arc::clone(&services),
+            refuses,
         };
 
         let (runtime, wake) = Runtime::with_home_assistant(config, Some(Box::new(stub)))
@@ -171,6 +216,7 @@ impl HaFixture {
         Self {
             runtime,
             calls,
+            services,
             _wake: wake,
             content_path,
         }
@@ -190,6 +236,64 @@ impl HaFixture {
 
     fn calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
+    }
+
+    /// Every service call Home Assistant was asked to make, in order.
+    fn services(&self) -> Vec<ServiceCall> {
+        self.services.lock().unwrap().clone()
+    }
+
+    fn router(&self) -> Router {
+        paneld::http::router(Arc::clone(&self.runtime))
+    }
+
+    /// `POST /d/{device}/api/tap`, returning the HTTP status and the body.
+    ///
+    /// The status is returned rather than asserted so a case can pin the
+    /// always-200 rule for itself.
+    async fn tap(&self, device: &str, body: Value) -> (StatusCode, Value) {
+        self.send(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/d/{device}/api/tap"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn get(&self, uri: &str) -> (StatusCode, Value) {
+        self.send(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
+        let response = self
+            .router()
+            .oneshot(request)
+            .await
+            .expect("the router is infallible");
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("reading the response body")
+            .to_bytes();
+        let json = serde_json::from_slice(&body).unwrap_or_else(|error| {
+            panic!(
+                "response body is not JSON ({error}): {}",
+                String::from_utf8_lossy(&body)
+            )
+        });
+        (status, json)
     }
 }
 
@@ -594,5 +698,324 @@ label = "Kettle"
         rendered,
         ["kindle", "kitchen"],
         "kitchen becomes due on its own 60-second clock"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tap actions, end to end over the HTTP surface
+// ---------------------------------------------------------------------------
+
+/// A 400x300 panel on a 2x2 grid, with one tappable cell, one inert cell, and two
+/// cells left empty.
+const TAPPABLE: &str = r#"
+[server]
+listen = "0.0.0.0:4444"
+public_base_url = "http://192.168.0.50:4444"
+
+[home_assistant]
+base_url = "http://homeassistant.invalid:8123"
+token = "never-sent-anywhere"
+
+[[device]]
+id = "kindle"
+width = 400
+height = 300
+palette = "gray16"
+dither = "bayer"
+refresh_rate = 300
+render_interval = 300
+grid = { cols = 2, rows = 2 }
+
+[[device.widget]]
+id = "desk_lamp"
+kind = "ha_entity"
+col = 0
+row = 0
+label = "Desk"
+entity = "light.desk"
+tap = "light.toggle"
+
+[[device.widget]]
+id = "office_temp"
+kind = "ha_entity"
+col = 1
+row = 0
+label = "Office"
+unit = "C"
+entity = "sensor.office_temperature"
+"#;
+
+/// The states [`TAPPABLE`]'s two cells read, so a render succeeds and the frame the
+/// poll serves is a real one.
+const TAPPABLE_STATES: &[(&str, Result<&str, &str>)] = &[
+    ("light.desk", Ok("off")),
+    ("sensor.office_temperature", Ok("21.4")),
+];
+
+// Points on [`TAPPABLE`]'s frame, derived here rather than from the renderer so
+// that these cases would catch the geometry changing under them.
+//
+// The smallest side of a cell is min(400/2, 300/2) = 150, so the gutter is
+// (150 * 0.06).clamp(1, 10) = 9. A cell is then (400 - 9*3)/2 = 186.5 wide and
+// (300 - 9*3)/2 = 136.5 tall, and cell (col, row) starts at
+// 9 + col * 195.5, 9 + row * 145.5.
+
+/// The middle of the tappable cell at (0, 0).
+const ON_DESK_LAMP: (f32, f32) = (102.25, 77.25);
+
+/// The middle of the inert cell at (1, 0).
+const ON_OFFICE_TEMP: (f32, f32) = (297.75, 77.25);
+
+/// Between the two columns: cell (0, 0) ends at 195.5 and cell (1, 0) begins at
+/// 204.5, so this belongs to neither.
+const IN_A_GUTTER: (f32, f32) = (200.0, 77.25);
+
+/// The middle of the empty cell at (0, 1).
+const ON_AN_EMPTY_CELL: (f32, f32) = (102.25, 222.75);
+
+fn at(point: (f32, f32), event_id: Option<&str>) -> Value {
+    match event_id {
+        Some(event_id) => json!({ "x": point.0, "y": point.1, "event_id": event_id }),
+        None => json!({ "x": point.0, "y": point.1 }),
+    }
+}
+
+#[tokio::test]
+async fn a_tap_on_a_widget_dispatches_exactly_one_service_call() {
+    let fixture = HaFixture::start(TAPPABLE, "tap-dispatch", TAPPABLE_STATES).await;
+
+    let (status, body) = fixture.tap("kindle", at(ON_DESK_LAMP, Some("e1"))).await;
+
+    assert_eq!(status, StatusCode::OK, "a tap always answers 200");
+    assert_eq!(body["status"], 0, "0 means the tap was understood");
+    assert_eq!(body["outcome"], "dispatched");
+    assert_eq!(body["widget"], "desk_lamp");
+    assert_eq!(body["detail"], "light.toggle");
+
+    let services = fixture.services();
+    assert_eq!(services.len(), 1, "one tap is one call: {services:?}");
+    assert_eq!(services[0].domain, "light");
+    assert_eq!(services[0].service, "toggle");
+    assert_eq!(
+        Value::Object(services[0].data.clone()),
+        json!({ "entity_id": "light.desk" }),
+        "the body is the widget's own entity, resolved by config"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_event_id_dispatches_nothing_more() {
+    let fixture = HaFixture::start(TAPPABLE, "tap-dedupe", TAPPABLE_STATES).await;
+
+    let (_, first) = fixture.tap("kindle", at(ON_DESK_LAMP, Some("e7"))).await;
+    assert_eq!(first["outcome"], "dispatched");
+
+    let (status, replay) = fixture.tap("kindle", at(ON_DESK_LAMP, Some("e7"))).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay["outcome"], "deduped");
+    assert_eq!(
+        fixture.services().len(),
+        1,
+        "a client that retries must not toggle the light twice"
+    );
+
+    // A different id is a different tap, which is the line the ledger must not
+    // blur: swallowing a deliberate second press is worse than the retry it guards.
+    let (_, again) = fixture.tap("kindle", at(ON_DESK_LAMP, Some("e8"))).await;
+    assert_eq!(again["outcome"], "dispatched");
+    assert_eq!(fixture.services().len(), 2);
+}
+
+#[tokio::test]
+async fn a_tap_that_lands_on_no_cell_dispatches_nothing() {
+    let fixture = HaFixture::start(TAPPABLE, "tap-no-target", TAPPABLE_STATES).await;
+
+    for (what, point) in [
+        ("a gutter", IN_A_GUTTER),
+        ("an empty cell", ON_AN_EMPTY_CELL),
+    ] {
+        let (status, body) = fixture.tap("kindle", at(point, None)).await;
+
+        assert_eq!(status, StatusCode::OK, "{what}");
+        assert_eq!(body["outcome"], "no_target", "{what}");
+        assert_eq!(body["widget"], Value::Null, "{what}");
+        assert_eq!(body["detail"], Value::Null, "{what}");
+    }
+    assert!(
+        fixture.services().is_empty(),
+        "a miss must never fire whichever action happened to be closest"
+    );
+}
+
+#[tokio::test]
+async fn a_tap_on_a_widget_with_no_tap_reports_that_it_is_inert() {
+    let fixture = HaFixture::start(TAPPABLE, "tap-no-action", TAPPABLE_STATES).await;
+
+    let (status, body) = fixture.tap("kindle", at(ON_OFFICE_TEMP, None)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["outcome"], "no_action");
+    assert_eq!(
+        body["widget"], "office_temp",
+        "the cell is still named, which is how a caller tells this from a miss"
+    );
+    assert!(fixture.services().is_empty());
+}
+
+#[tokio::test]
+async fn a_home_assistant_failure_is_reported_and_the_server_keeps_serving() {
+    let fixture = HaFixture::start_refusing(
+        TAPPABLE,
+        "tap-failed",
+        TAPPABLE_STATES,
+        "Home Assistant returned HTTP 400: entity light.desk is unknown",
+    )
+    .await;
+    fixture.render("kindle", OffsetDateTime::now_utc()).await;
+
+    let (status, body) = fixture.tap("kindle", at(ON_DESK_LAMP, Some("e1"))).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unreachable integration is never a transport failure"
+    );
+    assert_eq!(body["outcome"], "failed");
+    assert_eq!(body["widget"], "desk_lamp");
+    assert_eq!(
+        body["detail"], "light.toggle",
+        "the detail names the action; Home Assistant's reason goes to the log"
+    );
+    assert_eq!(fixture.services().len(), 1, "it was attempted");
+
+    let (status, poll) = fixture.get("/d/kindle/api/display").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(poll["status"], 0, "the poll is unaffected: {poll}");
+    assert!(
+        poll["filename"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty()),
+        "the panel is still being served a frame: {poll}"
+    );
+}
+
+#[tokio::test]
+async fn an_unconfigured_device_id_is_an_error_in_the_body_not_the_status_line() {
+    let fixture = HaFixture::start(TAPPABLE, "tap-unknown-device", TAPPABLE_STATES).await;
+
+    let (status, body) = fixture.tap("kindl", at(ON_DESK_LAMP, None)).await;
+
+    assert_eq!(status, StatusCode::OK, "the same rule as the display poll");
+    assert_eq!(body["status"], 500);
+    assert_eq!(body["outcome"], "no_target");
+    assert!(fixture.services().is_empty());
+}
+
+/// tesserae spells the same two numbers `x0` and `y0`, and a client written against
+/// it must work here unchanged.
+#[tokio::test]
+async fn x0_and_y0_are_accepted_as_aliases() {
+    let fixture = HaFixture::start(TAPPABLE, "tap-aliases", TAPPABLE_STATES).await;
+
+    let (status, body) = fixture
+        .tap(
+            "kindle",
+            json!({ "x0": ON_DESK_LAMP.0, "y0": ON_DESK_LAMP.1 }),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["outcome"], "dispatched", "{body}");
+    assert_eq!(fixture.services().len(), 1);
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_a_tap_is_refused_without_a_failing_status_line() {
+    let fixture = HaFixture::start(TAPPABLE, "tap-malformed", TAPPABLE_STATES).await;
+
+    let (status, body) = fixture.tap("kindle", json!({ "x": "over there" })).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "everything under /d/ answers 200, so no firmware learns to back off"
+    );
+    assert_eq!(body["status"], 400);
+    assert_eq!(body["outcome"], "no_target");
+    assert!(fixture.services().is_empty());
+}
+
+/// The path for a client that can only decorate the request it already makes: the
+/// tap must take effect on this wake, and the poll must answer exactly as it would
+/// have without it.
+#[tokio::test]
+async fn a_tap_carried_on_a_display_poll_dispatches_and_still_answers_the_poll() {
+    let fixture = HaFixture::start(TAPPABLE, "tap-on-poll", TAPPABLE_STATES).await;
+    let frame = fixture.render("kindle", OffsetDateTime::now_utc()).await;
+
+    let (status, body) = fixture
+        .get(&format!(
+            "/d/kindle/api/display?touch_x={}&touch_y={}&touch_event_id=e1",
+            ON_DESK_LAMP.0, ON_DESK_LAMP.1
+        ))
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], 0, "{body}");
+    assert_eq!(
+        body["filename"],
+        format!("{}.png", frame.hash),
+        "the poll answers with the frame it would have answered with anyway"
+    );
+    assert_eq!(
+        body["image_url"],
+        format!("{BASE_URL}/d/kindle/frames/{}.png", frame.hash)
+    );
+    assert_eq!(body["refresh_rate"], 300);
+
+    let services = fixture.services();
+    assert_eq!(services.len(), 1, "the tap took effect on this wake");
+    assert_eq!(services[0].to_string(), "light.toggle");
+
+    // The event id came along, so the same decorated poll repeated is one tap.
+    let (_, repeat) = fixture
+        .get(&format!(
+            "/d/kindle/api/display?touch_x={}&touch_y={}&touch_event_id=e1",
+            ON_DESK_LAMP.0, ON_DESK_LAMP.1
+        ))
+        .await;
+    assert_eq!(repeat["status"], 0);
+    assert_eq!(fixture.services().len(), 1, "a repeated poll is not a tap");
+}
+
+/// A poll carrying nonsense where its coordinates should be must answer exactly as
+/// an undecorated poll does, because the alternative is a panel that stops
+/// refreshing over a client-side bug in a feature it does not use.
+#[tokio::test]
+async fn a_malformed_touch_query_leaves_the_poll_untouched() {
+    let fixture = HaFixture::start(TAPPABLE, "tap-bad-query", TAPPABLE_STATES).await;
+    let frame = fixture.render("kindle", OffsetDateTime::now_utc()).await;
+
+    let plain = fixture.get("/d/kindle/api/display").await;
+    for query in [
+        "?touch_x=over-there&touch_y=77.25",
+        "?touch_x=102.25",
+        "?touch_y=77.25",
+        "?touch_event_id=e1",
+        "?touch_x=&touch_y=",
+    ] {
+        let decorated = fixture.get(&format!("/d/kindle/api/display{query}")).await;
+        assert_eq!(decorated, plain, "`{query}` changed the poll's answer");
+    }
+
+    assert!(
+        fixture.services().is_empty(),
+        "half a coordinate is a client bug, not a tap"
+    );
+    assert_eq!(
+        plain.1["filename"],
+        format!("{}.png", frame.hash),
+        "and the frame served is unchanged throughout"
     );
 }

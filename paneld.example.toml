@@ -18,7 +18,14 @@ public_base_url = "http://192.168.0.50:4444"
 # until every publisher happens to fire again.
 content_path = "paneld-content.json"
 
-# Optional. Required by any `ha_entity` widget.
+# Where fetched widget icons are cached. A cache, not a store: every entry is
+# re-fetchable, so losing the directory costs one round trip per icon. It exists so
+# that rendering never touches the network, which is what keeps a frame reproducible
+# and keeps the dashboard drawable while the internet is down.
+icon_cache_path = "paneld-icons"
+
+# Optional. Required by any `ha_entity` or `weather` widget, and by any `tap` that
+# calls a service.
 # [home_assistant]
 # base_url = "http://homeassistant.local:8123"
 # token = "a-long-lived-access-token"
@@ -65,8 +72,9 @@ kind = "beacon"
 col = 0
 row = 0
 label = "Slack"
-# Seconds. After this the cell shows how long ago it was last seen rather than a
-# stale value styled as current. 0, the default, disables the timer.
+# Seconds. Past this the cell keeps showing its last value, but muted and with a
+# mark in its top-right corner meaning "nothing has confirmed this lately". 0, the
+# default, disables the timer.
 stale_after = 3600
 # Matched against the pushed `state` field first and `value` second.
 # Defaults to ["on", "true", "alert"].
@@ -80,6 +88,23 @@ row = 0
 col_span = 2
 label = "Office"
 unit = "°C"
+# Optional, and spelt exactly the way gethomepage.dev spells an icon, so a line can
+# be copied between the two projects:
+#
+#   mdi-thermometer          Material Design Icons
+#   si-homeassistant         Simple Icons
+#   sh-plex                  selfh.st icons (add .svg for the vector version)
+#   plex / plex.png          Dashboard Icons, raster
+#   plex.svg                 Dashboard Icons, vector
+#   https://host/thing.svg   fetched as written
+#   /var/lib/paneld/mine.svg read from this machine
+#
+# `mdi-` and `si-` are the ones that work on e-ink: single-path monochrome
+# silhouettes that rasterise to crisp black. The Dashboard Icons and selfh.st
+# defaults are full-colour brand logos and dither to mush at this size. `mdi-name-#rrggbb`
+# is accepted and reduced to that colour's luminance, since the panel has no hue.
+# `.webp` is rejected at startup rather than failing silently: nothing here decodes it.
+icon = "mdi-thermometer"
 
 [[device.widget]]
 id = "notes"
@@ -89,8 +114,8 @@ row = 0
 label = "Notes"
 
 # Reads from Home Assistant rather than from a push. Needs the [home_assistant]
-# section above. A fetch failure leaves this one cell unavailable and never fails
-# the frame.
+# section above. A fetch failure leaves this one cell showing its last value, muted
+# and marked, and never fails the frame.
 # [[device.widget]]
 # id = "outside_temp"
 # kind = "ha_entity"
@@ -99,3 +124,79 @@ label = "Notes"
 # entity = "sensor.outside_temperature"
 # label = "Outside"
 # unit = "°C"
+
+# A `weather.*` entity's condition, drawn as an icon and its name. Its own kind
+# because a condition is a word from a closed set that wants a picture, not a figure
+# in tabular numerals — `ha_entity` on the same entity renders the literal string
+# `partlycloudy`. `attribute` is rejected here; use `ha_entity` with an `attribute`
+# to show one of the entity's numbers, as `outside_temp` above does.
+# [[device.widget]]
+# id = "sky"
+# kind = "weather"
+# col = 1
+# row = 1
+# col_span = 2
+# row_span = 2
+# entity = "weather.home"
+# label = "Sky"
+
+# ---------------------------------------------------------------------------
+# Tap actions
+# ---------------------------------------------------------------------------
+#
+# A widget may declare what tapping its cell does. Two verbs, spelt three ways:
+#
+#   tap = "refresh"                                  rebuild this device's frame
+#   tap = "light.toggle"                             call the service on the
+#                                                    widget's own `entity`
+#   tap = { service = "light.turn_on", entity = "light.desk", data = { brightness = 180 } }
+#
+# Be aware of what does and does not exist on the device side today. **No shipping
+# panel client reports a tap to its server.** The KOReader plugin's only gesture
+# handler closes the dashboard, and the ESP32 firmware sends no touch information at
+# all. So a `tap` is reachable from exactly two places for now:
+#
+#   1. A fork of the KOReader plugin, which is the eventual client for this.
+#   2. Anything else on the network — a shell script, a phone shortcut, a Home
+#      Assistant automation:
+#
+#        curl -X POST http://192.168.0.50:4444/d/kindle/api/tap \
+#             -H 'content-type: application/json' \
+#             -d '{"x": 102, "y": 77, "event_id": "whatever-1"}'
+#
+# Coordinates are frame pixels, origin top-left. `x0`/`y0` are accepted as aliases.
+# A point in a gutter or on an empty cell does nothing at all rather than firing the
+# nearest action, which on a 300 ppi panel is a routine outcome worth expecting.
+#
+# `event_id` is optional and is what makes a retry safe: the same id for the same
+# device is acted on once. Omit it and every request is a fresh tap.
+#
+# The reply is always HTTP 200 — a panel client treats anything else as a transport
+# failure and backs off — with the result in the body:
+#
+#   {"status": 0, "outcome": "dispatched", "widget": "desk_lamp", "detail": "light.toggle"}
+#
+# `outcome` is one of dispatched, refreshed, no_target, no_action, deduped, failed.
+#
+# A client that cannot make a second request may hang the tap on its display poll
+# instead, which is dispatched before the frame is read so the effect lands on the
+# same wake:
+#
+#   GET /d/kindle/api/display?touch_x=102&touch_y=77&touch_event_id=whatever-1
+#
+# [[device.widget]]
+# id = "desk_lamp"
+# kind = "ha_entity"
+# col = 1
+# row = 1
+# entity = "light.desk"
+# label = "Desk"
+# tap = "light.toggle"
+#
+# [[device.widget]]
+# id = "repaint"
+# kind = "text"
+# col = 2
+# row = 1
+# label = "Refresh"
+# tap = "refresh"
