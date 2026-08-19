@@ -303,7 +303,7 @@ fn cell_node(
     // label's height depend on how tall its neighbour's content happens to be.
     children.push(
         Node::container(body_nodes(
-            fonts, &cell.body, cell.ink, content_w, content_h,
+            fonts, &cell.body, cell.ink, content_w, content_h, label_px,
         ))
         .with_style(
             Style::default()
@@ -455,7 +455,14 @@ fn line(coordinate: u32) -> GridPlacement {
 /// the cell capped at some pixel count. Those caps were set against a 400x300 test
 /// device and silently bound everything on the 1448x1072 panel in service: a label
 /// asked for 45px and got 32, a weather caption asked for 82px and got 34.
-fn body_nodes(fonts: &Fonts, body: &Body, ink: Ink, content_w: f32, content_h: f32) -> Vec<Node> {
+fn body_nodes(
+    fonts: &Fonts,
+    body: &Body,
+    ink: Ink,
+    content_w: f32,
+    content_h: f32,
+    label_px: f32,
+) -> Vec<Node> {
     match body {
         Body::Figure { text, unit } => {
             // The design size *is* the box's height: a run set at that size overflows
@@ -601,10 +608,14 @@ fn body_nodes(fonts: &Fonts, body: &Body, ink: Ink, content_w: f32, content_h: f
             ]
         }
 
+        // An absence is not a reading, so it is set at chrome size rather than filling
+        // the cell a value would have filled. Scaling it to the box put `no data`
+        // across a 2x2 in 97px type, which shouts about the one cell with nothing to
+        // say, and made the same words two sizes on one dashboard.
         Body::Absent(reason) => vec![fitted(
             fonts,
             content_w,
-            (content_h * 0.16).max(MIN_TYPE_PX),
+            (label_px * 1.1).max(MIN_TYPE_PX),
             |size| {
                 text_node(
                     reason,
@@ -1138,12 +1149,17 @@ fn resolve_ha(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
     let (value, ink) = match inputs.ha_states.get(&reading) {
         Some(Reported::Fresh(value)) => (value.as_str(), Ink::Current),
         Some(Reported::Held(value)) => (value.as_str(), Ink::Held),
-        // Nothing was ever read. A missing key means the caller never asked,
-        // which for a validated config means Home Assistant is not configured.
+        // Nothing was ever read. A missing key means the caller never asked, which
+        // for a validated config means Home Assistant is not configured.
+        //
+        // Unmarked, unlike a held value: the mark says the value below is not
+        // confirmed current, and there is no value below for it to qualify. `no data`
+        // and a corner mark say the same thing twice, and the absence is already
+        // drawn muted.
         Some(Reported::Lost) | None => {
             return Cell {
                 body: Body::Absent("no data"),
-                ink: Ink::Held,
+                ink: Ink::Current,
             };
         }
     };
@@ -1615,11 +1631,13 @@ mod tests {
                 ink: Ink::Current,
             }
         );
+        // Lost carries no mark: `Ink::Current` here is not "this is fresh" but "there
+        // is nothing for the mark to qualify". The absence is drawn muted either way.
         assert_eq!(
             resolved(&w, &HashMap::from([(reading, Reported::Lost)])),
             Cell {
                 body: Body::Absent("no data"),
-                ink: Ink::Held,
+                ink: Ink::Current,
             }
         );
     }
@@ -1633,7 +1651,7 @@ mod tests {
             resolved(&w, &HashMap::new()),
             Cell {
                 body: Body::Absent("no data"),
-                ink: Ink::Held,
+                ink: Ink::Current,
             }
         );
     }
