@@ -30,6 +30,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Parse and validate the configuration, print what it describes, and exit.
+    ///
+    /// Exits non-zero on any parse or validation error, so it works as a
+    /// pre-commit check and as a container startup probe: it proves the config
+    /// that is actually mounted is one this binary accepts.
+    Validate,
+
     /// Render one device once, write the PNG to a path, and exit.
     ///
     /// Starts neither the listener nor the render loop, so it is the fast
@@ -53,9 +60,60 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Some(Command::Validate) => validate(&cli.config),
         Some(Command::Preview { device, output }) => preview(&cli.config, &device, &output).await,
         None => serve(&cli.config).await,
     }
+}
+
+/// Reports what the configuration describes, or why it is not usable.
+fn validate(config_path: &Path) -> Result<()> {
+    let config = config::load(config_path)?;
+
+    println!("{} ok", config_path.display());
+    println!("  listen           {}", config.server.listen);
+    println!("  public_base_url  {}", config.server.public_base_url);
+    println!("  content_path     {}", config.server.content_path);
+    println!(
+        "  home_assistant   {}",
+        match &config.home_assistant {
+            Some(ha) => &ha.base_url,
+            None => "not configured",
+        }
+    );
+
+    if config.devices.is_empty() {
+        println!("  devices          none");
+    }
+    for device in &config.devices {
+        let cells = device.grid.cols * device.grid.rows;
+        let occupied: u32 = device.widgets.iter().map(|w| w.col_span * w.row_span).sum();
+        println!(
+            "  device {} {}x{} {:?}/{:?} refresh {}s render {}s",
+            device.id,
+            device.width,
+            device.height,
+            device.palette,
+            device.dither,
+            device.refresh_rate,
+            device.render_interval,
+        );
+        println!(
+            "    grid {}x{}, {} of {} cells used by {} widget(s)",
+            device.grid.cols,
+            device.grid.rows,
+            occupied,
+            cells,
+            device.widgets.len(),
+        );
+        for widget in &device.widgets {
+            println!(
+                "    - {:<16} {:?} at col {} row {} span {}x{}",
+                widget.id, widget.kind, widget.col, widget.row, widget.col_span, widget.row_span,
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn serve(config_path: &Path) -> Result<()> {

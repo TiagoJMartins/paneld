@@ -31,6 +31,15 @@ pub const RENDER_INTERVAL_BOUNDS: std::ops::RangeInclusive<u32> = 5..=86_400;
 /// exhausts memory.
 pub const MAX_DIMENSION: u32 = 4_096;
 
+/// Default ceiling on the encoded frame, in bytes.
+///
+/// A constraint of the original TRMNL ESP32 boards, which buffer the whole PNG
+/// in RAM before decoding: without PSRAM, a frame much larger than this fails to
+/// fetch. It is *not* a constraint of every BYOS client — a Kindle running
+/// KOReader decodes arbitrary PNGs — which is why it is a per-device setting
+/// rather than a constant, and why exceeding it warns rather than fails.
+pub const DEFAULT_MAX_FRAME_BYTES: usize = 90_000;
+
 /// Smallest grid cell that can hold anything legible, in pixels.
 ///
 /// Also a hard safety floor rather than a taste judgement: below roughly this
@@ -97,6 +106,9 @@ pub struct Device {
     /// rendering more often than the device looks is wasted work, and rendering
     /// less often means it sometimes fetches a frame it already has.
     pub render_interval: u32,
+    /// Warn when an encoded frame reaches this many bytes. `0` disables the
+    /// check, which is right for a client that has real memory.
+    pub max_frame_bytes: usize,
     pub grid: Grid,
     pub widgets: Vec<Widget>,
 }
@@ -139,6 +151,10 @@ pub struct Widget {
 
 fn one() -> u32 {
     1
+}
+
+fn default_max_frame_bytes() -> usize {
+    DEFAULT_MAX_FRAME_BYTES
 }
 
 fn default_on_values() -> Vec<String> {
@@ -300,6 +316,7 @@ fn validate_device(device: RawDevice, has_home_assistant: bool) -> Result<Device
         dither,
         refresh_rate,
         render_interval,
+        max_frame_bytes,
         grid,
         widgets,
     } = device;
@@ -376,6 +393,7 @@ fn validate_device(device: RawDevice, has_home_assistant: bool) -> Result<Device
         dither,
         refresh_rate,
         render_interval,
+        max_frame_bytes,
         grid,
         widgets,
     })
@@ -447,6 +465,8 @@ struct RawDevice {
     dither: Dither,
     refresh_rate: u32,
     render_interval: Option<u32>,
+    #[serde(default = "default_max_frame_bytes")]
+    max_frame_bytes: usize,
     grid: Grid,
     #[serde(default, rename = "widget")]
     widgets: Vec<Widget>,
@@ -881,6 +901,31 @@ entity = "sensor.office_temperature"
             );
         let message = err(&text);
         assert!(message.contains("cells"), "{message}");
+    }
+
+    #[test]
+    fn max_frame_bytes_defaults_and_is_overridable() {
+        // A ceiling that suits the original TRMNL boards is wrong for a client with
+        // real memory, so it is per-device rather than a constant.
+        assert_eq!(
+            parse(BASE).unwrap().devices[0].max_frame_bytes,
+            DEFAULT_MAX_FRAME_BYTES
+        );
+
+        let raised = BASE.replace(
+            "refresh_rate = 300",
+            "refresh_rate = 300\nmax_frame_bytes = 250000",
+        );
+        assert_eq!(parse(&raised).unwrap().devices[0].max_frame_bytes, 250_000);
+    }
+
+    #[test]
+    fn a_zero_max_frame_bytes_disables_the_check() {
+        let text = BASE.replace(
+            "refresh_rate = 300",
+            "refresh_rate = 300\nmax_frame_bytes = 0",
+        );
+        assert_eq!(parse(&text).unwrap().devices[0].max_frame_bytes, 0);
     }
 
     #[test]

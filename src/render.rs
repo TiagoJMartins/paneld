@@ -11,7 +11,7 @@
 
 mod encode;
 
-pub use encode::{MAX_FRAME_BYTES, frame_hash, quantise_and_encode};
+pub use encode::{frame_hash, quantise_and_encode};
 
 use std::collections::HashMap;
 
@@ -110,14 +110,28 @@ pub fn render_frame(fonts: &Fonts, inputs: RenderInputs<'_>) -> Result<Vec<u8>> 
     let device = inputs.device;
     let node = dashboard_node(&inputs);
     let raster = rasterise(fonts, node, device.width, device.height)?;
-    quantise_and_encode(
+    let bytes = quantise_and_encode(
         &raster,
         device.width,
         device.height,
         device.palette,
         device.dither,
     )
-    .with_context(|| format!("encoding the frame for device `{}`", device.id))
+    .with_context(|| format!("encoding the frame for device `{}`", device.id))?;
+
+    // Advisory: some BYOS clients buffer the whole PNG in RAM before decoding and
+    // simply fail to fetch a larger one. Whether that applies is a property of the
+    // panel, so it is configured per device and zero switches it off.
+    if device.max_frame_bytes > 0 && bytes.len() >= device.max_frame_bytes {
+        tracing::warn!(
+            device = device.id.as_str(),
+            frame_bytes = bytes.len(),
+            limit = device.max_frame_bytes,
+            "encoded frame reached this device's configured ceiling; a client that \
+             buffers the whole frame may fail to fetch it"
+        );
+    }
+    Ok(bytes)
 }
 
 /// Renders the frame served when a poll names a device that is not configured.
@@ -725,6 +739,7 @@ fn truncate(text: &str, chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_MAX_FRAME_BYTES;
     use crate::config::{Grid, Palette};
     use std::sync::LazyLock;
     use time::Duration;
@@ -742,6 +757,7 @@ mod tests {
             dither: Dither::Atkinson,
             refresh_rate: 300,
             render_interval: 300,
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             grid: Grid { cols: 2, rows: 2 },
             widgets,
         }
@@ -1161,8 +1177,8 @@ mod tests {
         let bytes = render(&device, &content);
         assert_eq!(dimensions(&bytes), (1024, 758));
         assert!(
-            bytes.len() < MAX_FRAME_BYTES,
-            "a full dashboard encoded to {} bytes, over the {MAX_FRAME_BYTES} ceiling",
+            bytes.len() < DEFAULT_MAX_FRAME_BYTES,
+            "a full dashboard encoded to {} bytes, over the {DEFAULT_MAX_FRAME_BYTES} ceiling",
             bytes.len()
         );
     }

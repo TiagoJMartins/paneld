@@ -34,11 +34,6 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{Dither, Palette};
 
-/// Hard ceiling on the encoded frame, in bytes.
-///
-/// A limit of the non-PSRAM device boards: over it, the fetch fails outright.
-pub const MAX_FRAME_BYTES: usize = 90_000;
-
 /// Quantises a straight-alpha RGBA raster to `palette` and encodes it as a PNG.
 ///
 /// `rgba` is row-major, four bytes per pixel, as produced by the rasteriser.
@@ -81,16 +76,9 @@ pub fn quantise_and_encode(
     }
 
     let packed = pack_scanlines(&indices, w, h, spec.bit_depth as usize);
-    let bytes = encode_png(&packed, width, height, &spec)?;
-
-    if bytes.len() >= MAX_FRAME_BYTES {
-        tracing::warn!(
-            frame_bytes = bytes.len(),
-            limit = MAX_FRAME_BYTES,
-            "encoded frame is at or over the device's fetch ceiling; the device will fail to fetch it"
-        );
-    }
-    Ok(bytes)
+    // Whether the result is too big for a particular client is the caller's
+    // policy, not a property of encoding, so no ceiling is applied here.
+    encode_png(&packed, width, height, &spec)
 }
 
 /// The frame's filename stem: SHA-256 over the encoded bytes, truncated to 16
@@ -427,6 +415,7 @@ const GREEN: [u8; 3] = [0, 255, 0];
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_MAX_FRAME_BYTES;
 
     const EVERY_DITHER: [Dither; 4] = [
         Dither::Atkinson,
@@ -651,8 +640,8 @@ mod tests {
         let (w, h) = (1024, 758);
         let bytes = quantise_and_encode(&ramp(w, h), w, h, Palette::Gray16, Dither::Bayer).unwrap();
         assert!(
-            bytes.len() < MAX_FRAME_BYTES,
-            "a 1024x758 gray16 frame encoded to {} bytes, over the {MAX_FRAME_BYTES} ceiling",
+            bytes.len() < DEFAULT_MAX_FRAME_BYTES,
+            "a 1024x758 gray16 frame encoded to {} bytes, over the {DEFAULT_MAX_FRAME_BYTES} ceiling",
             bytes.len()
         );
     }
