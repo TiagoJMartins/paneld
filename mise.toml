@@ -1,0 +1,19 @@
+[tools]
+rust = "stable"
+
+# Thin wrappers over cargo. No build logic lives here.
+[tasks.build]
+description = "Build the release binary"
+run = "cargo build --release"
+
+[tasks.run]
+description = "Run the server against ./paneld.toml"
+run = "cargo run --"
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo test"
+
+[tasks.preview]
+description = "Render one device to a PNG and exit (usage: mise run preview <device> <out.png>)"
+run = "cargo run -- preview"

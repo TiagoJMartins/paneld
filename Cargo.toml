@@ -1,0 +1,56 @@
+[package]
+name = "paneld"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal TRMNL BYOS panel server: TOML dashboards, browserless rendering, pushable content"
+license = "MIT"
+publish = false
+
+[dependencies]
+# HTTP server
+axum = "0.8"
+# Async runtime
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
+# Config + content deserialisation
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Config parsing
+toml = "1.1"
+# Layout + text + rasterisation.
+#
+# `svg-source` is not optional despite us never rendering SVG: takumi-raster
+# 0.4.21 gates `use crate::resources::image::RenderedImage` behind its `svg`
+# feature but matches on that type unconditionally in `background_drawing.rs`,
+# so the crate does not compile without it. We still never take an SVG render
+# path. Dropped: `rayon` (one less variable in the way of byte-identical repeat
+# renders), `image-decoding` (we draw no bitmaps) and `woff`/`woff2` (our
+# embedded faces are TTF).
+takumi = { version = "2.10", default-features = false, features = [
+    "raster-backend",
+    "svg-source",
+] }
+# Palette quantisation and dithering. Note dithr does no gamma linearisation of
+# its own, so we hand it linear-light f32 samples.
+dithr = { version = "0.3", default-features = false, features = ["std"] }
+# PNG encoding. Used directly, never through `image`, which rejects every
+# sub-byte bit depth and so would cost us the 4-bit packing.
+png = "0.18"
+# Content hashing
+sha2 = "0.11"
+# Error handling
+anyhow = "1.0"
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# CLI
+clap = { version = "4.6", features = ["derive"] }
+# Home Assistant client
+reqwest = "0.13"
+async-trait = "0.1"
+# Timestamps on the wire
+time = { version = "0.3", features = ["serde-well-known", "formatting", "parsing"] }
+
+[dev-dependencies]
+# Drives the axum router in-process, without binding a port (test seam 1).
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
