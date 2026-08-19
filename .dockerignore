@@ -1,0 +1,15 @@
+# Build output and VCS metadata: never wanted in the build context.
+target
+.git
+.gitignore
+
+# A local config carries this host's LAN address and must not be baked into an
+# image; it is mounted at run time instead.
+paneld.toml
+paneld-content.json
+
+# Rendered previews.
+*.png
+
+Dockerfile
+.dockerignore
