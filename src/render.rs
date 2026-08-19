@@ -21,6 +21,7 @@ use time::OffsetDateTime;
 
 use crate::config::{Device, Dither, Palette, Widget, WidgetKind};
 use crate::content::{ContentRecord, Row};
+use crate::ha::Reading;
 
 /// Family name the UI text is registered and requested under.
 ///
@@ -68,7 +69,7 @@ pub struct RenderInputs<'a> {
     /// Home Assistant entity states, keyed by entity id, fetched by the caller so
     /// that rendering itself stays pure and synchronous. A per-entity `Err`
     /// degrades that one cell.
-    pub ha_states: &'a HashMap<String, Result<String, String>>,
+    pub ha_states: &'a HashMap<Reading, Result<String, String>>,
     /// The instant staleness is measured against. A parameter rather than a call
     /// to `now_utc()` so a frame is reproducible.
     pub now: OffsetDateTime,
@@ -664,13 +665,32 @@ fn resolve_ha(widget: &Widget, inputs: &RenderInputs<'_>) -> Body {
         // Config validation rejects this, so it cannot happen from a config file.
         return Body::Absent("no entity");
     };
-    match inputs.ha_states.get(entity) {
-        Some(Ok(state)) => Body::Figure {
-            text: state.clone(),
+    let reading = match &widget.attribute {
+        Some(attribute) => Reading::attribute(entity, attribute),
+        None => Reading::state(entity),
+    };
+    match inputs.ha_states.get(&reading) {
+        // Home Assistant reports a missing or dropped-out entity as the literal
+        // state `unavailable` or `unknown`. Rendering that as a figure would put
+        // the word where a number goes, in the confident numeric style — the same
+        // mistake as showing a dead publisher's last value as though it were
+        // current. It is an absence, so it is drawn as one.
+        Some(Ok(value)) if is_sentinel(value) => Body::Absent("unavailable"),
+        Some(Ok(value)) => Body::Figure {
+            text: value.clone(),
             unit: widget.unit.clone(),
         },
         Some(Err(_)) | None => Body::Absent("unavailable"),
     }
+}
+
+/// Whether a Home Assistant state means "no reading" rather than a value.
+fn is_sentinel(state: &str) -> bool {
+    let state = state.trim();
+    state.is_empty()
+        || state.eq_ignore_ascii_case("unavailable")
+        || state.eq_ignore_ascii_case("unknown")
+        || state.eq_ignore_ascii_case("none")
 }
 
 /// How long ago the record was received, if that exceeds the widget's
@@ -775,6 +795,7 @@ mod tests {
             unit: None,
             stale_after: 0,
             entity: None,
+            attribute: None,
             on_values: vec!["on".to_owned(), "true".to_owned(), "alert".to_owned()],
         }
     }
@@ -1037,11 +1058,11 @@ mod tests {
 
         let mut failed = HashMap::new();
         failed.insert(
-            "sensor.office".to_owned(),
+            Reading::state("sensor.office"),
             Err("connection refused".to_owned()),
         );
         let mut ok = HashMap::new();
-        ok.insert("sensor.office".to_owned(), Ok("21.4".to_owned()));
+        ok.insert(Reading::state("sensor.office"), Ok("21.4".to_owned()));
 
         let broken = render_frame(
             &FONTS,
@@ -1069,6 +1090,53 @@ mod tests {
         assert_ne!(
             broken, healthy,
             "unavailable must look different from a value"
+        );
+    }
+
+    #[test]
+    fn a_home_assistant_sentinel_state_is_an_absence_not_a_value() {
+        // A dropped-out Zigbee sensor reports the literal string "unavailable".
+        // Drawing that as a big figure reads as a confident reading, which is the
+        // thing the staleness rules exist to prevent.
+        let mut w = widget("temp", WidgetKind::HaEntity, 0, 0);
+        w.entity = Some("sensor.office".to_owned());
+        let content = HashMap::new();
+
+        for sentinel in ["unavailable", "unknown", "Unavailable", "  ", "none"] {
+            let mut ha = HashMap::new();
+            ha.insert(Reading::state("sensor.office"), Ok(sentinel.to_owned()));
+            assert_eq!(
+                resolve(
+                    &w,
+                    &RenderInputs {
+                        device: &device(vec![]),
+                        content: &content,
+                        ha_states: &ha,
+                        now: now(),
+                    }
+                ),
+                Body::Absent("unavailable"),
+                "{sentinel:?} should render as an absence"
+            );
+        }
+
+        // A real reading is still a figure.
+        let mut ha = HashMap::new();
+        ha.insert(Reading::state("sensor.office"), Ok("21.4".to_owned()));
+        assert_eq!(
+            resolve(
+                &w,
+                &RenderInputs {
+                    device: &device(vec![]),
+                    content: &content,
+                    ha_states: &ha,
+                    now: now(),
+                }
+            ),
+            Body::Figure {
+                text: "21.4".to_owned(),
+                unit: None
+            }
         );
     }
 
@@ -1101,7 +1169,7 @@ mod tests {
         let mut content = HashMap::new();
         content.insert("temp".to_owned(), record(serde_json::json!("99"), now()));
         let mut ha = HashMap::new();
-        ha.insert("sensor.office".to_owned(), Ok("21.4".to_owned()));
+        ha.insert(Reading::state("sensor.office"), Ok("21.4".to_owned()));
 
         assert_eq!(
             resolve(

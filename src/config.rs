@@ -84,8 +84,16 @@ fn default_content_path() -> String {
 pub struct HomeAssistant {
     /// e.g. `http://homeassistant.local:8123`. Stored without a trailing slash.
     pub base_url: String,
-    /// Long-lived access token.
-    pub token: String,
+    /// Long-lived access token, written literally. Convenient for local use, but
+    /// it puts a credential in the config file — prefer [`Self::token_env`]
+    /// anywhere the config is version-controlled or mounted from a ConfigMap.
+    pub token: Option<String>,
+    /// Name of an environment variable to read the token from instead.
+    ///
+    /// Exactly one of `token` and `token_env` must be set. Resolved when the
+    /// client is built rather than at parse time, so that parsing stays a pure
+    /// function of the text.
+    pub token_env: Option<String>,
 }
 
 /// One panel.
@@ -144,6 +152,12 @@ pub struct Widget {
     pub stale_after: u64,
     /// Home Assistant entity id, for `kind = "ha_entity"`.
     pub entity: Option<String>,
+    /// Read this attribute of the entity instead of its own state.
+    ///
+    /// Needed more often than it sounds: a `weather.*` entity's state is a
+    /// condition like `partlycloudy`, and the temperature you actually want to
+    /// show is an attribute.
+    pub attribute: Option<String>,
     /// Values that put a `beacon` in its "on" state.
     #[serde(default = "default_on_values")]
     pub on_values: Vec<String>,
@@ -237,10 +251,23 @@ pub fn parse(text: &str) -> Result<Config> {
     };
 
     let home_assistant = match file.home_assistant {
-        Some(ha) => Some(HomeAssistant {
-            base_url: validate_base_url(&ha.base_url, "home_assistant.base_url")?,
-            token: ha.token,
-        }),
+        Some(ha) => {
+            ensure!(
+                ha.token.is_some() != ha.token_env.is_some(),
+                "home_assistant needs exactly one of `token` or `token_env`, not both and not neither"
+            );
+            if let Some(name) = &ha.token_env {
+                ensure!(
+                    !name.is_empty(),
+                    "home_assistant.token_env must name an environment variable"
+                );
+            }
+            Some(HomeAssistant {
+                base_url: validate_base_url(&ha.base_url, "home_assistant.base_url")?,
+                token: ha.token,
+                token_env: ha.token_env,
+            })
+        }
         None => None,
     };
 

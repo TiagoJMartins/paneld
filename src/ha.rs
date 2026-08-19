@@ -29,11 +29,47 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_SNIPPET_CHARS: usize = 200;
 
 /// Reads one entity's state from Home Assistant.
+/// What to read from Home Assistant.
+///
+/// An attribute rather than the entity's own state is a common need, not an edge
+/// case: a `weather.*` entity's state is a condition like `partlycloudy`, and the
+/// temperature worth putting on a panel is an attribute of it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Reading {
+    pub entity_id: String,
+    pub attribute: Option<String>,
+}
+
+impl Reading {
+    pub fn state(entity_id: impl Into<String>) -> Self {
+        Self {
+            entity_id: entity_id.into(),
+            attribute: None,
+        }
+    }
+
+    pub fn attribute(entity_id: impl Into<String>, attribute: impl Into<String>) -> Self {
+        Self {
+            entity_id: entity_id.into(),
+            attribute: Some(attribute.into()),
+        }
+    }
+}
+
+impl std::fmt::Display for Reading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.attribute {
+            Some(attribute) => write!(f, "{}#{attribute}", self.entity_id),
+            None => f.write_str(&self.entity_id),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait HaClient: Send + Sync {
     /// Returns the entity's current state as Home Assistant reports it, e.g.
     /// `"21.4"`, `"on"` or `"unavailable"`.
-    async fn state(&self, entity_id: &str) -> Result<String>;
+    async fn read(&self, reading: &Reading) -> Result<String>;
 }
 
 /// A [`HaClient`] speaking to a real Home Assistant over HTTP.
@@ -55,8 +91,10 @@ impl HttpHaClient {
     ///
     /// Fails only if the configured token cannot be a header value.
     pub fn new(config: &crate::config::HomeAssistant) -> Result<Self> {
-        let mut auth = HeaderValue::from_str(&format!("Bearer {}", config.token))
-            .context("home_assistant.token is not usable as an HTTP header value")?;
+        let token = resolve_token(config)?;
+        let mut auth = HeaderValue::from_str(&format!("Bearer {token}")).context(
+            "the home_assistant.token / token_env value is not usable as an HTTP header value",
+        )?;
         auth.set_sensitive(true);
 
         let mut headers = HeaderMap::new();
@@ -77,7 +115,8 @@ impl HttpHaClient {
 
     /// The request, with every failure reported as its own message. `state`
     /// wraps this in the context naming the entity.
-    async fn fetch_state(&self, entity_id: &str) -> Result<String> {
+    async fn fetch_reading(&self, reading: &Reading) -> Result<String> {
+        let entity_id = reading.entity_id.as_str();
         validate_entity_id(entity_id)?;
 
         let url = format!("{}/api/states/{entity_id}", self.base_url);
@@ -105,23 +144,78 @@ impl HttpHaClient {
 
         let json: serde_json::Value = serde_json::from_str(&body)
             .with_context(|| format!("response body is not JSON: {}", snippet(&body)))?;
-        let Some(state) = json.get("state").and_then(serde_json::Value::as_str) else {
-            bail!(
-                "response JSON has no string `state` field: {}",
-                snippet(&body)
-            );
+        let Some(attribute) = &reading.attribute else {
+            let Some(state) = json.get("state").and_then(serde_json::Value::as_str) else {
+                bail!(
+                    "response JSON has no string `state` field: {}",
+                    snippet(&body)
+                );
+            };
+            return Ok(state.to_owned());
         };
 
-        Ok(state.to_owned())
+        let Some(value) = json.get("attributes").and_then(|a| a.get(attribute)) else {
+            bail!(
+                "entity has no attribute `{attribute}`; it has {}",
+                available_attributes(&json)
+            );
+        };
+        // Numbers and booleans are as legitimate on a panel as strings, and a
+        // temperature arrives as a number.
+        Ok(match value {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Null => bail!("attribute `{attribute}` is null"),
+            other => other.to_string(),
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl HaClient for HttpHaClient {
-    async fn state(&self, entity_id: &str) -> Result<String> {
-        self.fetch_state(entity_id)
+    async fn read(&self, reading: &Reading) -> Result<String> {
+        self.fetch_reading(reading)
             .await
-            .with_context(|| format!("Home Assistant entity `{entity_id}`"))
+            .with_context(|| format!("Home Assistant reading `{reading}`"))
+    }
+}
+
+/// The token, either written in the config or read from the environment.
+///
+/// Config validation guarantees exactly one source is configured. Reading the
+/// environment happens here rather than at parse time so that parsing stays a
+/// pure function of the text, and so a token never has to be written into a
+/// ConfigMap to be mounted.
+fn resolve_token(config: &crate::config::HomeAssistant) -> Result<String> {
+    if let Some(token) = &config.token {
+        return Ok(token.clone());
+    }
+    let name = config
+        .token_env
+        .as_deref()
+        .context("home_assistant has neither `token` nor `token_env`")?;
+    let token = std::env::var(name).with_context(|| {
+        format!("home_assistant.token_env names environment variable `{name}`, which is not set")
+    })?;
+    ensure!(
+        !token.trim().is_empty(),
+        "home_assistant.token_env names environment variable `{name}`, which is set but empty"
+    );
+    Ok(token)
+}
+
+/// The attribute names an entity does have, for an error message that tells the
+/// author what to write instead of only what was wrong.
+fn available_attributes(json: &serde_json::Value) -> String {
+    match json
+        .get("attributes")
+        .and_then(serde_json::Value::as_object)
+    {
+        Some(attributes) if !attributes.is_empty() => {
+            let mut names: Vec<&str> = attributes.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            names.join(", ")
+        }
+        _ => "none".to_owned(),
     }
 }
 
@@ -134,37 +228,36 @@ impl HaClient for HttpHaClient {
 /// Fetches concurrently. The render loop is a single task, so N sequential
 /// requests against an unreachable Home Assistant would stall it for
 /// N * [`REQUEST_TIMEOUT`].
-pub async fn fetch_states(
+pub async fn fetch_readings(
     client: &dyn HaClient,
-    entities: &[String],
-) -> HashMap<String, Result<String, String>> {
-    let distinct = distinct_ids(entities);
-    let results = join_all(distinct.iter().map(|id| client.state(id)).collect()).await;
+    readings: &[Reading],
+) -> HashMap<Reading, Result<String, String>> {
+    let distinct = distinct_readings(readings);
+    let results = join_all(distinct.iter().map(|r| client.read(r)).collect()).await;
 
     distinct
         .into_iter()
         .zip(results)
-        .map(|(entity_id, result)| {
+        .map(|(reading, result)| {
             let value = result.map_err(|err| {
                 let message = format!("{err:#}");
-                tracing::warn!(entity_id, error = %message, "Home Assistant fetch failed");
+                tracing::warn!(reading = %reading, error = %message, "Home Assistant fetch failed");
                 message
             });
-            (entity_id.to_owned(), value)
+            (reading.clone(), value)
         })
         .collect()
 }
 
-/// Input order, one entry per distinct id.
+/// Input order, one entry per distinct reading.
 ///
-/// Linear membership scan rather than a `HashSet`: an entity list is one id per
-/// grid cell, so this is a handful of pointer comparisons against an
-/// allocation.
-fn distinct_ids(entities: &[String]) -> Vec<&str> {
-    let mut distinct: Vec<&str> = Vec::with_capacity(entities.len());
-    for entity in entities {
-        if !distinct.contains(&entity.as_str()) {
-            distinct.push(entity);
+/// Linear membership scan rather than a `HashSet`: a reading list is one entry
+/// per grid cell, so this is a handful of comparisons against an allocation.
+fn distinct_readings(readings: &[Reading]) -> Vec<&Reading> {
+    let mut distinct: Vec<&Reading> = Vec::with_capacity(readings.len());
+    for reading in readings {
+        if !distinct.contains(&reading) {
+            distinct.push(reading);
         }
     }
     distinct
@@ -303,8 +396,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HaClient for StubHaClient {
-        async fn state(&self, entity_id: &str) -> Result<String> {
+        async fn read(&self, reading: &Reading) -> Result<String> {
             self.total_calls.fetch_add(1, Ordering::Relaxed);
+            let entity_id = reading.to_string();
+            let entity_id = entity_id.as_str();
 
             let Some(canned) = self.answers.get(entity_id) else {
                 bail!("stub has no answer for `{entity_id}`");
@@ -318,14 +413,15 @@ mod tests {
         }
     }
 
-    fn ids(ids: &[&str]) -> Vec<String> {
-        ids.iter().map(|id| (*id).to_owned()).collect()
+    fn readings(ids: &[&str]) -> Vec<Reading> {
+        ids.iter().map(|id| Reading::state(*id)).collect()
     }
 
     fn config() -> HomeAssistant {
         HomeAssistant {
             base_url: "http://homeassistant.local:8123".to_owned(),
-            token: "tok".to_owned(),
+            token: Some("tok".to_owned()),
+            token_env: None,
         }
     }
 
@@ -336,9 +432,9 @@ mod tests {
             ("binary_sensor.door", Ok("on")),
         ]);
 
-        let states = fetch_states(
+        let states = fetch_readings(
             &client,
-            &ids(&[
+            &readings(&[
                 "sensor.office_temp",
                 "binary_sensor.door",
                 "sensor.office_temp",
@@ -347,8 +443,14 @@ mod tests {
         .await;
 
         assert_eq!(states.len(), 2);
-        assert_eq!(states["sensor.office_temp"], Ok("21.4".to_owned()));
-        assert_eq!(states["binary_sensor.door"], Ok("on".to_owned()));
+        assert_eq!(
+            states[&Reading::state("sensor.office_temp")],
+            Ok("21.4".to_owned())
+        );
+        assert_eq!(
+            states[&Reading::state("binary_sensor.door")],
+            Ok("on".to_owned())
+        );
         assert_eq!(client.call_count("sensor.office_temp"), 1);
         assert_eq!(client.total_calls(), 2);
     }
@@ -361,16 +463,22 @@ mod tests {
             ("binary_sensor.door", Ok("on")),
         ]);
 
-        let states = fetch_states(
+        let states = fetch_readings(
             &client,
-            &ids(&["sensor.office_temp", "sensor.broken", "binary_sensor.door"]),
+            &readings(&["sensor.office_temp", "sensor.broken", "binary_sensor.door"]),
         )
         .await;
 
         assert_eq!(states.len(), 3);
-        assert_eq!(states["sensor.office_temp"], Ok("21.4".to_owned()));
-        assert_eq!(states["binary_sensor.door"], Ok("on".to_owned()));
-        let message = states["sensor.broken"]
+        assert_eq!(
+            states[&Reading::state("sensor.office_temp")],
+            Ok("21.4".to_owned())
+        );
+        assert_eq!(
+            states[&Reading::state("binary_sensor.door")],
+            Ok("on".to_owned())
+        );
+        let message = states[&Reading::state("sensor.broken")]
             .as_ref()
             .expect_err("sensor.broken answers with an error");
         assert!(message.contains("connection refused"), "{message}");
@@ -380,17 +488,20 @@ mod tests {
     async fn an_unknown_entity_is_an_error_not_a_missing_entry() {
         let client = StubHaClient::new(&[("sensor.office_temp", Ok("21.4"))]);
 
-        let states = fetch_states(&client, &ids(&["sensor.nope"])).await;
+        let states = fetch_readings(&client, &readings(&["sensor.nope"])).await;
 
         assert_eq!(states.len(), 1);
-        assert!(states["sensor.nope"].is_err(), "{states:?}");
+        assert!(
+            states[&Reading::state("sensor.nope")].is_err(),
+            "{states:?}"
+        );
     }
 
     #[tokio::test]
     async fn an_empty_entity_list_yields_an_empty_map() {
         let client = StubHaClient::new(&[("sensor.office_temp", Ok("21.4"))]);
 
-        let states = fetch_states(&client, &[]).await;
+        let states = fetch_readings(&client, &[]).await;
 
         assert!(states.is_empty(), "{states:?}");
         assert_eq!(client.total_calls(), 0);
@@ -407,9 +518,9 @@ mod tests {
 
         #[async_trait::async_trait]
         impl HaClient for BarrierHaClient {
-            async fn state(&self, entity_id: &str) -> Result<String> {
+            async fn read(&self, reading: &Reading) -> Result<String> {
                 self.barrier.wait().await;
-                Ok(entity_id.to_owned())
+                Ok(reading.entity_id.clone())
             }
         }
 
@@ -419,13 +530,19 @@ mod tests {
 
         let states = tokio::time::timeout(
             Duration::from_secs(5),
-            fetch_states(&client, &ids(&["sensor.a", "sensor.b"])),
+            fetch_readings(&client, &readings(&["sensor.a", "sensor.b"])),
         )
         .await
         .expect("both fetches are in flight together");
 
-        assert_eq!(states["sensor.a"], Ok("sensor.a".to_owned()));
-        assert_eq!(states["sensor.b"], Ok("sensor.b".to_owned()));
+        assert_eq!(
+            states[&Reading::state("sensor.a")],
+            Ok("sensor.a".to_owned())
+        );
+        assert_eq!(
+            states[&Reading::state("sensor.b")],
+            Ok("sensor.b".to_owned())
+        );
     }
 
     #[test]
@@ -437,7 +554,8 @@ mod tests {
     fn new_rejects_a_token_that_cannot_be_a_header_value() {
         let message = HttpHaClient::new(&HomeAssistant {
             base_url: "http://homeassistant.local:8123".to_owned(),
-            token: "tok\nInjected: yes".to_owned(),
+            token: Some("tok\nInjected: yes".to_owned()),
+            token_env: None,
         })
         .expect_err("a token with a newline cannot be a header value")
         .to_string();
@@ -452,7 +570,7 @@ mod tests {
         // Validation happens before any request, so this never touches the
         // network despite the base URL being unreachable from a test.
         let err = client
-            .state("sensor.office/../../config")
+            .read(&Reading::state("sensor.office/../../config"))
             .await
             .expect_err("a path-forging entity id is rejected");
         let message = format!("{err:#}");
@@ -466,10 +584,72 @@ mod tests {
         let client = HttpHaClient::new(&config()).unwrap();
 
         let err = client
-            .state("sensor.office temp")
+            .read(&Reading::state("sensor.office temp"))
             .await
             .expect_err("an entity id with a space is rejected");
 
         assert!(format!("{err:#}").contains("sensor.office temp"), "{err:#}");
+    }
+    #[tokio::test]
+    async fn a_reading_can_target_an_attribute_rather_than_the_state() {
+        // The case that motivated this: a weather entity's state is a condition
+        // like "partlycloudy", and the temperature is an attribute of it.
+        let client = StubHaClient::new(&[
+            ("weather.braga", Ok("partlycloudy")),
+            ("weather.braga#temperature", Ok("27.1")),
+        ]);
+        let readings = vec![
+            Reading::state("weather.braga"),
+            Reading::attribute("weather.braga", "temperature"),
+        ];
+
+        let out = fetch_readings(&client, &readings).await;
+        assert_eq!(out.len(), 2, "state and attribute are distinct readings");
+        assert_eq!(
+            out[&Reading::state("weather.braga")],
+            Ok("partlycloudy".to_owned())
+        );
+        assert_eq!(
+            out[&Reading::attribute("weather.braga", "temperature")],
+            Ok("27.1".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_reading_renders_for_logs_and_keys_distinctly() {
+        assert_eq!(Reading::state("weather.braga").to_string(), "weather.braga");
+        assert_eq!(
+            Reading::attribute("weather.braga", "temperature").to_string(),
+            "weather.braga#temperature"
+        );
+        assert_ne!(
+            Reading::state("weather.braga"),
+            Reading::attribute("weather.braga", "temperature")
+        );
+    }
+
+    #[test]
+    fn a_token_can_come_from_the_environment_so_it_need_not_be_in_the_config() {
+        // Set on this process only; the point is that a ConfigMap never has to
+        // carry a credential.
+        let name = "PANELD_TEST_HA_TOKEN";
+        unsafe { std::env::set_var(name, "from-the-env") };
+
+        let client = HttpHaClient::new(&HomeAssistant {
+            base_url: "http://homeassistant.local:8123".to_owned(),
+            token: None,
+            token_env: Some(name.to_owned()),
+        });
+        assert!(client.is_ok(), "{:?}", client.err());
+
+        unsafe { std::env::remove_var(name) };
+        let message = HttpHaClient::new(&HomeAssistant {
+            base_url: "http://homeassistant.local:8123".to_owned(),
+            token: None,
+            token_env: Some(name.to_owned()),
+        })
+        .expect_err("an unset variable must be an error, not an empty token")
+        .to_string();
+        assert!(message.contains(name), "{message}");
     }
 }

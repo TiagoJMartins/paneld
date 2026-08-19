@@ -115,12 +115,12 @@ struct StubHa {
 
 #[async_trait::async_trait]
 impl HaClient for StubHa {
-    async fn state(&self, entity_id: &str) -> anyhow::Result<String> {
+    async fn read(&self, reading: &paneld::ha::Reading) -> anyhow::Result<String> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        match self.answers.get(entity_id) {
+        match self.answers.get(reading.entity_id.as_str()) {
             Some(Ok(state)) => Ok(state.clone()),
             Some(Err(message)) => Err(anyhow::anyhow!(message.clone())),
-            None => Err(anyhow::anyhow!("the stub has no answer for `{entity_id}`")),
+            None => Err(anyhow::anyhow!("the stub has no answer for `{reading}`")),
         }
     }
 }

@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::config::{Config, Device};
 use crate::content::ContentStore;
 use crate::frame::{Frame, FrameStore};
-use crate::ha::{HaClient, HttpHaClient, fetch_states};
+use crate::ha::{HaClient, HttpHaClient, Reading, fetch_readings};
 use crate::render::{self, RenderInputs};
 use crate::status::StatusStore;
 
@@ -190,21 +190,27 @@ impl Runtime {
     ///
     /// A missing client or a per-entity failure leaves that cell unavailable
     /// rather than failing the frame.
-    async fn fetch_ha_states(&self, device: &Device) -> HashMap<String, Result<String, String>> {
-        let entities: Vec<String> = device
+    async fn fetch_ha_states(&self, device: &Device) -> HashMap<Reading, Result<String, String>> {
+        let readings: Vec<Reading> = device
             .widgets
             .iter()
-            .filter_map(|widget| widget.entity.clone())
+            .filter_map(|widget| {
+                let entity = widget.entity.as_ref()?;
+                Some(match &widget.attribute {
+                    Some(attribute) => Reading::attribute(entity, attribute),
+                    None => Reading::state(entity),
+                })
+            })
             .collect();
-        if entities.is_empty() {
+        if readings.is_empty() {
             return HashMap::new();
         }
 
         match &self.ha {
-            Some(client) => fetch_states(client.as_ref(), &entities).await,
-            None => entities
+            Some(client) => fetch_readings(client.as_ref(), &readings).await,
+            None => readings
                 .into_iter()
-                .map(|entity| (entity, Err("Home Assistant is not configured".to_owned())))
+                .map(|reading| (reading, Err("Home Assistant is not configured".to_owned())))
                 .collect(),
         }
     }
