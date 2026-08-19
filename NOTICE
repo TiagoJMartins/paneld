@@ -1,0 +1,13 @@
+paneld is MIT licensed; see LICENSE.
+
+It embeds two typefaces with `include_bytes!`, so every binary and every
+container image redistributes them. Both are licensed under the SIL Open Font
+License version 1.1, which requires its licence text to accompany the font.
+Those texts are kept alongside the fonts and are included in each release
+archive:
+
+  Inter           assets/fonts/Inter-LICENSE.txt
+  IBM Plex Mono   assets/fonts/IBMPlexMono-LICENSE.txt
+
+Kept separate from LICENSE so that file stays a verbatim MIT text, which is what
+lets GitHub and other tooling classify the project's licence automatically.

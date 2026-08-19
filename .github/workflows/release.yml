@@ -35,7 +35,7 @@ jobs:
           stage="paneld-${version}-x86_64-unknown-linux-gnu"
           mkdir "$stage"
           cp target/release/paneld "$stage"/
-          cp paneld.example.toml LICENSE "$stage"/
+          cp paneld.example.toml LICENSE NOTICE "$stage"/
           # The embedded typefaces are OFL 1.1, which requires its licence to
           # travel with any redistribution of the font — including inside a binary.
           cp assets/fonts/*LICENSE*.txt "$stage"/
