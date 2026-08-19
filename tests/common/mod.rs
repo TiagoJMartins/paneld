@@ -5,6 +5,10 @@
 //! of the real loop body, so a render is provoked deterministically instead of
 //! waiting on an interval.
 
+// Each test binary compiles this harness separately and uses only the part it
+// needs, so helpers unused by one of them are expected rather than dead code.
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
