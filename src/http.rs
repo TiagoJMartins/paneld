@@ -61,6 +61,7 @@ fn routes(runtime: Arc<Runtime>) -> Router {
         .route("/d/{device}/api/setup", get(setup))
         .route("/d/{device}/api/log", post(device_log))
         .route("/d/{device}/frames/{file}", get(frame_file))
+        .route("/d/{device}/current.png", get(current_frame))
         .route(
             "/api/content/{widget_id}",
             put(put_content).get(get_content),
@@ -358,6 +359,41 @@ async fn frame_file(
             // The device asks for identity encoding; a proxy that recompresses
             // anyway corrupts the fetch.
             (header::CACHE_CONTROL, "no-transform"),
+        ],
+        frame.bytes.to_vec(),
+    )
+        .into_response()
+}
+
+/// `GET /d/{device}/current.png` — whatever frame is being served right now.
+///
+/// A convenience for humans and dashboards: one stable URL that always shows the
+/// latest frame, so a browser tab can just be refreshed. The panel must never use
+/// it, because a filename that never changes defeats the device's own caching and
+/// would make it repaint on every poll — hence `no-store`, which is the opposite
+/// of what the content-addressed frame URLs want.
+async fn current_frame(
+    State(runtime): State<Arc<Runtime>>,
+    Path(device_id): Path<String>,
+) -> Response {
+    let frame = runtime
+        .frames
+        .current(&device_id)
+        .or_else(|| runtime.placeholder(&device_id, None).ok());
+
+    let Some(frame) = frame else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no frame for device `{device_id}`") })),
+        )
+            .into_response();
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "no-store"),
         ],
         frame.bytes.to_vec(),
     )

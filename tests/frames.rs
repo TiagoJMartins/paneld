@@ -446,3 +446,38 @@ async fn content_survives_a_restart() {
     );
     assert_eq!(stored["value"], 21.4);
 }
+
+#[tokio::test]
+async fn the_current_frame_url_is_stable_while_the_content_addressed_one_moves() {
+    // A convenience for humans: one URL to refresh. It must track the latest frame
+    // rather than a hash, and must not be cached, or a browser shows a stale panel.
+    let mut harness = Harness::start(ONE_DEVICE).await;
+
+    let (status, first) = harness.get_bytes("/d/kindle/current.png").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(is_png(&first));
+    assert_eq!(png_dimensions(&first), (400, 300));
+
+    harness
+        .put(
+            "/api/content/office_temp",
+            json!({ "value": 21.4, "render": true }),
+        )
+        .await;
+    harness.tick(NO_TIME).await;
+
+    let (status, second) = harness.get_bytes("/d/kindle/current.png").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(
+        first, second,
+        "the same URL must now serve the newly rendered frame"
+    );
+}
+
+#[tokio::test]
+async fn the_current_frame_url_falls_back_to_the_placeholder_for_an_unknown_device() {
+    let harness = Harness::start(ONE_DEVICE).await;
+    let (status, bytes) = harness.get_bytes("/d/kindel/current.png").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(is_png(&bytes), "a mistyped id should still be diagnosable");
+}

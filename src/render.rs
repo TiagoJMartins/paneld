@@ -361,7 +361,10 @@ fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node>
         Body::Figure { text, unit } => {
             // The figure is sized down as it gets longer so a five-digit reading
             // still fits the cell it was laid out for.
-            let width_limited = span_w * 1.55 / text.chars().count().max(1) as f32;
+            // 1.40 rather than a tighter fit to the glyph advance: a long reading
+            // should keep visible air between itself and the cell rule, or it reads
+            // as having overflowed even when it technically fits.
+            let width_limited = span_w * 1.40 / text.chars().count().max(1) as f32;
             let size = figure_px.min(width_limited).max(14.0);
             let mut nodes = vec![text_node(
                 text,
