@@ -1,0 +1,101 @@
+# paneld — example configuration.
+#
+# Copy to `paneld.toml` and edit. The server re-reads this file when it changes on
+# disk; if the new version does not parse or does not validate, the error is logged
+# and the previous configuration stays in effect, so a typo never blanks the panel.
+
+[server]
+listen = "0.0.0.0:4444"
+
+# Must be reachable *from the device*, so a LAN or tailnet address — never
+# localhost, 127.0.0.1 or a container-internal hostname, all of which are rejected.
+# A trailing slash is stripped: the panel clients concatenate this with the endpoint
+# path without normalising, and a doubled separator is the most likely cause of a
+# silently blank panel.
+public_base_url = "http://192.168.0.50:4444"
+
+# Where pushed content is persisted, so a redeploy does not blank the dashboard
+# until every publisher happens to fire again.
+content_path = "paneld-content.json"
+
+# Optional. Required by any `ha_entity` widget.
+# [home_assistant]
+# base_url = "http://homeassistant.local:8123"
+# token = "a-long-lived-access-token"
+
+[[device]]
+# Selects the route prefix: point the device's base URL at
+# http://192.168.0.50:4444/d/kindle
+id = "kindle"
+
+# The panel's real resolution, so frames are neither letterboxed nor scaled.
+width = 1024
+height = 758
+
+# gray16 | gray4 | mono | bwry | spectra6
+palette = "gray16"
+
+# atkinson | floyd-steinberg | bayer | none
+#
+# Error diffusion gives better tone. Ordered dithering (`bayer`) is stateless per
+# pixel, so a change in one corner leaves every other pixel byte-identical and the
+# panel only repaints when something visibly moved. Prefer `bayer` when frame
+# stability matters more than tone.
+dither = "atkinson"
+
+# Advice sent to the device telling it when to poll again, in seconds. Clamped to
+# 30..=86400; out of range is a config error. Note the KOReader client ignores this
+# unless its "use server refresh interval" setting is enabled, which is off by
+# default.
+refresh_rate = 300
+
+# How often this server rebuilds the frame, in seconds. A separate clock from
+# `refresh_rate`, defaulting to it. Lower it only when a frame should be ready ahead
+# of an unpredictable poll; raise it when a dashboard is expensive and you would
+# rather trigger renders explicitly with `render: true` on a push.
+render_interval = 300
+
+# Each cell must be at least 40x40 pixels.
+grid = { cols = 4, rows = 3 }
+
+[[device.widget]]
+# Also the push address: PUT /api/content/slack_unread
+id = "slack_unread"
+kind = "beacon"
+col = 0
+row = 0
+label = "Slack"
+# Seconds. After this the cell shows how long ago it was last seen rather than a
+# stale value styled as current. 0, the default, disables the timer.
+stale_after = 3600
+# Matched against the pushed `state` field first and `value` second.
+# Defaults to ["on", "true", "alert"].
+on_values = ["on", "true", "alert"]
+
+[[device.widget]]
+id = "office_temp"
+kind = "value"
+col = 1
+row = 0
+col_span = 2
+label = "Office"
+unit = "°C"
+
+[[device.widget]]
+id = "notes"
+kind = "text"
+col = 3
+row = 0
+label = "Notes"
+
+# Reads from Home Assistant rather than from a push. Needs the [home_assistant]
+# section above. A fetch failure leaves this one cell unavailable and never fails
+# the frame.
+# [[device.widget]]
+# id = "outside_temp"
+# kind = "ha_entity"
+# col = 0
+# row = 1
+# entity = "sensor.outside_temperature"
+# label = "Outside"
+# unit = "°C"

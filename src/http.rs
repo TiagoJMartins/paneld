@@ -42,7 +42,20 @@ use crate::telemetry::Telemetry;
 const MAX_LOG_BYTES: usize = 2_048;
 
 /// Builds the router.
+///
+/// The slash-collapsing middleware wraps the routes from the outside rather than
+/// being layered onto them. `Router::layer` runs *after* routing has already
+/// decided, which is too late to rewrite a path so that it matches: a doubled
+/// slash would 404 before the rewrite ever ran. An outer router with no routes of
+/// its own sends everything to its layered fallback, so the rewrite happens first
+/// and the inner router routes on the corrected path.
 pub fn router(runtime: Arc<Runtime>) -> Router {
+    Router::new()
+        .fallback_service(routes(runtime))
+        .layer(middleware::from_fn(collapse_slashes))
+}
+
+fn routes(runtime: Arc<Runtime>) -> Router {
     Router::new()
         .route("/d/{device}/api/display", get(display))
         .route("/d/{device}/api/setup", get(setup))
@@ -50,7 +63,6 @@ pub fn router(runtime: Arc<Runtime>) -> Router {
         .route("/d/{device}/frames/{file}", get(frame_file))
         .route("/api/content/{widget_id}", put(put_content).get(get_content))
         .route("/api/status", get(status))
-        .layer(middleware::from_fn(collapse_slashes))
         .with_state(runtime)
 }
 
@@ -325,7 +337,11 @@ async fn frame_file(
         .or_else(|| runtime.placeholder_by_hash(hash));
 
     let Some(frame) = frame else {
-        return (StatusCode::NOT_FOUND, "no such frame").into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no frame `{hash}` for device `{device_id}`") })),
+        )
+            .into_response();
     };
 
     (
@@ -362,7 +378,9 @@ async fn put_content(
                 PutError::TooManyWidgets { .. } => StatusCode::INSUFFICIENT_STORAGE,
                 _ => StatusCode::BAD_REQUEST,
             };
-            return (code, error.to_string()).into_response();
+            // JSON on the error path too: this endpoint answers JSON on success,
+            // and a script should not have to sniff the content type.
+            return (code, Json(json!({ "error": error.to_string() }))).into_response();
         }
     };
 

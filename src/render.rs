@@ -148,19 +148,15 @@ pub fn render_placeholder(
     let scale = (height as f32 / 480.0).clamp(0.5, 2.5);
 
     let node = Node::container(vec![
-        text_node("Unknown device", 34.0 * scale, 700.0, UI_FAMILY),
+        text_node("Unknown device", text_style(28.0 * scale, 700.0, UI_FAMILY)),
         text_node(
             &truncate(requested, 64),
-            44.0 * scale,
-            700.0,
-            NUMERIC_FAMILY,
+            text_style(40.0 * scale, 700.0, NUMERIC_FAMILY),
         ),
-        text_node(&body, 22.0 * scale, 400.0, UI_FAMILY),
+        text_node(&body, text_style(20.0 * scale, 400.0, UI_FAMILY)),
         text_node(
             "This server does not serve that id. Check the base URL on the device.",
-            19.0 * scale,
-            400.0,
-            UI_FAMILY,
+            text_style(17.0 * scale, 400.0, UI_FAMILY),
         ),
     ])
     .with_style(
@@ -277,28 +273,43 @@ fn cell_node(widget: &Widget, body: &Body, cell_w: f32, cell_h: f32, spacing: Sp
 
     let mut children = Vec::new();
     if let Some(label) = &widget.label {
-        children.push(
-            text_node(label, label_px, 700.0, UI_FAMILY).with_style(
-                Style::default()
+        children.push(text_node(
+            label,
+            one_line(
+                text_style(label_px, 700.0, UI_FAMILY)
                     .with(StyleDeclaration::color(muted()))
-                    .with(StyleDeclaration::letter_spacing(Length::Px(
-                        label_px * 0.06,
-                    )))
-                    .with(StyleDeclaration::text_transform(TextTransform::Uppercase))
-                    .with(StyleDeclaration::max_lines(Some(1))),
+                    .with(StyleDeclaration::letter_spacing(Length::Px(label_px * 0.06)))
+                    .with(StyleDeclaration::text_transform(TextTransform::Uppercase)),
             ),
-        );
+        ));
     }
-    children.extend(body_nodes(body, span_w, span_h, label_px));
+    // The body sits in its own growing box so that the label is pinned to the top
+    // of every cell while the body is centred in whatever space is left. Laying
+    // both out in one column instead would centre them as a group, which makes a
+    // label's height depend on how tall its neighbour's content happens to be.
+    children.push(
+        Node::container(body_nodes(body, span_w, span_h, label_px)).with_style(
+            Style::default()
+                .with(StyleDeclaration::display(Display::Flex))
+                .with(StyleDeclaration::flex_direction(FlexDirection::Column))
+                .with(StyleDeclaration::justify_content(JustifyContent::Center))
+                .with(StyleDeclaration::align_items(AlignItems::Start))
+                .with(StyleDeclaration::flex_grow(Some(FlexGrow(1.0))))
+                .with(StyleDeclaration::width(Length::Percentage(100.0)))
+                .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(
+                    (span_h * 0.02).clamp(1.0, 6.0),
+                )))),
+        ),
+    );
 
     Node::container(children).with_style(
         Style::default()
             .with(StyleDeclaration::display(Display::Flex))
             .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-            .with(StyleDeclaration::justify_content(JustifyContent::Center))
+            .with(StyleDeclaration::justify_content(JustifyContent::Start))
             .with(StyleDeclaration::align_items(AlignItems::Start))
             .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(
-                (span_h * 0.04).clamp(2.0, 10.0),
+                (span_h * 0.03).clamp(2.0, 8.0),
             ))))
             .with(StyleDeclaration::padding_top(Length::Px(spacing.padding)))
             .with(StyleDeclaration::padding_right(Length::Px(spacing.padding)))
@@ -340,7 +351,7 @@ fn line(coordinate: u32) -> GridPlacement {
 /// The nodes that make up a cell below its label.
 fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node> {
     let figure_px = (span_h * 0.40).clamp(18.0, 108.0);
-    let prose_px = (span_h * 0.15).clamp(13.0, 34.0);
+    let prose_px = (span_h * 0.11).clamp(12.0, 26.0);
 
     match body {
         Body::Figure { text, unit } => {
@@ -348,15 +359,17 @@ fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node>
             // still fits the cell it was laid out for.
             let width_limited = span_w * 1.55 / text.chars().count().max(1) as f32;
             let size = figure_px.min(width_limited).max(14.0);
-            let mut nodes = vec![
-                text_node(text, size, 700.0, NUMERIC_FAMILY)
-                    .with_style(Style::default().with(StyleDeclaration::max_lines(Some(1)))),
-            ];
+            let mut nodes = vec![text_node(
+                text,
+                one_line(text_style(size, 700.0, NUMERIC_FAMILY)),
+            )];
             if let Some(unit) = unit {
-                nodes.push(text_node(unit, (size * 0.34).max(11.0), 400.0, UI_FAMILY).with_style(
-                    Style::default()
-                        .with(StyleDeclaration::color(muted()))
-                        .with(StyleDeclaration::max_lines(Some(1))),
+                nodes.push(text_node(
+                    unit,
+                    one_line(
+                        text_style((size * 0.30).max(11.0), 400.0, UI_FAMILY)
+                            .with(StyleDeclaration::color(muted())),
+                    ),
                 ));
             }
             nodes
@@ -403,11 +416,8 @@ fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node>
                 ),
                 text_node(
                     if *on { "ON" } else { "OFF" },
-                    (dot * 0.82).max(13.0),
-                    700.0,
-                    UI_FAMILY,
-                )
-                .with_style(Style::default().with(StyleDeclaration::max_lines(Some(1)))),
+                    one_line(text_style((dot * 0.78).max(13.0), 700.0, UI_FAMILY)),
+                ),
             ])
             .with_style(
                 Style::default()
@@ -422,18 +432,17 @@ fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node>
 
         Body::Prose(text) => {
             let lines = ((span_h - label_px * 2.0) / (prose_px * 1.35)).floor();
-            vec![
-                text_node(text, prose_px, 400.0, UI_FAMILY).with_style(
-                    Style::default()
-                        .with(StyleDeclaration::line_height(LineHeight::Unitless(1.35)))
-                        // Bounded so a long push is clipped to the cell instead of
-                        // pushing the layout around.
-                        .with(StyleDeclaration::max_lines(Some(
-                            (lines as u32).clamp(1, 12),
-                        )))
-                        .with(StyleDeclaration::text_overflow(TextOverflow::Ellipsis)),
-                ),
-            ]
+            vec![text_node(
+                text,
+                text_style(prose_px, 400.0, UI_FAMILY)
+                    .with(StyleDeclaration::line_height(LineHeight::Unitless(1.3)))
+                    // Bounded so a long push is clipped to the cell instead of
+                    // pushing the layout around.
+                    .with(StyleDeclaration::max_lines(Some(
+                        (lines as u32).clamp(1, 12),
+                    )))
+                    .with(StyleDeclaration::text_overflow(TextOverflow::Ellipsis)),
+            )]
         }
 
         Body::Rows(rows) => {
@@ -456,25 +465,28 @@ fn body_nodes(body: &Body, span_w: f32, span_h: f32, label_px: f32) -> Vec<Node>
         }
 
         Body::Stale { since } => vec![
-            text_node("last seen", (span_h * 0.13).clamp(11.0, 22.0), 400.0, UI_FAMILY).with_style(
-                Style::default()
-                    .with(StyleDeclaration::color(muted()))
-                    .with(StyleDeclaration::max_lines(Some(1))),
+            text_node(
+                "last seen",
+                one_line(
+                    text_style((span_h * 0.11).clamp(11.0, 20.0), 400.0, UI_FAMILY)
+                        .with(StyleDeclaration::color(muted())),
+                ),
             ),
-            text_node(since, (span_h * 0.22).clamp(14.0, 44.0), 700.0, UI_FAMILY).with_style(
-                Style::default()
-                    .with(StyleDeclaration::color(muted()))
-                    .with(StyleDeclaration::max_lines(Some(1))),
+            text_node(
+                since,
+                one_line(
+                    text_style((span_h * 0.20).clamp(14.0, 40.0), 700.0, UI_FAMILY)
+                        .with(StyleDeclaration::color(muted())),
+                ),
             ),
         ],
 
-        Body::Absent(reason) => vec![
-            text_node(reason, (span_h * 0.16).clamp(12.0, 30.0), 400.0, UI_FAMILY).with_style(
-                Style::default()
-                    .with(StyleDeclaration::color(muted()))
-                    .with(StyleDeclaration::max_lines(Some(2))),
-            ),
-        ],
+        Body::Absent(reason) => vec![text_node(
+            reason,
+            text_style((span_h * 0.14).clamp(12.0, 26.0), 400.0, UI_FAMILY)
+                .with(StyleDeclaration::color(muted()))
+                .with(StyleDeclaration::max_lines(Some(2))),
+        )],
     }
 }
 
@@ -492,13 +504,11 @@ fn row_node(row: &Row, size: f32) -> Node {
     }
 
     Node::container(vec![
-        text_node(&label, size, 400.0, UI_FAMILY).with_style(
-            Style::default()
-                .with(StyleDeclaration::color(muted()))
-                .with(StyleDeclaration::max_lines(Some(1))),
+        text_node(
+            &label,
+            one_line(text_style(size, 400.0, UI_FAMILY).with(StyleDeclaration::color(muted()))),
         ),
-        text_node(&value, size, 700.0, NUMERIC_FAMILY)
-            .with_style(Style::default().with(StyleDeclaration::max_lines(Some(1)))),
+        text_node(&value, one_line(text_style(size, 700.0, NUMERIC_FAMILY))),
     ])
     .with_style(
         Style::default()
@@ -515,15 +525,28 @@ fn row_node(row: &Row, size: f32) -> Node {
     )
 }
 
-fn text_node(text: &str, size: f32, weight: f32, family_name: &str) -> Node {
-    Node::text(text.to_owned()).with_style(
-        Style::default()
-            .with(StyleDeclaration::font_size(FontSize::Length(Length::Px(
-                size,
-            ))))
-            .with(StyleDeclaration::font_weight(FontWeight::Absolute(weight)))
-            .with(StyleDeclaration::font_family(family(family_name))),
-    )
+/// A run of text.
+///
+/// Takes its complete style, because `Node::with_style` *replaces* a node's style
+/// rather than merging into it: chaining a second call silently discards the first,
+/// which is how a 96px figure ends up rendering at the inherited 16px.
+fn text_node(text: &str, style: Style) -> Node {
+    Node::text(text.to_owned()).with_style(style)
+}
+
+/// The base style for a run of text, to be extended with `.with(..)`.
+fn text_style(size: f32, weight: f32, family_name: &str) -> Style {
+    Style::default()
+        .with(StyleDeclaration::font_size(FontSize::Length(Length::Px(
+            size,
+        ))))
+        .with(StyleDeclaration::font_weight(FontWeight::Absolute(weight)))
+        .with(StyleDeclaration::font_family(family(family_name)))
+}
+
+/// Text that must stay on one line rather than wrap out of its cell.
+fn one_line(style: Style) -> Style {
+    style.with(StyleDeclaration::max_lines(Some(1)))
 }
 
 fn family(name: &str) -> FontFamily {

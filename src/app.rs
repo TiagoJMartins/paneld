@@ -97,6 +97,16 @@ impl Runtime {
             .clone()
     }
 
+    /// Re-reads the configuration file and swaps it in if it is valid.
+    ///
+    /// On failure the previously loaded configuration stays in effect and the error
+    /// is handed back for the caller to log, so a typo never blanks the panel.
+    pub fn reload(&self, path: &std::path::Path) -> Result<()> {
+        let config = crate::config::load(path)?;
+        self.replace_config(config);
+        Ok(())
+    }
+
     /// Swaps in a freshly validated configuration.
     pub fn replace_config(&self, config: Config) {
         *self
@@ -281,5 +291,115 @@ impl Runtime {
     /// `refresh_rate` to send alongside a placeholder.
     pub fn placeholder_refresh_rate(&self) -> u32 {
         PLACEHOLDER_REFRESH_RATE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ONE_DEVICE: &str = r#"
+[server]
+listen = "0.0.0.0:4444"
+public_base_url = "http://192.168.0.50:4444"
+
+[[device]]
+id = "kindle"
+width = 400
+height = 300
+palette = "gray16"
+dither = "bayer"
+refresh_rate = 300
+grid = { cols = 1, rows = 1 }
+"#;
+
+    /// A config file in a per-test temporary directory, removed on drop.
+    struct Fixture {
+        path: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new(contents: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "paneld-reload-{}-{:?}.toml",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, contents).unwrap();
+            Self { path }
+        }
+
+        fn write(&self, contents: &str) {
+            std::fs::write(&self.path, contents).unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn runtime(toml: &str) -> Arc<Runtime> {
+        let mut config = crate::config::parse(toml).unwrap();
+        config.server.content_path = std::env::temp_dir()
+            .join(format!(
+                "paneld-reload-content-{}-{:?}.json",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        Runtime::with_home_assistant(config, None).unwrap().0
+    }
+
+    #[test]
+    fn a_valid_reload_takes_effect() {
+        let fixture = Fixture::new(ONE_DEVICE);
+        let runtime = runtime(ONE_DEVICE);
+        assert_eq!(runtime.config().devices[0].refresh_rate, 300);
+
+        fixture.write(&ONE_DEVICE.replace("refresh_rate = 300", "refresh_rate = 600"));
+        runtime.reload(&fixture.path).unwrap();
+        assert_eq!(runtime.config().devices[0].refresh_rate, 600);
+    }
+
+    #[test]
+    fn a_malformed_reload_leaves_the_previous_configuration_in_effect() {
+        // A typo must never blank the panel.
+        let fixture = Fixture::new(ONE_DEVICE);
+        let runtime = runtime(ONE_DEVICE);
+
+        fixture.write("this is not TOML [[[");
+        let error = runtime
+            .reload(&fixture.path)
+            .expect_err("a malformed file must be rejected");
+        assert!(format!("{error:#}").contains("TOML"), "{error:#}");
+        assert_eq!(
+            runtime.config().devices.len(),
+            1,
+            "the previous configuration must still be in effect"
+        );
+        assert_eq!(runtime.config().devices[0].refresh_rate, 300);
+    }
+
+    #[test]
+    fn a_reload_that_fails_validation_leaves_the_previous_configuration_in_effect() {
+        // Parses as TOML but breaks a rule: still must not take effect.
+        let fixture = Fixture::new(ONE_DEVICE);
+        let runtime = runtime(ONE_DEVICE);
+
+        fixture.write(&ONE_DEVICE.replace("refresh_rate = 300", "refresh_rate = 1"));
+        let error = runtime.reload(&fixture.path).expect_err("out of range");
+        assert!(format!("{error:#}").contains("refresh_rate 1"), "{error:#}");
+        assert_eq!(runtime.config().devices[0].refresh_rate, 300);
+    }
+
+    #[test]
+    fn a_reload_of_a_missing_file_leaves_the_previous_configuration_in_effect() {
+        let runtime = runtime(ONE_DEVICE);
+        let missing = std::env::temp_dir().join("paneld-does-not-exist.toml");
+        assert!(runtime.reload(&missing).is_err());
+        assert_eq!(runtime.config().devices.len(), 1);
     }
 }

@@ -134,15 +134,12 @@ async fn watch_config(runtime: Arc<Runtime>, path: PathBuf) {
         }
         last_seen = current;
 
-        match config::load(&path) {
-            Ok(config) => {
-                tracing::info!(
-                    path = %path.display(),
-                    devices = config.devices.len(),
-                    "configuration reloaded"
-                );
-                runtime.replace_config(config);
-            }
+        match runtime.reload(&path) {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                devices = runtime.config().devices.len(),
+                "configuration reloaded"
+            ),
             Err(error) => tracing::error!(
                 path = %path.display(),
                 error = format!("{error:#}"),
