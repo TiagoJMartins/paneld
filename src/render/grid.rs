@@ -294,6 +294,7 @@ mod tests {
             thickness,
             fields: Vec::new(),
             timezone: Timezone::utc(),
+            alerts: Vec::new(),
         });
         let (_, _, area_w, area_h) = device.grid_area();
         device.chrome = Chrome::derived(area_w, area_h, device.grid);

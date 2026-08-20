@@ -1,9 +1,10 @@
 //! The status bar: a strip along one edge of the frame, outside the widget grid.
 //!
-//! Everything the bar can say is something this process already knows for
+//! Almost everything the bar can say is something this process already knows for
 //! certain — the clock it was handed, the device's own configuration, the last
-//! telemetry it reported — so nothing here fetches, and [`node`] stays as pure as
-//! the rest of the render pipeline.
+//! telemetry it reported. The exception is an [`Alert`], which reads pushed
+//! content, and it reads it from [`RenderInputs`] like every other resolved input,
+//! so [`node`] stays as pure as the rest of the render pipeline.
 //!
 //! The strip's geometry is not decided here. [`Device::status_bar_area`] owns it,
 //! because the grid beside it is sized by the same arithmetic and the tap hit test
@@ -17,7 +18,7 @@ use super::{
     MIN_TYPE_PX, NUMERIC_FAMILY, RenderInputs, UI_FAMILY, fitted, muted, one_line, rule,
     rule_width, text_node, text_style,
 };
-use crate::config::{Device, Edge, StatusBar, StatusField};
+use crate::config::{Alert, Device, Edge, StatusBar, StatusField};
 use crate::telemetry::Telemetry;
 
 /// The type size a bar's thickness affords, as a fraction of it.
@@ -31,13 +32,13 @@ const TYPE_SCALE: f32 = 0.5;
 /// The margin at each end of the strip, as a fraction of the type size.
 const MARGIN_SCALE: f32 = 0.6;
 
-/// The least space between two fields, as a fraction of the type size.
+/// The space between two things in the bar, as a fraction of the type size.
 ///
-/// A floor rather than the spacing itself: the fields are spread evenly along the
-/// bar, so they usually stand much further apart than this. It matters only when
-/// they nearly fill the strip, which is exactly when two fields running together
-/// would read as one value.
-const GAP_SCALE: f32 = 0.8;
+/// Fixed spacing rather than an even spread across the strip, because the fields
+/// are a row of chrome and not a set of columns: spread evenly, adding a field
+/// moved every other field, and a bar showing two things put one of them in the
+/// middle of the panel where it read as a caption for the cell above it.
+const GAP_SCALE: f32 = 1.4;
 
 /// What a field with nothing to report says.
 ///
@@ -68,18 +69,18 @@ pub fn node(fonts: &Fonts, device: &Device, bar: &StatusBar, inputs: &RenderInpu
     let along = (if horizontal { width } else { height }) as f32;
     let across = (if horizontal { height } else { width }) as f32;
 
-    // How wide one field's run may be set. Exact rather than estimated, because
-    // the gaps are declared on the container below: what is left over is the
-    // strip's length less its end margins and those gaps, shared equally. A
-    // vertical bar stacks its fields instead, so each has the whole width.
-    let count = bar.fields.len().max(1) as f32;
+    // How wide one run may be set. The fields sit at fixed spacing rather than
+    // spread across the strip, so what any one of them may take is the strip's
+    // length less the margins and the gaps, shared equally. A vertical bar stacks
+    // its contents instead, so each has the whole width.
+    let count = (bar.fields.len() + bar.alerts.len()).max(1) as f32;
     let available = if horizontal {
         ((along - margin * 2.0 - gap * (count - 1.0)) / count).max(1.0)
     } else {
         across
     };
 
-    let children = bar
+    let fields = bar
         .fields
         .iter()
         .map(|&field| {
@@ -93,18 +94,33 @@ pub fn node(fonts: &Fonts, device: &Device, bar: &StatusBar, inputs: &RenderInpu
         })
         .collect::<Vec<_>>();
 
+    // Only the alerts that are actually up. An alert that is not firing contributes
+    // no node at all, which is the point of it: nothing on the panel moves when one
+    // appears or goes, because the fields are anchored to the leading edge and the
+    // alerts to the trailing one.
+    let alerts = bar
+        .alerts
+        .iter()
+        .filter(|alert| is_raised(alert, inputs))
+        .map(|alert| alert_node(fonts, alert, inputs, available, size))
+        .collect::<Vec<_>>();
+
+    let direction = if horizontal {
+        FlexDirection::Row
+    } else {
+        FlexDirection::Column
+    };
+
+    // Two groups rather than one flat row, so that `space-between` puts the fields
+    // at the leading edge and the alerts at the trailing one. Flat, the alerts
+    // would sit wherever the fields happened to end.
+    let children = vec![group(fields, direction, gap), group(alerts, direction, gap)];
+
     let mut style = Style::default()
         .with(StyleDeclaration::display(Display::Flex))
-        .with(StyleDeclaration::flex_direction(if horizontal {
-            FlexDirection::Row
-        } else {
-            FlexDirection::Column
-        }))
-        // Evenly spread, so adding a field re-spaces the whole bar rather than
-        // crowding one end of it, and a bar showing one thing centres that thing
-        // instead of pinning it into a corner.
+        .with(StyleDeclaration::flex_direction(direction))
         .with(StyleDeclaration::justify_content(
-            JustifyContent::SpaceEvenly,
+            JustifyContent::SpaceBetween,
         ))
         .with(StyleDeclaration::align_items(AlignItems::Center))
         .with(StyleDeclaration::width(Length::Px(width as f32)))
@@ -121,18 +137,87 @@ pub fn node(fonts: &Fonts, device: &Device, bar: &StatusBar, inputs: &RenderInpu
         style
             .with(StyleDeclaration::padding_left(Length::Px(margin)))
             .with(StyleDeclaration::padding_right(Length::Px(margin)))
-            .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(gap))))
     } else {
         style
             .with(StyleDeclaration::padding_top(Length::Px(margin)))
             .with(StyleDeclaration::padding_bottom(Length::Px(margin)))
-            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(gap))))
     };
     for declaration in separator(bar.edge) {
         style = style.with(declaration);
     }
 
     Node::container(children).with_style(style)
+}
+
+/// One end of the bar: its contents in a row at fixed spacing, sized to them.
+fn group(children: Vec<Node>, direction: FlexDirection, gap: f32) -> Node {
+    Node::container(children).with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::flex_direction(direction))
+            .with(StyleDeclaration::align_items(AlignItems::Center))
+            .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(gap))))
+            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(gap)))),
+    )
+}
+
+/// Whether an alert is up: something was pushed, it reads as on, and it has been
+/// confirmed recently enough to believe.
+///
+/// The staleness rule is the opposite of a cell's, deliberately. A cell keeps its
+/// last reading and mutes it, because the reading is what the cell is for. An alert
+/// that nothing has confirmed within its window disappears, because an unconfirmed
+/// alert is a publisher that died with its hand up — and a panel that cried wolf
+/// until someone restarted a script is a panel nobody trusts.
+fn is_raised(alert: &Alert, inputs: &RenderInputs<'_>) -> bool {
+    let Some(record) = inputs.content.get(&alert.id) else {
+        return false;
+    };
+    if alert.stale_after > 0 && super::is_stale_after(alert.stale_after, record, inputs.now) {
+        return false;
+    }
+    super::beacon_is_on(record, &alert.on_values)
+}
+
+/// One raised alert: its glyph, and its words when it was given any.
+fn alert_node(
+    fonts: &Fonts,
+    alert: &Alert,
+    inputs: &RenderInputs<'_>,
+    available: f32,
+    size: f32,
+) -> Node {
+    let mut children = Vec::new();
+    if let Some(icon) = alert
+        .icon
+        .as_ref()
+        .and_then(|spec| inputs.icons.get(spec.as_str()))
+    {
+        // Drawn in full ink, not the bar's grey: the rest of the strip is chrome
+        // that is always there, and this is the one thing on it that means
+        // something happened.
+        children.push(super::icon_node(icon, size, super::Ink::Current));
+    }
+    if let Some(label) = &alert.label {
+        children.push(fitted(fonts, available, size, |size| {
+            text_node(
+                label,
+                one_line(
+                    text_style(size, 700.0, UI_FAMILY).with(StyleDeclaration::color(super::ink())),
+                ),
+            )
+        }));
+    }
+
+    Node::container(children).with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::flex_direction(FlexDirection::Row))
+            .with(StyleDeclaration::align_items(AlignItems::Center))
+            .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
+                size * 0.4,
+            )))),
+    )
 }
 
 /// The rule between the bar and the dashboard, on the one side of the strip that
@@ -316,6 +401,8 @@ fn month_name(month: Month) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::ContentRecord;
+    use std::collections::HashMap;
 
     /// A bar in UTC. Spelt as a config fragment, and every fixture below goes
     /// through `parse`, so a field this module reads is one a file can really set.
@@ -519,10 +606,75 @@ grid = {{ cols = 4, rows = 3 }}
 
     #[test]
     fn numbers_are_set_in_the_tabular_face_and_the_device_id_is_not() {
-        // Not cosmetic: fields are spread evenly, so a proportional digit width
-        // would move every field on the bar whenever the clock ticked.
+        // Not cosmetic: a proportional digit width would move the fields beside a
+        // figure whenever it changed.
         assert_eq!(face(StatusField::Time), NUMERIC_FAMILY);
         assert_eq!(face(StatusField::Battery), NUMERIC_FAMILY);
         assert_eq!(face(StatusField::Device), UI_FAMILY);
+    }
+
+    /// A bar carrying one alert, and a content store in the state `pushed` names.
+    fn alerting(pushed: Option<(&str, i64)>) -> (Device, HashMap<String, ContentRecord>) {
+        let device = device(
+            r#"edge = "bottom"
+fields = ["date"]
+
+[[device.status_bar.alert]]
+id = "slack_unread"
+icon = "si-slack"
+stale_after = 3600"#,
+        );
+        let content = match pushed {
+            Some((state, age)) => HashMap::from([(
+                "slack_unread".to_owned(),
+                ContentRecord {
+                    value: serde_json::Value::String(state.to_owned()),
+                    state: Some(state.to_owned()),
+                    unit: None,
+                    rows: None,
+                    received_at: now() - time::Duration::seconds(age),
+                },
+            )]),
+            None => HashMap::new(),
+        };
+        (device, content)
+    }
+
+    /// Whether the bar's one alert is up, given the pushed state.
+    fn raised(pushed: Option<(&str, i64)>) -> bool {
+        let (device, content) = alerting(pushed);
+        let bar = device.status_bar.as_ref().expect("a bar");
+        let icons = HashMap::new();
+        let ha = HashMap::new();
+        let telemetry = Telemetry::default();
+        let inputs = RenderInputs {
+            device: &device,
+            content: &content,
+            ha_states: &ha,
+            icons: &icons,
+            telemetry: &telemetry,
+            now: now(),
+        };
+        is_raised(&bar.alerts[0], &inputs)
+    }
+
+    #[test]
+    fn an_alert_is_up_only_while_something_says_so() {
+        assert!(raised(Some(("alert", 0))), "a fresh on reads as up");
+        assert!(!raised(None), "nothing pushed is not an alert");
+        assert!(!raised(Some(("clear", 0))), "an off push clears it");
+    }
+
+    #[test]
+    fn a_stale_alert_withdraws_instead_of_muting() {
+        // The opposite of a cell, and deliberately: a cell keeps its last reading
+        // because the reading is what it is for, where an alert nobody has confirmed
+        // lately is a publisher that died with its hand up. A panel that cried wolf
+        // until someone restarted a script is a panel nobody reads.
+        assert!(raised(Some(("alert", 60))), "within the window it stands");
+        assert!(
+            !raised(Some(("alert", 7_200))),
+            "past the window it withdraws"
+        );
     }
 }

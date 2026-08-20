@@ -350,6 +350,8 @@ fn cell_node(
     // box here as `cell * span` measured a 2x2 ten pixels short of where
     // `Layout::rect` places it — the exact disagreement `rect` exists to prevent.
     let (_, _, span_w, span_h) = layout.rect(widget);
+    // The panel's short side, which is what a viewing distance is a fraction of.
+    let device_short_side = inputs.device.width.min(inputs.device.height) as f32;
     let padding = layout.padding();
     let border = layout.border();
     // Padding on both sides, plus a rule on each. Read from the layout rather than
@@ -358,10 +360,20 @@ fn cell_node(
     let chrome = layout.inset();
     // What a cell's contents actually have to fit inside.
     let content_w = (span_w - chrome).max(1.0);
-    // Chrome is sized to one cell and never to the span: a label is chrome, and a
-    // label that grew with its widget's span would set the same word at two sizes
-    // on one dashboard.
-    let label_px = (layout.cell().1 * 0.11).max(MIN_TYPE_PX);
+    // Chrome is sized to the *panel*, bounded by what a cell can hold — never to
+    // the span, and never to the cell alone.
+    //
+    // Two things went wrong when this was a fraction of the cell's height. A label
+    // that grew with its widget's span set the same word at two sizes on one
+    // dashboard, which is what the cell rather than the span fixed. But a cell is
+    // itself unbounded: a two-cell grid on this panel gave cells 1008 pixels tall
+    // and set `BRAGA` at 110px, the same size as the reading underneath it. Chrome
+    // that competes with content is not chrome. A label's job is to name a cell at
+    // a glance and then get out of the way, and the size that does that is a
+    // property of how far away the glass is — which is the frame, not the grid.
+    let label_px = (device_short_side * CHROME_SCALE)
+        .min(layout.cell().1 * 0.11)
+        .max(MIN_TYPE_PX);
     let gap = (span_h * 0.03).clamp(2.0, 8.0);
 
     let mut children = Vec::new();
@@ -391,7 +403,14 @@ fn cell_node(
         // makes a label's height depend on how tall its neighbour's content happens
         // to be.
         None => Node::container(body_nodes(
-            fonts, &cell.body, cell.ink, content_w, content_h, label_px,
+            fonts,
+            &cell.body,
+            cell.ink,
+            Space {
+                width: content_w,
+                height: content_h,
+                label_px,
+            },
         ))
         .with_style(
             Style::default()
@@ -599,20 +618,46 @@ fn line(coordinate: u32) -> GridPlacement {
     GridPlacement::Line(coordinate as i16 + 1)
 }
 
+/// The box a body is drawn in, and the chrome it is drawn against.
+///
+/// One type because the three always travel together: every size in a body comes
+/// out of the box, and the one size that does not — a column of readings, which is
+/// capped — is measured against the chrome that names it. Passing them separately
+/// was six arguments deep by the time a weather cell had split its box in two.
+#[derive(Debug, Clone, Copy)]
+struct Space {
+    width: f32,
+    height: f32,
+    /// The cell's label size: chrome, and the yardstick a reading is held to.
+    label_px: f32,
+}
+
+impl Space {
+    /// The same chrome, over a smaller box.
+    fn sized(&self, width: f32, height: f32) -> Self {
+        Self {
+            width,
+            height,
+            label_px: self.label_px,
+        }
+    }
+}
+
 /// The nodes that make up a cell below its header.
 ///
 /// Every size here comes out of the content box rather than out of a fraction of
 /// the cell capped at some pixel count. Those caps were set against a 400x300 test
 /// device and silently bound everything on the 1448x1072 panel in service: a label
 /// asked for 45px and got 32, a weather caption asked for 82px and got 34.
-fn body_nodes(
-    fonts: &Fonts,
-    body: &Body,
-    ink: Ink,
-    content_w: f32,
-    content_h: f32,
-    label_px: f32,
-) -> Vec<Node> {
+///
+/// The one exception is a column of readings, which is capped — see
+/// [`ROW_TYPE_CEILING`] for why a table is not a figure.
+fn body_nodes(fonts: &Fonts, body: &Body, ink: Ink, space: Space) -> Vec<Node> {
+    let Space {
+        width: content_w,
+        height: content_h,
+        label_px,
+    } = space;
     match body {
         Body::Figure { text, unit } => {
             // The design size *is* the box's height: a run set at that size overflows
@@ -628,15 +673,7 @@ fn body_nodes(
             svg,
             condition,
             rows,
-        } => sky_nodes(
-            fonts,
-            svg,
-            condition.as_deref(),
-            rows,
-            ink,
-            content_w,
-            content_h,
-        ),
+        } => sky_nodes(fonts, svg, condition.as_deref(), rows, ink, space),
 
         Body::Beacon { on, icon, text } => {
             beacon_nodes(fonts, *on, icon.as_ref(), *text, ink, content_w, content_h)
@@ -668,7 +705,7 @@ fn body_nodes(
             )]
         }
 
-        Body::Rows(rows) => vec![rows_node(fonts, rows, content_w, content_h)],
+        Body::Rows(rows) => vec![rows_node(fonts, rows, space)],
 
         // A group's children are cells in their own right, drawn by `cell_node`.
         // There is nothing to add here, and an empty container would still be a box
@@ -730,9 +767,13 @@ fn sky_nodes(
     condition: Option<&str>,
     rows: &[Line],
     ink: Ink,
-    content_w: f32,
-    content_h: f32,
+    space: Space,
 ) -> Vec<Node> {
+    let Space {
+        width: content_w,
+        height: content_h,
+        ..
+    } = space;
     if rows.is_empty() {
         // Sized as one block, not as a glyph and a caption that each guessed at
         // the cell: the glyph is the reading and the words are its caption, so
@@ -789,7 +830,11 @@ fn sky_nodes(
     );
 
     vec![
-        Node::container(vec![glyph, rows_node(fonts, rows, rows_w, rows_h)]).with_style(
+        Node::container(vec![
+            glyph,
+            rows_node(fonts, rows, space.sized(rows_w, rows_h)),
+        ])
+        .with_style(
             Style::default()
                 .with(StyleDeclaration::display(Display::Flex))
                 .with(StyleDeclaration::flex_direction(match beside {
@@ -908,27 +953,54 @@ fn dot_node(size: f32, on: bool, ink: Ink) -> Node {
     )
 }
 
+/// How much larger than a cell's own chrome a reading may be set.
+///
+/// A ceiling, and the only place in this module where a size is not simply the
+/// space available. A single `value` cell exists to be one number and should fill
+/// its box; a column of readings is a table, and a table set to fill a 700x1000
+/// cell is four numbers shouting at a room. Tied to the chrome that names them
+/// rather than fixed in pixels so that it scales with the panel: a reading reads as
+/// the content at a little under twice the label above it, at any panel size.
+const ROW_TYPE_CEILING: f32 = 1.8;
+
 /// A column of labelled rows filling a box, each row inked by its own trust.
 ///
 /// Shared by a `list` body and by a weather cell's readings, because they are one
 /// thing: `n` labelled values sized and aligned to a box together.
-fn rows_node(fonts: &Fonts, rows: &[Line], width: f32, height: f32) -> Node {
+fn rows_node(fonts: &Fonts, rows: &[Line], space: Space) -> Node {
+    let Space {
+        width,
+        height,
+        label_px,
+    } = space;
     // Every row plus every gap between them fills the box: a row's line box is about
     // 1.2 of its size and the gaps are 0.28 of it, so `n` rows want `1.48n - 0.28`
     // sizes' worth of height.
-    let by_height = (height / (rows.len().max(1) as f32 * 1.48 - 0.28)).max(MIN_TYPE_PX);
-    let row_px = rows_size(fonts, rows, width, by_height);
+    let by_height = height / (rows.len().max(1) as f32 * 1.48 - 0.28);
+    let design = by_height.min(label_px * ROW_TYPE_CEILING).max(MIN_TYPE_PX);
+    let row_px = rows_size(fonts, rows, width, design);
+
     let children = rows
         .iter()
         // Each line's own ink, not the cell's: one unreachable sensor mutes its own
         // line and leaves the readings around it black.
-        .map(|line| row_node(&line.row, row_px, line.ink))
+        .map(|line| row_node(line, row_px, width))
         .collect::<Vec<_>>();
+
+    // Spread down the box once the ceiling has taken the type below what the height
+    // affords, so a tall cell reads as a table with air in it rather than as a
+    // small block adrift in the middle of a large box. Centred when the rows
+    // genuinely fill the height, which is what a dense cell wants.
+    let filled = row_px >= by_height - 0.5;
     Node::container(children).with_style(
         Style::default()
             .with(StyleDeclaration::display(Display::Flex))
             .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-            .with(StyleDeclaration::justify_content(JustifyContent::Center))
+            .with(StyleDeclaration::justify_content(match filled {
+                true => JustifyContent::Center,
+                false => JustifyContent::SpaceEvenly,
+            }))
+            .with(StyleDeclaration::height(Length::Px(height)))
             .with(StyleDeclaration::width(Length::Px(width)))
             .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(
                 row_px * 0.28,
@@ -952,7 +1024,7 @@ fn rows_node(fonts: &Fonts, rows: &[Line], width: f32, height: f32) -> Node {
 fn rows_size(fonts: &Fonts, rows: &[Line], width: f32, design: f32) -> f32 {
     let widest = rows
         .iter()
-        .map(|line| intrinsic_width(fonts, row_runs(&line.row, design, line.ink)))
+        .map(|line| intrinsic_width(fonts, row_runs(line, design)))
         .fold(0.0, f32::max);
     fit_size(widest, width, design)
 }
@@ -1087,6 +1159,14 @@ const UNIT_BASELINE_LIFT: f32 = 0.279;
 /// than one that overflows. A value long enough to hit this is a config or
 /// publisher problem, and it should look like one.
 const MIN_TYPE_PX: f32 = 12.0;
+
+/// A cell's chrome type, as a fraction of the panel's short side.
+///
+/// A label is read at the same distance as everything else on the glass, so its
+/// size belongs to the panel and not to whichever cell it happens to name. Set so
+/// that on the 1072-pixel side of the panel in service a label lands near 32px —
+/// legible across a room, and a clear third of the reading it introduces.
+const CHROME_SCALE: f32 = 0.030;
 
 /// Builds a run at the largest size, up to `design`, at which it fits `available`
 /// pixels wide.
@@ -1273,8 +1353,8 @@ fn paint_svg(markup: &str, colour: ColorInput) -> String {
 
 /// One line of a multi-reading widget: label on the left, value on the right,
 /// stretched across the box it is laid out in.
-fn row_node(row: &Row, size: f32, ink: Ink) -> Node {
-    Node::container(row_runs_children(row, size, ink)).with_style(
+fn row_node(line: &Line, size: f32, width: f32) -> Node {
+    Node::container(row_runs_children(line, size)).with_style(
         Style::default()
             .with(StyleDeclaration::display(Display::Flex))
             .with(StyleDeclaration::flex_direction(FlexDirection::Row))
@@ -1285,7 +1365,7 @@ fn row_node(row: &Row, size: f32, ink: Ink) -> Node {
             .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
                 size * 0.5,
             ))))
-            .with(StyleDeclaration::width(Length::Percentage(100.0))),
+            .with(StyleDeclaration::width(Length::Px(width))),
     )
 }
 
@@ -1296,8 +1376,8 @@ fn row_node(row: &Row, size: f32, ink: Ink) -> Node {
 /// the fit that decides a column's type size has to be taken on a content-sized
 /// copy. The gap between label and value is kept, because it is width the row
 /// genuinely needs.
-fn row_runs(row: &Row, size: f32, ink: Ink) -> Node {
-    Node::container(row_runs_children(row, size, ink)).with_style(
+fn row_runs(line: &Line, size: f32) -> Node {
+    Node::container(row_runs_children(line, size)).with_style(
         Style::default()
             .with(StyleDeclaration::display(Display::Flex))
             .with(StyleDeclaration::flex_direction(FlexDirection::Row))
@@ -1308,33 +1388,56 @@ fn row_runs(row: &Row, size: f32, ink: Ink) -> Node {
     )
 }
 
-/// A row's two runs: its label in chrome grey, its value in the tabular face.
+/// A row's runs: what it is, then what it reads.
 ///
-/// The value carries its unit rather than setting it apart, because a row is one
-/// line and `21.3 °C` is one reading — the figure-and-unit treatment a whole cell
-/// gets has no room to work at this size.
+/// What it is may be a glyph, words, or both — a glyph for a quantity, words for a
+/// place, and both when a room's thermometer wants saying twice. The value carries
+/// its unit rather than setting it apart, because a row is one line and `21.3 °C`
+/// is one reading: the figure-and-unit treatment a whole cell gets has no room to
+/// work at this size.
 ///
 /// Both runs are one-line, and therefore elided rather than wrapped when a column
 /// cannot be fitted even at [`MIN_TYPE_PX`] — a publisher sending
 /// `21.299999237060547` into a cell a few characters wide. That case is what
 /// [`one_line`]'s ellipsis is for: a run that wrapped inside a one-line box printed
 /// over the reading beneath it.
-fn row_runs_children(row: &Row, size: f32, ink: Ink) -> Vec<Node> {
-    let label = row
-        .label
-        .clone()
-        .or_else(|| row.id.clone())
-        .unwrap_or_default();
+fn row_runs_children(line: &Line, size: f32) -> Vec<Node> {
+    let row = &line.row;
+    let ink = line.ink;
+    let label = row.label.clone().or_else(|| row.id.clone());
     let mut value = row.value.as_ref().map(value_text).unwrap_or_default();
     if let Some(unit) = &row.unit {
         value.push(' ');
         value.push_str(unit);
     }
 
-    vec![
-        text_node(
-            &label,
+    // The glyph and the words that follow it are one thing — what this row is — so
+    // they share a box and the value is what the row's `space-between` pushes away
+    // from. Left as two siblings, a row with both would have spread its glyph, its
+    // label and its value evenly across the line.
+    let mut naming = Vec::new();
+    if let Some(icon) = &line.icon {
+        // A shade larger than the type it stands beside. A glyph at the same
+        // nominal size as a run of digits reads smaller than they do, because the
+        // digits fill their line box and a silhouette sits inside its own margins.
+        naming.push(icon_node(icon, size * 1.15, ink));
+    }
+    if let Some(label) = &label {
+        naming.push(text_node(
+            label,
             one_line(text_style(size, 400.0, UI_FAMILY).with(StyleDeclaration::color(muted()))),
+        ));
+    }
+
+    vec![
+        Node::container(naming).with_style(
+            Style::default()
+                .with(StyleDeclaration::display(Display::Flex))
+                .with(StyleDeclaration::flex_direction(FlexDirection::Row))
+                .with(StyleDeclaration::align_items(AlignItems::Center))
+                .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
+                    size * 0.35,
+                )))),
         ),
         text_node(
             &value,
@@ -1457,6 +1560,9 @@ impl Ink {
 #[derive(Debug, Clone, PartialEq)]
 struct Line {
     row: Row,
+    /// Drawn where the label would go. Resolved here rather than looked up while
+    /// building nodes, so that a row's layout takes no map with it.
+    icon: Option<Icon>,
     ink: Ink,
 }
 
@@ -1542,6 +1648,10 @@ fn resolve_pushed(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
                 rows.iter()
                     .map(|row| Line {
                         row: rounded_row(row, widget.precision),
+                        // A pushed row names no icon: the push protocol carries
+                        // values, and a publisher that could choose glyphs would be
+                        // choosing the dashboard's appearance from outside it.
+                        icon: None,
                         ink,
                     })
                     .collect(),
@@ -1736,6 +1846,11 @@ fn reading_line(reading: &crate::config::Reading, inputs: &RenderInputs<'_>) -> 
             unit,
             state: None,
         },
+        icon: reading
+            .icon
+            .as_ref()
+            .and_then(|spec| inputs.icons.get(spec))
+            .cloned(),
         ink,
     }
 }
@@ -1790,17 +1905,23 @@ fn format_reading(text: &str, precision: Option<u8>) -> String {
 }
 
 /// Whether a pushed record is older than its widget's `stale_after`.
+fn is_stale(widget: &Widget, record: &ContentRecord, now: OffsetDateTime) -> bool {
+    widget.stale_after > 0 && is_stale_after(widget.stale_after, record, now)
+}
+
+/// Whether a pushed record is older than `stale_after` seconds.
 ///
 /// Computed at render time rather than stamped at push time, so raising or
-/// lowering `stale_after` takes effect on the next frame. A record stamped in the
+/// lowering the window takes effect on the next frame. A record stamped in the
 /// future is never stale: that is a clock disagreement, not freshness
 /// information, and treating it as stale would mute a cell that is fine.
-fn is_stale(widget: &Widget, record: &ContentRecord, now: OffsetDateTime) -> bool {
-    if widget.stale_after == 0 {
-        return false;
-    }
+///
+/// Shared with the status bar's alerts, which apply the same age to the opposite
+/// decision — a stale cell mutes its reading, a stale alert withdraws itself — so
+/// the arithmetic is written once and the policy lives at each call site.
+fn is_stale_after(stale_after: u64, record: &ContentRecord, now: OffsetDateTime) -> bool {
     let age = now - record.received_at;
-    age.whole_seconds() >= 0 && age.unsigned_abs().as_secs() > widget.stale_after
+    age.whole_seconds() >= 0 && age.unsigned_abs().as_secs() > stale_after
 }
 
 /// Whether a beacon reads as "on".
@@ -1980,6 +2101,7 @@ mod tests {
     fn reading(label: &str, entity: &str, attribute: Option<&str>) -> crate::config::Reading {
         crate::config::Reading {
             label: Some(label.to_owned()),
+            icon: None,
             entity: entity.to_owned(),
             attribute: attribute.map(str::to_owned),
             unit: Some("\u{b0}C".to_owned()),
@@ -2000,6 +2122,7 @@ mod tests {
                 unit: unit.map(str::to_owned),
                 state: None,
             },
+            icon: None,
             ink,
         }
     }
@@ -3093,6 +3216,7 @@ mod tests {
                     edge,
                     thickness: 24,
                     fields: vec![StatusField::Device, StatusField::Refresh],
+                    alerts: Vec::new(),
                     timezone: Timezone::utc(),
                 }),
                 ..device(vec![widget("a", WidgetKind::Value, 0, 0)])
@@ -3516,7 +3640,17 @@ mod tests {
             }
         );
         assert!(
-            body_nodes(&FONTS, &Body::Group, Ink::Current, 200.0, 200.0, 14.0).is_empty(),
+            body_nodes(
+                &FONTS,
+                &Body::Group,
+                Ink::Current,
+                Space {
+                    width: 200.0,
+                    height: 200.0,
+                    label_px: 14.0,
+                },
+            )
+            .is_empty(),
             "a group's cell has no body of its own to draw"
         );
     }
@@ -3717,5 +3851,139 @@ mod tests {
                 child.id
             );
         }
+    }
+
+    /// A panel whose bar carries one alert, rendered with `pushed` in the store.
+    fn alerting_frame(pushed: Option<&str>) -> Vec<u8> {
+        let text = r#"
+[server]
+listen = "0.0.0.0:4444"
+public_base_url = "http://192.168.0.50:4444"
+
+[[device]]
+id = "kindle"
+width = 400
+height = 300
+palette = "gray16"
+dither = "none"
+refresh_rate = 300
+grid = { cols = 2, rows = 1 }
+
+[device.status_bar]
+edge = "bottom"
+fields = ["date"]
+
+[[device.status_bar.alert]]
+id = "post"
+label = "MAIL"
+
+[[device.widget]]
+id = "a"
+kind = "value"
+col = 0
+row = 0
+
+[[device.widget]]
+id = "b"
+kind = "value"
+col = 1
+row = 0
+"#;
+        let device = &crate::config::parse(text)
+            .expect("the fixture must be valid")
+            .devices[0];
+        let mut content =
+            HashMap::from([("a".to_owned(), record(serde_json::json!("21.4"), now()))]);
+        if let Some(state) = pushed {
+            content.insert(
+                "post".to_owned(),
+                ContentRecord {
+                    value: serde_json::Value::String(state.to_owned()),
+                    state: Some(state.to_owned()),
+                    unit: None,
+                    rows: None,
+                    received_at: now(),
+                },
+            );
+        }
+        render(device, &content)
+    }
+
+    #[test]
+    fn an_alert_that_is_not_up_costs_the_frame_nothing() {
+        // The whole point of an alert over a beacon cell. Three frames: nothing ever
+        // pushed, an explicit off, and an on. The first two must be the same bytes —
+        // not merely similar — because that is what "takes no space until it fires"
+        // means on a panel that repaints when the bytes change. And the third must
+        // differ, or the alert never appears at all.
+        let quiet = alerting_frame(None);
+        let cleared = alerting_frame(Some("off"));
+        let raised = alerting_frame(Some("alert"));
+
+        assert_eq!(
+            quiet, cleared,
+            "a cleared alert must leave the frame exactly as it was before anything \
+             was ever pushed"
+        );
+        assert_ne!(
+            quiet, raised,
+            "a raised alert has to show up somewhere on the frame"
+        );
+    }
+
+    #[test]
+    fn chrome_is_sized_to_the_panel_and_not_to_the_cell() {
+        // A two-cell grid on the panel in service gives cells 1008 pixels tall. Sized
+        // off the cell, a label came out at 110px — the same size as the reading it
+        // was introducing, which is not chrome. Both grids here are the same panel,
+        // so both must set their labels the same.
+        let dense = panel(vec![widget("a", WidgetKind::Value, 0, 0)]);
+        let sparse = Device {
+            grid: Grid { cols: 2, rows: 1 },
+            chrome: Chrome::derived(1448, 1072, Grid { cols: 2, rows: 1 }),
+            ..panel(vec![widget("a", WidgetKind::Value, 0, 0)])
+        };
+
+        let label_px = |device: &Device| {
+            let layout = Layout::for_device(device);
+            (device.width.min(device.height) as f32 * CHROME_SCALE)
+                .min(layout.cell().1 * 0.11)
+                .max(MIN_TYPE_PX)
+        };
+
+        assert_eq!(
+            label_px(&dense),
+            label_px(&sparse),
+            "one panel, one chrome size, whatever the grid"
+        );
+        assert!(
+            label_px(&sparse) < 40.0,
+            "chrome must stay chrome: got {}",
+            label_px(&sparse)
+        );
+    }
+
+    #[test]
+    fn a_column_of_readings_is_capped_below_what_a_tall_cell_would_allow() {
+        // The ceiling, in the shape the complaint arrived in: four readings in a cell
+        // half the panel high were set at what the height afforded and shouted.
+        let rows: Vec<Line> = ["21.9", "22.3", "26.1", "53"]
+            .iter()
+            .map(|v| resolved_line("Room", serde_json::json!(*v), Some("\u{b0}C"), Ink::Current))
+            .collect();
+
+        let label_px = 32.0;
+        let tall = rows_size(&FONTS, &rows, 691.0, {
+            let by_height = 991.0_f32 / (4.0 * 1.48 - 0.28);
+            by_height.min(label_px * ROW_TYPE_CEILING).max(MIN_TYPE_PX)
+        });
+        assert!(
+            tall <= label_px * ROW_TYPE_CEILING + 0.5,
+            "a tall cell must not set its rows past the ceiling: got {tall}"
+        );
+        assert!(
+            tall > label_px,
+            "the reading still has to outweigh the label naming it: got {tall}"
+        );
     }
 }

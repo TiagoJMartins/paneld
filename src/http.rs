@@ -682,15 +682,22 @@ fn find_device<'a>(config: &'a Config, device_id: &str) -> Option<&'a Device> {
 
 /// Every device whose dashboard declares `widget_id`.
 ///
-/// Walks a group's children as well as the widgets beside it: a nested cell has a
-/// push address like any other, and a push that resolved to no device is a cell
-/// that stays as it was until the render interval comes round — a change the
-/// publisher was told had been accepted, on a panel that has not shown it.
+/// Walks a group's children as well as the widgets beside it, and a status bar's
+/// alerts as well as its widgets: all three are push addresses, and a push that
+/// resolved to no device is a cell — or an alert — that stays as it was until the
+/// render interval comes round. For an alert that is the whole feature broken: it
+/// exists to appear when it is triggered, not five minutes later.
 fn devices_using(config: &Config, widget_id: &str) -> Vec<String> {
     config
         .devices
         .iter()
-        .filter(|device| device.all_widgets().any(|widget| widget.id == widget_id))
+        .filter(|device| {
+            device.all_widgets().any(|widget| widget.id == widget_id)
+                || device
+                    .status_bar
+                    .as_ref()
+                    .is_some_and(|bar| bar.alerts.iter().any(|alert| alert.id == widget_id))
+        })
         .map(|device| device.id.clone())
         .collect()
 }

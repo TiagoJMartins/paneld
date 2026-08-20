@@ -130,8 +130,11 @@ grid = { cols = 4, rows = 3 }
 #              side bounded to 18..=64: enough for one line of chrome at the size
 #              the rest of the dashboard is set at, and never so much of a small
 #              panel that the dashboard is squeezed to make room for the clock.
-#   fields     what the bar says, in the order written. A bar with no fields is
-#              rejected — it is a strip of panel that nothing can use.
+#   fields     what the bar always says, in the order written, laid out from the
+#              leading edge. Not spread across the strip: the fields are a row of
+#              chrome, and spread evenly a bar showing two things put one of them
+#              in the middle of the panel where it read as a caption for the cell
+#              above it.
 #
 # The fields are a closed set rather than a format string:
 #
@@ -170,11 +173,54 @@ grid = { cols = 4, rows = 3 }
 # unknown name is rejected at load, naming the release, since a typo and a zone
 # newer than this build want different fixes.
 #
+# ---------------------------------------------------------------------------
+# Status bar alerts
+# ---------------------------------------------------------------------------
+#
+# An alert is an indicator that costs nothing until it fires. Declared on the bar,
+# raised by a push, drawn at the *trailing* end of the strip only while it reads on,
+# and taking no space at all otherwise — a cleared alert leaves the frame in
+# exactly the state it was in before anything was ever pushed, byte for byte, so
+# the panel does not even repaint for it.
+#
+# That is the difference from a `beacon` widget, and it is the whole reason this
+# exists. A beacon owns a cell whether or not anything is happening: it spends real
+# estate all day to say nothing, and on a small panel a cell is a quarter of a row.
+# Reach for a beacon when the *state* is the information — a door, a pump, a
+# dishwasher you want to see at a glance either way. Reach for an alert when only
+# one of the two states is worth the glass.
+#
+#   id           the push address: PUT /api/content/<id>. Not a widget id, and
+#                under no obligation to be unique against one — a publisher may
+#                reasonably feed both a cell and the bar from a single push.
+#   icon         the glyph drawn while it reads on
+#   label        words beside the glyph. Usually unnecessary: an alert is on or
+#                absent, so there is nothing for a label to disambiguate. One of
+#                `icon` and `label` is required, because an alert that fires and
+#                draws nothing looks exactly like one that is not firing.
+#   on_values    what reads as on, matched against the pushed `state` then `value`.
+#                Defaults to ["on", "true", "alert"], as a beacon does.
+#   stale_after  how long a push keeps it up, in seconds. 0 is forever.
+#
+# `stale_after` is the opposite of a widget's, deliberately. A cell that has gone
+# stale keeps its last reading and mutes it, because the reading is what the cell is
+# for. An alert that has gone stale *disappears*, because an alert nobody has
+# confirmed lately is a publisher that died with its hand up — and a panel that
+# cries wolf until someone restarts a script is a panel nobody reads. Set it to
+# comfortably span the quiet hours of whatever publishes: a work-hours script needs
+# a window that survives the night, or the alert would withdraw itself every
+# evening.
+#
 # [device.status_bar]
 # edge = "top"
 # thickness = 38
 # fields = ["date", "battery", "refresh"]
 # timezone = "Europe/Lisbon"
+#
+# [[device.status_bar.alert]]
+# id = "slack_unread"
+# icon = "si-slack"
+# stale_after = 86400
 
 [[device.widget]]
 # Also the push address: PUT /api/content/slack_unread
@@ -194,9 +240,12 @@ on_values = ["on", "true", "alert"]
 # dot, spelt exactly the way `icon` is spelt below. Either one alone is legal and
 # the other state falls back to the dot, which is usually the shape you want: a
 # picture for "something wants attention" and nothing louder than a dot for
-# "quiet".
+# "quiet". Choose the off glyph with care — an outlined version of the on glyph
+# still reads as the thing having happened, at a glance, from across a room, which
+# is the only way this is ever read. When only one of the two states is worth the
+# glass at all, a status bar alert is the better shape: see above.
 # icon_on = "mdi-bell-ring"
-# icon_off = "mdi-bell-outline"
+# icon_off = "mdi-checkbox-blank-circle-outline"
 #
 # The dot or the icon *is* the reading; the `ON`/`OFF` beside it only confirms it.
 # On a dense dashboard the word is therefore the part worth dropping, which is what
@@ -279,6 +328,13 @@ label = "Notes"
 # A reading may name its own `entity` and falls back to the widget's when it does
 # not. `label`, `unit` and `precision` are its own, with `precision` falling back to
 # the widget's and then the device's.
+#
+# `icon` on a reading stands in place of its label, and on a row it usually earns
+# its place twice over: a row is a single line, so a word competes with the figure
+# for it, and `Humidity   63 %` spends a third of the line saying what a droplet
+# says in a square — beside a `%` that has already said it. Given both an icon and a
+# label the glyph leads and the words follow, which is what a row wants when the
+# label is a *place* rather than a quantity. Given neither, the row is its value.
 # [[device.widget]]
 # id = "sky"
 # kind = "weather"
@@ -292,13 +348,13 @@ label = "Notes"
 # state_text = true
 #
 # [[device.widget.reading]]
-# label = "Temp"
+# icon = "mdi-thermometer"
 # attribute = "temperature"
 # unit = "°C"
 # precision = 1
 #
 # [[device.widget.reading]]
-# label = "Humidity"
+# icon = "mdi-water-percent"
 # attribute = "humidity"
 # unit = "%"
 # precision = 0
@@ -326,20 +382,20 @@ label = "Notes"
 # icon = "mdi-home-thermometer"
 #
 # [[device.widget.reading]]
-# label = "Office"
+# icon = "mdi-desk"
 # entity = "sensor.office_temperature"
 # unit = "°C"
 # precision = 1
 #
 # [[device.widget.reading]]
-# label = "Outside"
+# icon = "mdi-tree"
 # entity = "weather.home"
 # attribute = "temperature"
 # unit = "°C"
 # precision = 1
 #
 # [[device.widget.reading]]
-# label = "Humidity"
+# icon = "mdi-water-percent"
 # entity = "weather.home"
 # attribute = "humidity"
 # unit = "%"

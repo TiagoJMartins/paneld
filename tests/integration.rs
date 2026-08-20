@@ -646,6 +646,57 @@ async fn a_push_to_a_cell_inside_a_group_rebuilds_its_device() {
     assert_eq!(harness.render_count("kindle").await, 2, "startup plus one");
 }
 
+/// One device whose Slack indicator lives on the status bar rather than in a cell.
+const ALERTING: &str = r#"
+[server]
+listen = "0.0.0.0:4444"
+public_base_url = "http://192.168.0.50:4444"
+
+[[device]]
+id = "kindle"
+width = 400
+height = 300
+palette = "gray16"
+dither = "bayer"
+refresh_rate = 300
+render_interval = 300
+grid = { cols = 1, rows = 1 }
+
+[device.status_bar]
+edge = "bottom"
+fields = ["date"]
+
+[[device.status_bar.alert]]
+id = "slack_unread"
+label = "SLACK"
+
+[[device.widget]]
+id = "only"
+kind = "value"
+col = 0
+row = 0
+"#;
+
+#[tokio::test]
+async fn a_push_to_a_status_bar_alert_rebuilds_its_device() {
+    // An alert exists to appear when it is triggered. If the address that raises it
+    // resolved to no device, the panel would not show it until the render interval
+    // came round — five minutes late, which for a notification is not late but
+    // wrong.
+    let mut harness = Harness::start(ALERTING).await;
+
+    let (status, _) = harness
+        .put(
+            "/api/content/slack_unread",
+            json!({ "value": "on", "state": "alert", "render": true }),
+        )
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    assert_eq!(harness.tick(NO_TIME).await, ["kindle"]);
+    assert_eq!(harness.render_count("kindle").await, 2, "startup plus one");
+}
+
 // ---------------------------------------------------------------------------
 // Cadence configuration
 // ---------------------------------------------------------------------------

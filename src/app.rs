@@ -281,16 +281,22 @@ impl Runtime {
             return HashMap::new();
         };
         // Group children are walked too: a nested cell's icon is fetched exactly
-        // like a top-level one's.
-        let specs: Vec<String> = device
+        // like a top-level one's. So are a reading's glyph and a status bar alert's,
+        // because both are drawn by the same code path and so must be resolved by
+        // the same one.
+        let mut specs: Vec<String> = device
             .all_widgets()
             .flat_map(|widget| {
                 [&widget.icon, &widget.icon_on, &widget.icon_off]
                     .into_iter()
                     .flatten()
                     .cloned()
+                    .chain(widget.readings.iter().filter_map(|r| r.icon.clone()))
             })
             .collect();
+        if let Some(bar) = &device.status_bar {
+            specs.extend(bar.alerts.iter().filter_map(|alert| alert.icon.clone()));
+        }
         if specs.is_empty() {
             return HashMap::new();
         }

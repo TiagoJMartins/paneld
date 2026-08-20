@@ -314,10 +314,44 @@ pub struct StatusBar {
     pub edge: Edge,
     /// Height on a horizontal edge, width on a vertical one, in pixels.
     pub thickness: u32,
-    /// What the bar says, in the order written.
+    /// What the bar always says, in the order written, from the leading edge.
     pub fields: Vec<StatusField>,
+    /// What the bar says only when it is true, pinned to the trailing edge.
+    pub alerts: Vec<Alert>,
     /// The zone [`StatusField::Date`] and [`StatusField::Time`] are rendered in.
     pub timezone: Timezone,
+}
+
+/// An indicator that costs nothing until it fires.
+///
+/// The difference between this and a `beacon` widget is the whole point of it. A
+/// beacon owns a cell of the grid whether or not anything is happening, so a
+/// dashboard pays for it all day to learn something that is true for ten minutes.
+/// An alert is declared on the bar, drawn only while its pushed value reads on,
+/// and takes no space at all otherwise — nothing moves on the panel when it
+/// appears or goes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Alert {
+    /// The push address: `PUT /api/content/<id>`.
+    ///
+    /// Not a widget id and under no obligation to be unique against one, because a
+    /// publisher may reasonably feed both a cell and the bar from one push.
+    pub id: String,
+    /// The glyph drawn while it reads on.
+    pub icon: Option<String>,
+    /// Words drawn beside the glyph. Usually unnecessary: an alert is on or absent,
+    /// so there is nothing for a label to disambiguate.
+    pub label: Option<String>,
+    /// Values that read as on, matched against the pushed `state` then `value`.
+    pub on_values: Vec<String>,
+    /// How long a pushed value keeps the alert up, in seconds. `0` is forever.
+    ///
+    /// Different from a widget's `stale_after`, and deliberately: a cell that has
+    /// gone stale still shows its last reading, muted, because the reading is what
+    /// the cell is for. An alert that has gone stale shows *nothing*, because an
+    /// alert nobody has confirmed lately is not an alert — it is a publisher that
+    /// died with its hand up.
+    pub stale_after: u64,
 }
 
 /// A time zone, resolved from its IANA name when the configuration loaded.
@@ -548,6 +582,13 @@ impl Widget {
 pub struct Reading {
     /// What the row is called. A row without one is just its value.
     pub label: Option<String>,
+    /// A glyph standing in for the label.
+    ///
+    /// Worth having because a row is a line and a label competes with the reading
+    /// for it: `Humidity  63 %` spends a third of the row saying what a droplet
+    /// says in a square. Given both, the glyph leads and the words follow, which is
+    /// what a row wants when the label is a place rather than a quantity.
+    pub icon: Option<String>,
     /// Resolved: the reading's own `entity`, or the widget's when it named none.
     pub entity: String,
     /// Read this attribute instead of the entity's state. How a weather cell gets
@@ -1216,13 +1257,14 @@ fn validate_status_bar(
         edge,
         thickness,
         fields,
+        alerts,
         timezone,
     } = raw;
 
     ensure!(
-        !fields.is_empty(),
-        "device `{device_id}` has a status_bar with no `fields`; a bar with nothing in it \
-         is a strip of panel that nothing can use"
+        !(fields.is_empty() && alerts.is_empty()),
+        "device `{device_id}` has a status_bar with no `fields` and no alerts; a bar with \
+         nothing that can ever appear in it is a strip of panel nothing can use"
     );
 
     let across = match edge {
@@ -1249,11 +1291,55 @@ fn validate_status_bar(
         None => Timezone::utc(),
     };
 
+    let alerts = alerts
+        .into_iter()
+        .map(|raw| validate_alert(raw, device_id))
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(StatusBar {
         edge,
         thickness,
         fields,
+        alerts,
         timezone,
+    })
+}
+
+/// Resolves one of a bar's alerts.
+///
+/// An alert with neither a glyph nor words would fire and draw nothing, which
+/// looks exactly like an alert that is not firing — so one of the two is required.
+fn validate_alert(raw: RawAlert, device_id: &str) -> Result<Alert> {
+    let RawAlert {
+        id,
+        icon,
+        label,
+        on_values,
+        stale_after,
+    } = raw;
+
+    ensure!(
+        !id.trim().is_empty(),
+        "device `{device_id}` has a status_bar alert with no `id`; the id is the address \
+         `PUT /api/content/<id>` a publisher raises it with"
+    );
+    ensure!(
+        icon.is_some() || label.is_some(),
+        "status_bar alert `{id}` on device `{device_id}` has neither an `icon` nor a \
+         `label`, so firing would look the same as staying quiet"
+    );
+    if let Some(icon) = &icon {
+        crate::icon::validate(icon).with_context(|| {
+            format!("status_bar alert `{id}` on device `{device_id}` has an invalid icon")
+        })?;
+    }
+
+    Ok(Alert {
+        id,
+        icon,
+        label,
+        on_values,
+        stale_after,
     })
 }
 
@@ -1584,11 +1670,22 @@ fn validate_reading(
 ) -> Result<Reading> {
     let RawReading {
         label,
+        icon,
         entity,
         attribute,
         unit,
         precision,
     } = raw;
+
+    if let Some(icon) = &icon {
+        crate::icon::validate(icon).with_context(|| {
+            format!(
+                "reading {} of widget `{widget_id}` on device `{device_id}` has an \
+                 invalid icon",
+                index + 1
+            )
+        })?;
+    }
 
     let entity = entity
         .or_else(|| widget_entity.map(str::to_owned))
@@ -1610,6 +1707,7 @@ fn validate_reading(
 
     Ok(Reading {
         label,
+        icon,
         entity,
         attribute,
         unit,
@@ -1777,8 +1875,24 @@ struct RawChrome {
 struct RawStatusBar {
     edge: Edge,
     thickness: Option<u32>,
+    #[serde(default)]
     fields: Vec<StatusField>,
+    /// Written as `[[device.status_bar.alert]]` tables.
+    #[serde(default, rename = "alert")]
+    alerts: Vec<RawAlert>,
     timezone: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct RawAlert {
+    id: String,
+    icon: Option<String>,
+    label: Option<String>,
+    #[serde(default = "default_on_values")]
+    on_values: Vec<String>,
+    #[serde(default)]
+    stale_after: u64,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1821,6 +1935,7 @@ struct RawWidget {
 #[serde(deny_unknown_fields)]
 struct RawReading {
     label: Option<String>,
+    icon: Option<String>,
     /// Defaults to the widget's own `entity`.
     entity: Option<String>,
     attribute: Option<String>,
@@ -3483,5 +3598,107 @@ row = 0
             );
             stamp(path, epoch);
         }
+    }
+
+    /// [`BASE`] with a `[device.status_bar]` written as a table, so alerts can be
+    /// appended to it as `[[device.status_bar.alert]]`.
+    fn with_alert(bar: &str, alert: &str) -> String {
+        format!("{BASE}\n[device.status_bar]\n{bar}\n\n[[device.status_bar.alert]]\n{alert}\n")
+    }
+
+    #[test]
+    fn parses_a_status_bar_alert() {
+        let config = parse(&with_alert(
+            "edge = \"bottom\"\nfields = [\"date\"]",
+            "id = \"slack_unread\"\nicon = \"si-slack\"\nstale_after = 3600",
+        ))
+        .unwrap();
+        let bar = config.devices[0].status_bar.as_ref().unwrap();
+        assert_eq!(bar.alerts.len(), 1);
+        assert_eq!(bar.alerts[0].id, "slack_unread");
+        assert_eq!(bar.alerts[0].icon.as_deref(), Some("si-slack"));
+        assert_eq!(bar.alerts[0].stale_after, 3600);
+        assert_eq!(
+            bar.alerts[0].on_values,
+            ["on", "true", "alert"],
+            "an alert shares the beacon's default vocabulary"
+        );
+    }
+
+    #[test]
+    fn a_bar_may_carry_only_alerts() {
+        // A bar that is empty until something happens is a legitimate bar: it costs
+        // the strip and says nothing until it has something to say.
+        let config = parse(&with_alert(
+            "edge = \"bottom\"",
+            "id = \"post\"\nlabel = \"MAIL\"",
+        ))
+        .unwrap();
+        let bar = config.devices[0].status_bar.as_ref().unwrap();
+        assert!(bar.fields.is_empty());
+        assert_eq!(bar.alerts.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_bar_that_can_never_show_anything() {
+        let message = err(&with_status_bar("edge = \"bottom\", fields = []"));
+        assert!(message.contains("status_bar"), "{message}");
+    }
+
+    #[test]
+    fn rejects_an_alert_that_would_fire_invisibly() {
+        // Neither glyph nor words: firing would look exactly like staying quiet,
+        // which is the one thing an alert must not do.
+        let message = err(&with_alert(
+            "edge = \"bottom\"\nfields = [\"date\"]",
+            "id = \"post\"",
+        ));
+        assert!(
+            message.contains("post") && message.contains("icon"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_alert_with_no_id_or_a_bad_icon() {
+        let no_id = err(&with_alert(
+            "edge = \"bottom\"\nfields = [\"date\"]",
+            "id = \"\"\nlabel = \"x\"",
+        ));
+        assert!(no_id.contains("id"), "{no_id}");
+
+        let bad_icon = err(&with_alert(
+            "edge = \"bottom\"\nfields = [\"date\"]",
+            "id = \"post\"\nicon = \"nonsense.webp\"",
+        ));
+        assert!(
+            bad_icon.contains("post") && bad_icon.contains("icon"),
+            "{bad_icon}"
+        );
+    }
+
+    #[test]
+    fn a_reading_can_be_named_by_a_glyph() {
+        let config = parse(&with_home_assistant(
+            "[[device.widget]]\nid = \"climate\"\nkind = \"list\"\ncol = 0\nrow = 0\n\
+             [[device.widget.reading]]\nicon = \"mdi-thermometer\"\n\
+             entity = \"sensor.office\"\nunit = \"°C\"\n",
+        ))
+        .unwrap();
+        let reading = &config.devices[0].widgets[0].readings[0];
+        assert_eq!(reading.icon.as_deref(), Some("mdi-thermometer"));
+        assert_eq!(reading.label, None, "a glyph stands in for the words");
+    }
+
+    #[test]
+    fn rejects_a_reading_whose_glyph_is_not_one() {
+        let message = err(&with_home_assistant(
+            "[[device.widget]]\nid = \"climate\"\nkind = \"list\"\ncol = 0\nrow = 0\n\
+             [[device.widget.reading]]\nicon = \"mine.webp\"\nentity = \"sensor.office\"\n",
+        ));
+        assert!(
+            message.contains("reading 1") && message.contains("icon"),
+            "{message}"
+        );
     }
 }
