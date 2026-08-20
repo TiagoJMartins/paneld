@@ -474,10 +474,11 @@ mod tests {
         let bitmap = takumi::render(options).expect("a glyph should rasterise");
         assert_eq!((bitmap.width(), bitmap.height()), (SIZE, SIZE));
 
-        bitmap
-            .into_raw()
-            .chunks_exact(4)
-            .filter(|px| px[0] < 250 || px[1] < 250 || px[2] < 250)
+        let raw = bitmap.into_raw();
+        raw.as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|&&[r, g, b, _]| r < 250 || g < 250 || b < 250)
             .count()
     }
 

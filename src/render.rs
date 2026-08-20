@@ -2736,7 +2736,12 @@ mod tests {
             Ink::Current,
         );
         let raster = rasterise(&FONTS, node, 48, 48).expect("should rasterise");
-        let inked = raster.chunks_exact(4).filter(|px| px[3] > 128).count();
+        let inked = raster
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|&&[.., a]| a > 128)
+            .count();
         assert!(
             inked > 20,
             "a painted icon must actually draw ink, got {inked}"

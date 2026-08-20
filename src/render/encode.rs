@@ -77,8 +77,14 @@ pub fn quantise_and_encode(
     // Every sample is now a palette colour, so this lookup recovers the index the
     // quantiser chose rather than approximating it.
     let mut indices = Vec::with_capacity(w * h);
-    for px in linear.chunks_exact(3) {
-        indices.push(targets.nearest_rgb_index([px[0], px[1], px[2]]) as u8);
+    // `as_chunks` rather than `chunks_exact`: the chunk size is a constant, so the
+    // fixed-size form hands the compiler an array it can index without a bounds
+    // check per channel. The remainder is empty by construction — the buffer is
+    // three samples per pixel — and discarding it is the same guarantee
+    // `chunks_exact` gave.
+    let (pixels, _) = linear.as_chunks::<3>();
+    for &[r, g, b] in pixels {
+        indices.push(targets.nearest_rgb_index([r, g, b]) as u8);
     }
 
     let packed = pack_scanlines(&indices, w, h, spec.bit_depth as usize);
@@ -125,10 +131,11 @@ pub fn frame_hash(bytes: &[u8]) -> String {
 fn to_linear_over_white(rgba: &[u8], grayscale: bool) -> Vec<f32> {
     let lut = &*SRGB_TO_LINEAR;
     let mut linear = Vec::with_capacity(rgba.len() / 4 * 3);
-    for px in rgba.chunks_exact(4) {
-        let alpha = f32::from(px[3]) / 255.0;
+    let (pixels, _) = rgba.as_chunks::<4>();
+    for &[r, g, b, a] in pixels {
+        let alpha = f32::from(a) / 255.0;
         let over_white = |channel: u8| lut[channel as usize] * alpha + (1.0 - alpha);
-        let (r, g, b) = (over_white(px[0]), over_white(px[1]), over_white(px[2]));
+        let (r, g, b) = (over_white(r), over_white(g), over_white(b));
 
         if grayscale {
             let luminance = 0.212_6 * r + 0.715_2 * g + 0.072_2 * b;
