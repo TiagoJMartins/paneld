@@ -123,12 +123,22 @@ fn validate(config_path: &Path) -> Result<()> {
                 .map(|field| format!("{field:?}").to_lowercase())
                 .collect();
             println!(
-                "    status bar on the {} edge, {}px, offset {}: {}",
+                "    status bar on the {} edge, {}px, {} (IANA {}): {}",
                 bar.edge,
                 bar.thickness,
-                bar.utc_offset,
+                bar.timezone.name(),
+                config::TZDATA_VERSION,
                 fields.join(" ")
             );
+            // The clock is the one field that costs a repaint per render, so an
+            // author reading this report should be told which they configured.
+            if bar.fields.contains(&config::StatusField::Time) {
+                println!(
+                    "      the clock changes every frame, so this panel repaints \
+                     every {}s",
+                    device.render_interval
+                );
+            }
         }
         for widget in &device.widgets {
             print_widget(widget, 4);

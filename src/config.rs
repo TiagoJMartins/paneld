@@ -16,7 +16,8 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use time::UtcOffset;
+use time::{OffsetDateTime, UtcOffset};
+use tz::TimeZoneRef;
 
 /// Inclusive bounds on a device's `refresh_rate`, in seconds.
 ///
@@ -315,15 +316,91 @@ pub struct StatusBar {
     pub thickness: u32,
     /// What the bar says, in the order written.
     pub fields: Vec<StatusField>,
-    /// The fixed offset from UTC that [`StatusField::Date`] and
-    /// [`StatusField::Time`] are rendered in.
-    ///
-    /// A fixed offset, and deliberately not called a timezone: paneld carries no
-    /// timezone database, so nothing here could know when a region changes offset.
-    /// A panel in a DST region needs this edited twice a year, and a field named
-    /// `timezone` would have hidden that rather than said it.
-    pub utc_offset: UtcOffset,
+    /// The zone [`StatusField::Date`] and [`StatusField::Time`] are rendered in.
+    pub timezone: Timezone,
 }
+
+/// A time zone, resolved from its IANA name when the configuration loaded.
+///
+/// A real zone and not an offset, because an offset is a fact about a moment and
+/// a wall panel outlives the moment: a panel told `+01:00` in August is an hour
+/// wrong from the last Sunday in October until spring, and wrong quietly, which is
+/// the worst way for a clock to be wrong. The database is compiled into the binary
+/// (see `Cargo.toml`), so this needs nothing installed and reads nothing at render
+/// time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Timezone {
+    /// The name the file wrote.
+    ///
+    /// Kept alongside the handle because the handle cannot answer it: `Portugal`
+    /// and `Europe/Lisbon` resolve to the same transition data and so compare
+    /// equal, and lookup is case-insensitive, so the only record of what an author
+    /// actually asked for is this string.
+    name: String,
+    zone: TimeZoneRef<'static>,
+}
+
+impl Timezone {
+    /// UTC, which is what a bar gets when its author names no zone.
+    pub fn utc() -> Self {
+        Self {
+            name: "UTC".to_owned(),
+            zone: TimeZoneRef::utc(),
+        }
+    }
+
+    /// Resolves an IANA name — `Europe/Lisbon`, `America/New_York`, `UTC` —
+    /// against the compiled-in database.
+    ///
+    /// An unknown name is an error naming the database version, because the two
+    /// ways to get here are a typo and a zone that only exists in a release newer
+    /// than the one this binary was built against, and those want different fixes.
+    pub fn parse(name: &str) -> Result<Self> {
+        let name = name.trim();
+        ensure!(
+            !name.is_empty(),
+            "a time zone must be named, as an IANA zone like `Europe/Lisbon`"
+        );
+        let zone = tzdb::tz_by_name(name).with_context(|| {
+            format!(
+                "`{name}` is not a zone in the IANA {} database compiled into this binary",
+                tzdb::VERSION
+            )
+        })?;
+        Ok(Self {
+            name: name.to_owned(),
+            zone,
+        })
+    }
+
+    /// The IANA name this was resolved from.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// `instant`, as the wall time this zone was reading at that moment.
+    ///
+    /// Degrades to UTC rather than failing, because this runs inside a render and a
+    /// clock an hour wrong beats no frame at all. Both ways it can fail are
+    /// exotic: an instant past the last transition of a zone that carries no POSIX
+    /// rule, and an offset beyond ±24 hours, which no real zone has.
+    pub fn at(&self, instant: OffsetDateTime) -> OffsetDateTime {
+        let offset = self
+            .zone
+            .find_local_time_type(instant.unix_timestamp())
+            .ok()
+            .and_then(|local| UtcOffset::from_whole_seconds(local.ut_offset()).ok())
+            .unwrap_or(UtcOffset::UTC);
+        instant.to_offset(offset)
+    }
+}
+
+/// The IANA release the time zone database compiled into this binary came from.
+///
+/// Surfaced because the database is frozen at build time and nothing announces
+/// that: a zone whose rules changed after this release is rendered by the old
+/// rules, silently, until someone rebuilds.
+pub const TZDATA_VERSION: &str = tzdb::VERSION;
 
 /// Which edge of the frame a status bar takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1139,7 +1216,7 @@ fn validate_status_bar(
         edge,
         thickness,
         fields,
-        utc_offset,
+        timezone,
     } = raw;
 
     ensure!(
@@ -1166,18 +1243,17 @@ fn validate_status_bar(
         across.saturating_sub(thickness)
     );
 
-    let utc_offset = match &utc_offset {
-        Some(raw) => parse_utc_offset(raw).with_context(|| {
-            format!("device `{device_id}` has an invalid status_bar utc_offset `{raw}`")
-        })?,
-        None => UtcOffset::UTC,
+    let timezone = match &timezone {
+        Some(name) => Timezone::parse(name)
+            .with_context(|| format!("device `{device_id}` has an invalid status_bar timezone"))?,
+        None => Timezone::utc(),
     };
 
     Ok(StatusBar {
         edge,
         thickness,
         fields,
-        utc_offset,
+        timezone,
     })
 }
 
@@ -1188,49 +1264,6 @@ fn validate_status_bar(
 /// a small panel that the dashboard is squeezed to make room for the clock.
 fn default_thickness(width: u32, height: u32) -> u32 {
     ((width.min(height) as f32 * 0.05).round() as u32).clamp(18, 64)
-}
-
-/// Parses a fixed offset from UTC, spelt `+02:00`, `-0530`, `+2`, `Z` or `UTC`.
-///
-/// Hand-parsed rather than taken from a datetime library because this is the whole
-/// of what paneld understands about time zones, and saying so in twenty lines is
-/// more honest than reaching for a parser that implies a database behind it.
-fn parse_utc_offset(raw: &str) -> Result<UtcOffset> {
-    let text = raw.trim();
-    if text.eq_ignore_ascii_case("z") || text.eq_ignore_ascii_case("utc") {
-        return Ok(UtcOffset::UTC);
-    }
-    ensure!(
-        text.is_ascii() && !text.is_empty(),
-        "an offset is written like `+02:00`, `-0530`, `+2`, `Z` or `UTC`"
-    );
-
-    let (sign, rest) = match text.as_bytes()[0] {
-        b'+' => (1i8, &text[1..]),
-        b'-' => (-1i8, &text[1..]),
-        _ => (1i8, text),
-    };
-    let (hours, minutes) = match rest.split_once(':') {
-        Some((hours, minutes)) => (hours, minutes),
-        // `+0530`, the spelling with no separator. Anything longer than two digits
-        // is hours and minutes run together.
-        None if rest.len() > 2 => rest.split_at(rest.len() - 2),
-        None => (rest, "0"),
-    };
-
-    let hours: i8 = hours
-        .parse()
-        .with_context(|| format!("`{hours}` is not an hour count"))?;
-    let minutes: i8 = minutes
-        .parse()
-        .with_context(|| format!("`{minutes}` is not a minute count"))?;
-    ensure!(
-        (0..=23).contains(&hours) && (0..=59).contains(&minutes),
-        "an offset of {hours}:{minutes:02} is not a real one"
-    );
-
-    UtcOffset::from_hms(sign * hours, sign * minutes, 0)
-        .with_context(|| format!("`{raw}` is not an offset from UTC"))
 }
 
 /// Rejects a widget that leaves its grid, and any two widgets sharing a cell.
@@ -1745,7 +1778,7 @@ struct RawStatusBar {
     edge: Edge,
     thickness: Option<u32>,
     fields: Vec<StatusField>,
-    utc_offset: Option<String>,
+    timezone: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -2806,46 +2839,84 @@ entity = "sensor.office_temperature"
     }
 
     #[test]
-    fn parses_every_offset_spelling() {
-        for (raw, seconds) in [
-            ("+02:00", 7_200),
-            ("-0530", -19_800),
-            ("+2", 7_200),
-            ("Z", 0),
-            ("UTC", 0),
-        ] {
-            let text = with_status_bar(&format!(
-                "edge = \"top\", fields = [\"time\"], utc_offset = \"{raw}\""
-            ));
-            let config = parse(&text).unwrap_or_else(|e| panic!("{raw} should parse: {e:#}"));
-            let bar = config.devices[0].status_bar.as_ref().unwrap();
-            assert_eq!(bar.utc_offset.whole_seconds(), seconds, "{raw}");
-        }
+    fn resolves_an_iana_zone_and_follows_its_rules_across_a_transition() {
+        let text =
+            with_status_bar("edge = \"top\", fields = [\"time\"], timezone = \"Europe/Lisbon\"");
+        let config = parse(&text).unwrap();
+        let zone = &config.devices[0].status_bar.as_ref().unwrap().timezone;
+        assert_eq!(zone.name(), "Europe/Lisbon");
+
+        // The whole reason this is a zone and not an offset: one name, two offsets,
+        // and the database is what knows which applies when. 2026-01-15 is WET and
+        // 2026-07-15 is WEST.
+        let winter = OffsetDateTime::from_unix_timestamp(1_768_478_400).unwrap();
+        let summer = OffsetDateTime::from_unix_timestamp(1_784_116_800).unwrap();
+        assert_eq!(zone.at(winter).offset().whole_hours(), 0, "WET");
+        assert_eq!(zone.at(summer).offset().whole_hours(), 1, "WEST");
     }
 
     #[test]
-    fn rejects_an_offset_that_is_not_one() {
-        for raw in ["midday", "+25:00", "+02:75", "two", "+"] {
+    fn a_zone_south_of_the_equator_moves_the_other_way() {
+        // A northern-hemisphere-only test would pass on a sign error.
+        let text =
+            with_status_bar("edge = \"top\", fields = [\"time\"], timezone = \"Australia/Sydney\"");
+        let config = parse(&text).unwrap();
+        let zone = &config.devices[0].status_bar.as_ref().unwrap().timezone;
+
+        let january = OffsetDateTime::from_unix_timestamp(1_768_478_400).unwrap();
+        let july = OffsetDateTime::from_unix_timestamp(1_784_116_800).unwrap();
+        assert_eq!(zone.at(january).offset().whole_hours(), 11, "AEDT");
+        assert_eq!(zone.at(july).offset().whole_hours(), 10, "AEST");
+    }
+
+    #[test]
+    fn rejects_a_zone_the_database_does_not_have() {
+        for raw in ["Europe/Nowhere", "midday", "+02:00", ""] {
             let text = with_status_bar(&format!(
-                "edge = \"top\", fields = [\"time\"], utc_offset = \"{raw}\""
+                "edge = \"top\", fields = [\"time\"], timezone = \"{raw}\""
             ));
             let message = err(&text);
             assert!(
-                message.contains("utc_offset") && message.contains(raw),
-                "{raw} should be rejected, got: {message}"
+                message.contains("timezone"),
+                "`{raw}` should be rejected as a zone, got: {message}"
             );
         }
     }
 
     #[test]
-    fn the_default_offset_is_utc() {
-        // paneld carries no timezone database, so UTC is the only offset it can
-        // assume without implying it knows where the panel is.
+    fn a_fixed_offset_is_no_longer_a_time_zone() {
+        // `utc_offset` was what this took before the database went in. Rejected
+        // rather than tolerated: a panel that quietly ignored it would keep the
+        // wrong clock it was configured to have.
+        let text = with_status_bar("edge = \"top\", fields = [\"time\"], utc_offset = \"+01:00\"");
+        let message = err(&text);
+        assert!(message.contains("utc_offset"), "{message}");
+    }
+
+    #[test]
+    fn the_default_zone_is_utc() {
+        // The only zone paneld can assume without implying it knows where the panel
+        // hangs.
         let text = with_status_bar("edge = \"top\", fields = [\"time\"]");
         let config = parse(&text).unwrap();
         assert_eq!(
-            config.devices[0].status_bar.as_ref().unwrap().utc_offset,
-            UtcOffset::UTC
+            config.devices[0]
+                .status_bar
+                .as_ref()
+                .unwrap()
+                .timezone
+                .name(),
+            "UTC"
+        );
+    }
+
+    #[test]
+    fn the_embedded_database_is_named() {
+        // Frozen at build time, so an operator has to be able to see which release
+        // the clock's rules came from.
+        assert!(
+            TZDATA_VERSION.len() >= 5 && TZDATA_VERSION.is_ascii(),
+            "expected an IANA release like `2026b`, got `{TZDATA_VERSION}`"
         );
     }
 

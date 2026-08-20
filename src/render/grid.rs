@@ -215,8 +215,7 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Dither, Edge, Grid, Palette, StatusBar, WidgetKind};
-    use time::UtcOffset;
+    use crate::config::{Dither, Edge, Grid, Palette, StatusBar, Timezone, WidgetKind};
 
     /// A widget occupying one or more cells, with everything a hit test does not
     /// look at left empty.
@@ -294,7 +293,7 @@ mod tests {
             edge,
             thickness,
             fields: Vec::new(),
-            utc_offset: UtcOffset::UTC,
+            timezone: Timezone::utc(),
         });
         let (_, _, area_w, area_h) = device.grid_area();
         device.chrome = Chrome::derived(area_w, area_h, device.grid);

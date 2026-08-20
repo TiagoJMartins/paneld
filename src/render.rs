@@ -3080,8 +3080,7 @@ mod tests {
 
     #[test]
     fn a_status_bar_takes_its_edge_and_leaves_the_grid_the_rest() {
-        use crate::config::{StatusBar, StatusField};
-        use time::UtcOffset;
+        use crate::config::{StatusBar, StatusField, Timezone};
 
         // All four edges, because the edge decides both the flex axis and which of
         // the bar and the grid comes first. Getting the order backwards draws the bar
@@ -3094,7 +3093,7 @@ mod tests {
                     edge,
                     thickness: 24,
                     fields: vec![StatusField::Device, StatusField::Refresh],
-                    utc_offset: UtcOffset::UTC,
+                    timezone: Timezone::utc(),
                 }),
                 ..device(vec![widget("a", WidgetKind::Value, 0, 0)])
             };

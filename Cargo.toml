@@ -1,6 +1,6 @@
 [package]
 name = "paneld"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "Minimal TRMNL BYOS panel server: TOML dashboards, browserless rendering, pushable content"
 license = "MIT"
@@ -49,6 +49,23 @@ reqwest = "0.13"
 async-trait = "0.1"
 # Timestamps on the wire
 time = { version = "0.3", features = ["serde-well-known", "formatting", "parsing"] }
+# The IANA time zone database, compiled into the binary.
+#
+# Compiled in rather than read from `/usr/share/zoneinfo` for the same reason the
+# typefaces are: the runtime image is a slim Debian with no `tzdata` package, so a
+# clock that consulted the filesystem would be wrong on the one machine this runs
+# on. `default-features = false` drops tzdb's `local` feature, whose only job is to
+# read the *host's* zone from the environment — a panel's zone is a property of the
+# wall it hangs on, not of the container that renders it.
+#
+# `tz-rs` is already in the graph as tzdb's engine and is named here only so its
+# `TimeZoneRef` can appear in our own signatures. Its library name is `tz`.
+#
+# The database is frozen at build time, so a rules change in a new IANA release
+# needs `cargo update` and a rebuild. `paneld validate` prints the embedded
+# version so that staleness is at least visible.
+tzdb = { version = "0.7", default-features = false, features = ["std"] }
+tz-rs = { version = "0.7", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # Drives the axum router in-process, without binding a port (test seam 1).

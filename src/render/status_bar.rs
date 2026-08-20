@@ -207,8 +207,8 @@ fn field_text(
     telemetry: &Telemetry,
 ) -> String {
     match field {
-        StatusField::Date => date_text(now.to_offset(bar.utc_offset)),
-        StatusField::Time => time_text(now.to_offset(bar.utc_offset)),
+        StatusField::Date => date_text(bar.timezone.at(now)),
+        StatusField::Time => time_text(bar.timezone.at(now)),
         StatusField::Battery => match telemetry.battery_percent {
             Some(percent) => format!("{}%", percent.round() as i64),
             None => ABSENT.to_owned(),
@@ -322,15 +322,22 @@ mod tests {
     const UTC_BAR: &str = r#"edge = "bottom"
 fields = ["time"]"#;
 
-    /// The same bar two hours east, which at the instant these tests use is on the
-    /// next day.
-    const EAST_BAR: &str = r#"edge = "bottom"
+    /// The same bar in a zone that is two hours east at the instant below, where it
+    /// is already the next day. Helsinki is on EET in November, so this is a
+    /// standard-time offset rather than a summer one.
+    const HELSINKI_BAR: &str = r#"edge = "bottom"
 fields = ["time"]
-utc_offset = "+02:00""#;
+timezone = "Europe/Helsinki""#;
 
-    const WEST_BAR: &str = r#"edge = "bottom"
+    /// Five hours west: New York on EST, again standard time in November.
+    const NEW_YORK_BAR: &str = r#"edge = "bottom"
 fields = ["time"]
-utc_offset = "-05:00""#;
+timezone = "America/New_York""#;
+
+    /// A zone whose offset changes, for the transition test.
+    const LISBON_BAR: &str = r#"edge = "bottom"
+fields = ["time"]
+timezone = "Europe/Lisbon""#;
 
     /// 2023-11-14T22:13:20Z — late enough in the day that a positive offset lands
     /// on the next date, which is the case a naive clock gets wrong.
@@ -393,29 +400,57 @@ grid = {{ cols = 4, rows = 3 }}
     }
 
     #[test]
-    fn a_positive_offset_shifts_the_clock_past_midnight() {
-        // The whole point of `utc_offset`: at this instant a panel two hours east is
-        // already on the next day, and a bar that ignored the offset would show
-        // yesterday's date beside tonight's time.
+    fn a_zone_east_of_utc_shifts_the_clock_past_midnight() {
+        // At this instant a panel in Helsinki is already on the next day, and a bar
+        // that rendered UTC would show yesterday's date beside tonight's time.
         assert_eq!(
-            text(EAST_BAR, StatusField::Time, &nothing_reported()),
+            text(HELSINKI_BAR, StatusField::Time, &nothing_reported()),
             "00:13"
         );
         assert_eq!(
-            text(EAST_BAR, StatusField::Date, &nothing_reported()),
+            text(HELSINKI_BAR, StatusField::Date, &nothing_reported()),
             "Wed 15 Nov"
         );
     }
 
     #[test]
-    fn a_negative_offset_shifts_the_clock_back_within_the_day() {
+    fn a_zone_west_of_utc_shifts_the_clock_back_within_the_day() {
         assert_eq!(
-            text(WEST_BAR, StatusField::Time, &nothing_reported()),
+            text(NEW_YORK_BAR, StatusField::Time, &nothing_reported()),
             "17:13"
         );
         assert_eq!(
-            text(WEST_BAR, StatusField::Date, &nothing_reported()),
+            text(NEW_YORK_BAR, StatusField::Date, &nothing_reported()),
             "Tue 14 Nov"
+        );
+    }
+
+    #[test]
+    fn the_clock_follows_its_zone_across_a_daylight_saving_transition() {
+        // The reason the bar takes a zone and not an offset. One configuration, one
+        // panel, two answers — and neither of them is anything the author has to
+        // remember to edit in spring and autumn.
+        let device = device(LISBON_BAR);
+        let bar = device
+            .status_bar
+            .as_ref()
+            .expect("the fixture configures a bar");
+        let telemetry = nothing_reported();
+
+        // 2026-01-15T12:00:00Z, when Lisbon is on WET, and 2026-07-15T12:00:00Z,
+        // when it is on WEST.
+        let winter = OffsetDateTime::from_unix_timestamp(1_768_478_400).expect("valid");
+        let summer = OffsetDateTime::from_unix_timestamp(1_784_116_800).expect("valid");
+
+        assert_eq!(
+            field_text(StatusField::Time, &device, bar, winter, &telemetry),
+            "12:00",
+            "WET is UTC itself"
+        );
+        assert_eq!(
+            field_text(StatusField::Time, &device, bar, summer, &telemetry),
+            "13:00",
+            "WEST is an hour ahead, and the database is what knows that"
         );
     }
 
