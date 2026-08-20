@@ -3,6 +3,10 @@
 # Copy to `paneld.toml` and edit. The server re-reads this file when it changes on
 # disk; if the new version does not parse or does not validate, the error is logged
 # and the previous configuration stays in effect, so a typo never blanks the panel.
+#
+# Everything in here may instead live in a fragment under `paneld.toml.d/`. That is
+# documented at the foot of this file, together with the one rule worth reading
+# before you split anything up.
 
 [server]
 listen = "0.0.0.0:4444"
@@ -24,8 +28,8 @@ content_path = "paneld-content.json"
 # and keeps the dashboard drawable while the internet is down.
 icon_cache_path = "paneld-icons"
 
-# Optional. Required by any `ha_entity` or `weather` widget, and by any `tap` that
-# calls a service.
+# Optional. Required by any `ha_entity`, `weather` or `list` widget, by every
+# `reading` any of them carries, and by any `tap` that calls a service.
 # [home_assistant]
 # base_url = "http://homeassistant.local:8123"
 # token = "a-long-lived-access-token"
@@ -62,8 +66,110 @@ refresh_rate = 300
 # rather trigger renders explicitly with `render: true` on a push.
 render_interval = 300
 
+# Decimal places every numeric reading on this panel is rounded to, said once here
+# rather than on each widget. A widget's own `precision` overrides this, and a
+# `reading`'s overrides both; leave all three out and a value renders with exactly
+# the digits its source sent. That last case is the one worth knowing, because a
+# Home Assistant sensor sends however many the integration felt like, and
+# `21.299999237060547` in a cell 240 pixels wide is a number nobody can read from
+# a sofa. Capped at 6: past that the decimals are noise competing with the figure
+# for space. A reading that is not a number at all — a condition, a pushed string —
+# passes through untouched, so setting this cannot mangle a `text` cell.
+# precision = 1
+
 # Each cell must be at least 40x40 pixels.
 grid = { cols = 4, rows = 3 }
+
+# ---------------------------------------------------------------------------
+# Spacing
+# ---------------------------------------------------------------------------
+#
+# Three measurements in pixels, all optional. Leave one out and it is derived from
+# the cell size, which is what most dashboards should want: fixed spacing is a trap
+# on a small panel or a dense grid, where padding that exceeds the cell it sits
+# inside leaves the text layout engine a negative content box. The derived values
+# scale with the cell and are bounded at both ends, so a 4x3 grid on a Kindle and a
+# 2x2 on an 800x480 panel both come out looking deliberate.
+#
+#   gap      between cells, and around the outside of the grid area.
+#   padding  inside a cell, between its rule and its content. Charged twice per
+#            axis — once on each side — and it comes straight off the width a
+#            figure has to fit in, so it wants a tighter hand than `gap`.
+#   border   a cell's rule, hairline by default. `border = 0` draws no frame at
+#            all, which is what a dashboard of bare readings wants; the gap alone
+#            then separates one cell from the next.
+#
+# Each is capped at 64 pixels. That ceiling is a guard rather than taste: spacing is
+# subtracted from every cell, so a typo with an extra digit is a dashboard with no
+# cells rather than a roomy one.
+#
+# A combination that leaves a cell nothing to draw in — too much padding, too many
+# tracks, a status bar taking what was left — is rejected when the file loads, in an
+# error naming the device and the content box it worked out. That is deliberate: the
+# layout engine panics on a degenerate box rather than returning an error, so this
+# has to be a logged failure with the previous configuration still in effect, not
+# something discovered on the panel.
+#
+# [device.chrome]
+# gap = 10
+# padding = 8
+# border = 1
+
+# ---------------------------------------------------------------------------
+# Status bar
+# ---------------------------------------------------------------------------
+#
+# A strip along one edge of the frame, outside the widget grid. Optional and off by
+# default. The grid gets the frame *less* the strip, so turning one on shrinks every
+# cell rather than drawing over the top row — which is also why a bar thick enough
+# to leave the grid less than one cell's worth of its axis is rejected at load.
+#
+#   edge       top | bottom | left | right
+#   thickness  height on a horizontal edge, width on a vertical one, in pixels,
+#              within 12..=256. Omitted, it is a twentieth of the frame's short
+#              side bounded to 18..=64: enough for one line of chrome at the size
+#              the rest of the dashboard is set at, and never so much of a small
+#              panel that the dashboard is squeezed to make room for the clock.
+#   fields     what the bar says, in the order written. A bar with no fields is
+#              rejected — it is a strip of panel that nothing can use.
+#
+# The fields are a closed set rather than a format string:
+#
+#   date       the date, in the bar's own offset
+#   time       the time of day, in the bar's own offset
+#   battery    the device's last reported battery percentage
+#   refresh    how often the device is told to poll, as a period
+#   device     the device id, for a household running more than one panel
+#   signal     signal strength as the device reported it
+#
+# Closed deliberately. Every field here is something this process already knows for
+# certain, where a template language would invite naming things it does not have —
+# and a wall panel is a poor place to discover that.
+#
+# Two of them cost more than they look.
+#
+# `time` makes every frame differ from the last, because the minute always has. The
+# panel therefore repaints on every render interval rather than only when a reading
+# changed, and on e-ink that is the difference between a dashboard that sits still
+# and one that flashes every `render_interval` seconds — plus whatever that costs a
+# battery device in runtime. `date` is cheap by comparison: it changes once a day.
+# If you want a clock and a still panel, you cannot have both; pick one knowingly.
+#
+# `signal` is only as good as the client: the KOReader plugin in service hardcodes
+# `rssi` to 0, so the field reads 0 until that changes.
+#
+# `utc_offset` is a fixed offset from UTC, spelt `+02:00`, `-0530`, `+2`, `Z` or
+# `UTC`, and defaults to UTC. It is a fixed offset and deliberately not called a
+# timezone: paneld carries no timezone database, so nothing here could know when a
+# region changes offset. A panel anywhere that observes DST needs this line edited
+# twice a year. Calling the key `timezone` would have hidden that rather than said
+# it.
+#
+# [device.status_bar]
+# edge = "top"
+# thickness = 38
+# fields = ["date", "battery", "refresh"]
+# utc_offset = "+01:00"
 
 [[device.widget]]
 # Also the push address: PUT /api/content/slack_unread
@@ -79,6 +185,19 @@ stale_after = 3600
 # Matched against the pushed `state` field first and `value` second.
 # Defaults to ["on", "true", "alert"].
 on_values = ["on", "true", "alert"]
+# A beacon's two states may each have an icon of their own, drawn in place of the
+# dot, spelt exactly the way `icon` is spelt below. Either one alone is legal and
+# the other state falls back to the dot, which is usually the shape you want: a
+# picture for "something wants attention" and nothing louder than a dot for
+# "quiet".
+# icon_on = "mdi-bell-ring"
+# icon_off = "mdi-bell-outline"
+#
+# The dot or the icon *is* the reading; the `ON`/`OFF` beside it only confirms it.
+# On a dense dashboard the word is therefore the part worth dropping, which is what
+# `state_text = false` does. Also accepted on a `weather` cell, where it drops the
+# condition's name and leaves the sky icon to say it.
+# state_text = false
 
 [[device.widget]]
 id = "office_temp"
@@ -88,6 +207,10 @@ row = 0
 col_span = 2
 label = "Office"
 unit = "°C"
+# Decimal places for this cell only, overriding the device's. A publisher that
+# sends four decimals and a cell that shows one is the normal arrangement — round
+# where it is read, not where it is measured.
+# precision = 1
 # Optional, and spelt exactly the way gethomepage.dev spells an icon, so a line can
 # be copied between the two projects:
 #
@@ -116,20 +239,41 @@ label = "Notes"
 # Reads from Home Assistant rather than from a push. Needs the [home_assistant]
 # section above. A fetch failure leaves this one cell showing its last value, muted
 # and marked, and never fails the frame.
+#
+# `attribute` reads one of the entity's attributes instead of its own state, which
+# is needed more often than it sounds: a `weather.*` entity's state is a condition
+# like `partlycloudy` and the temperature you want is an attribute hanging off it.
+#
+# One figure from one entity is the whole of what this kind is for. Several figures
+# read together belong in a `list`, and figures that hang off a condition belong in
+# the `weather` cell that already reads it — both below.
 # [[device.widget]]
-# id = "outside_temp"
+# id = "hallway_co2"
 # kind = "ha_entity"
 # col = 0
 # row = 1
-# entity = "sensor.outside_temperature"
-# label = "Outside"
-# unit = "°C"
+# entity = "sensor.hallway_co2"
+# label = "Hallway"
+# unit = "ppm"
+# precision = 0
 
 # A `weather.*` entity's condition, drawn as an icon and its name. Its own kind
 # because a condition is a word from a closed set that wants a picture, not a figure
 # in tabular numerals — `ha_entity` on the same entity renders the literal string
-# `partlycloudy`. `attribute` is rejected here; use `ha_entity` with an `attribute`
-# to show one of the entity's numbers, as `outside_temp` above does.
+# `partlycloudy`. `attribute` is rejected here rather than ignored: it says "read
+# something else", which this kind cannot do, and ignoring it would leave an author
+# staring at an icon that never matches the number they asked for.
+#
+# The numbers belong in `[[device.widget.reading]]` tables beside the condition, and
+# they are why a separate `ha_entity` widget for the outdoor temperature is no
+# longer the way to do this. The temperature and the humidity are attributes of the
+# very entity this cell already reads, so a reading names the attribute and inherits
+# the entity — one cell that says what the sky is doing, instead of three that have
+# to be read together to find out.
+#
+# A reading may name its own `entity` and falls back to the widget's when it does
+# not. `label`, `unit` and `precision` are its own, with `precision` falling back to
+# the widget's and then the device's.
 # [[device.widget]]
 # id = "sky"
 # kind = "weather"
@@ -139,6 +283,117 @@ label = "Notes"
 # row_span = 2
 # entity = "weather.home"
 # label = "Sky"
+# # The condition's name, beside the icon. `false` leaves the picture to say it.
+# state_text = true
+#
+# [[device.widget.reading]]
+# label = "Temp"
+# attribute = "temperature"
+# unit = "°C"
+# precision = 1
+#
+# [[device.widget.reading]]
+# label = "Humidity"
+# attribute = "humidity"
+# unit = "%"
+# precision = 0
+
+# Several readings as labelled rows in one cell. A `list` *is* its readings, so one
+# with none is rejected — there would be nothing to draw.
+#
+# A list is not a special case of a `group`, and it is worth knowing which of the
+# two you want. A list is **one presentation of n values**: they are laid out and
+# sized together, so the rows share a type size and the labels line up down the
+# cell, and adding a fourth reading makes all four a little smaller. A group is **n
+# independent widgets** that happen to share one slot of the outer grid, each with
+# its own kind, its own frame and its own tap. Three temperatures are a list; a
+# temperature, a beacon and a button are a group.
+#
+# Readings here name their own entities, which is the other half of what a list is
+# for: values from different places that are only ever read as a set.
+# [[device.widget]]
+# id = "climate"
+# kind = "list"
+# col = 3
+# row = 1
+# row_span = 2
+# label = "Climate"
+# icon = "mdi-home-thermometer"
+#
+# [[device.widget.reading]]
+# label = "Office"
+# entity = "sensor.office_temperature"
+# unit = "°C"
+# precision = 1
+#
+# [[device.widget.reading]]
+# label = "Outside"
+# entity = "weather.home"
+# attribute = "temperature"
+# unit = "°C"
+# precision = 1
+#
+# [[device.widget.reading]]
+# label = "Humidity"
+# entity = "weather.home"
+# attribute = "humidity"
+# unit = "%"
+# precision = 0
+
+# A sub-grid of widgets sharing one slot of the outer grid. `grid` is the sub-grid,
+# and the children are `[[device.widget.widget]]` tables placed on it with their own
+# `col` and `row`.
+#
+# One level deep, and a group inside a group is rejected. Arbitrary nesting would
+# make placement, geometry and tap resolution recursive to serve a composition
+# nobody asked for, when two levels is the whole ask: several small cells sharing
+# one slot.
+#
+# The children are laid out inside the group's *content box*, with one `gap` between
+# them and no outer margin of their own — the group's own padding already is that
+# margin. So a group is not a nested dashboard with its own spacing to tune; it
+# inherits the device's, and reads as one framed cell subdivided rather than as a
+# grid bolted inside a grid. A sub-grid dense enough to leave a child no content box
+# is rejected at load, the same floor the device's own cells are held to, one level
+# down.
+#
+# A group draws no value of its own: an `entity`, `attribute` or `unit` on one is
+# rejected, because its children are what read anything.
+#
+# A tap lands on the child cell it hit, so each child carries its own `tap`. A point
+# inside the group that hits no child — a sub-gap, an empty sub-cell — resolves to
+# the group itself, which is what makes a `tap` on the group worth writing: it is
+# the fallback for the space between its children.
+#
+# Ids stay unique across the whole device, children included, because an id is a
+# content push address: two widgets answering to PUT /api/content/washer means one
+# publisher feeds a cell nobody chose.
+# [[device.widget]]
+# id = "utility"
+# kind = "group"
+# col = 0
+# row = 2
+# col_span = 2
+# label = "Utility"
+# grid = { cols = 2, rows = 1 }
+#
+# [[device.widget.widget]]
+# id = "washer"
+# kind = "beacon"
+# col = 0
+# row = 0
+# label = "Washer"
+# icon_on = "mdi-washing-machine"
+# state_text = false
+#
+# [[device.widget.widget]]
+# id = "dryer"
+# kind = "beacon"
+# col = 1
+# row = 0
+# label = "Dryer"
+# icon_on = "mdi-tumble-dryer"
+# state_text = false
 
 # ---------------------------------------------------------------------------
 # Tap actions
@@ -166,7 +421,9 @@ label = "Notes"
 #
 # Coordinates are frame pixels, origin top-left. `x0`/`y0` are accepted as aliases.
 # A point in a gutter or on an empty cell does nothing at all rather than firing the
-# nearest action, which on a 300 ppi panel is a routine outcome worth expecting.
+# nearest action, which on a 300 ppi panel is a routine outcome worth expecting. A
+# point inside a group resolves to the child it landed on, and to the group itself
+# when it landed between children.
 #
 # `event_id` is optional and is what makes a retry safe: the same id for the same
 # device is acted on once. Omit it and every request is a fresh tap.
@@ -200,3 +457,95 @@ label = "Notes"
 # row = 1
 # label = "Refresh"
 # tap = "refresh"
+
+# ---------------------------------------------------------------------------
+# Shared dashboards
+# ---------------------------------------------------------------------------
+#
+# A named grid and widget set, declared once at the top level and adopted by a
+# device with `dashboard = "<name>"`. For a household with two panels the same size
+# showing the same thing, that is the difference between one set of widget tables
+# and two sets that have to be kept in step by hand.
+#
+# A dashboard is adopted *whole*: it brings the grid its widgets were laid out on. A
+# device that adopts one and also declares a `grid` or widgets of its own is
+# rejected — taking one and overriding the other would place someone else's widgets
+# on a grid their author never saw. Drop one or the other.
+#
+# Two devices may adopt the same dashboard, and each gets its own copy. Everything
+# about the panel rather than about the layout stays per-device: palette, dither,
+# chrome, status bar, refresh and render intervals. That is the point of the split —
+# the same dashboard on a Kindle in gray16 and on a 4-colour panel in the kitchen,
+# each dithered the way its own screen wants.
+#
+# The widget ids belong to the dashboard, and content is stored per widget id, so
+# one `PUT /api/content/bins` feeds every panel that adopted it. A validation error
+# inside a dashboard is reported against the adopting device as well as the
+# dashboard, because the author's next move is to fix the dashboard but the panel
+# that went blank is that device, and the message has to connect the two.
+#
+# [[dashboard]]
+# name = "kitchen"
+# grid = { cols = 2, rows = 2 }
+#
+# [[dashboard.widget]]
+# id = "shopping"
+# kind = "text"
+# col = 0
+# row = 0
+# col_span = 2
+# label = "Shopping"
+#
+# [[dashboard.widget]]
+# id = "bins"
+# kind = "beacon"
+# col = 0
+# row = 1
+# label = "Bins out"
+# icon_on = "mdi-delete-alert"
+#
+# [[device]]
+# id = "kitchen-panel"
+# width = 800
+# height = 480
+# palette = "mono"
+# dither = "bayer"
+# refresh_rate = 900
+# dashboard = "kitchen"
+
+# ---------------------------------------------------------------------------
+# The drop-in directory
+# ---------------------------------------------------------------------------
+#
+# Anything above may live in a fragment instead of in this file. `paneld.toml.d/`
+# beside the main file is read after it, in file-name order — `10-devices.toml`
+# before `20-kitchen.toml` — after the convention systemd made familiar. So a
+# package can ship a device and you can add another without editing a file that the
+# next upgrade replaces.
+#
+# The directory is derived from the config path rather than configured, so
+# `--config /etc/paneld.toml` reads `/etc/paneld.toml.d/` and moving the main file
+# moves its fragments with it instead of leaving them behind. Top-level `*.toml`
+# only: a subdirectory, a dotfile and an editor's `paneld.toml.swp` all live in a
+# config directory without being configuration.
+#
+# Merging is deliberately blunt. **Each section is declared exactly once**, in
+# whichever document its author likes. `[server]` and `[home_assistant]` belong to
+# one document only; a device id or a dashboard name may be declared once across the
+# whole set. Nothing is deep-merged and nothing overrides anything — a second
+# `[[device]]` carrying an id another file already used is an error naming both
+# files, not a device that wins.
+#
+# That is a refusal to be clever, and the reason is what the clever version costs to
+# read. A fragment that silently replaced part of another file's device would
+# produce a dashboard that no single file explains: to know what the panel is
+# showing you would have to run the merge in your head, in file-name order, across
+# every file in the directory. Hitting an error that names both documents is worse
+# once and better forever.
+#
+# The watcher notices a fragment being *added or deleted*, not only edited. Adding
+# or removing a file modifies no file, so the directory's own modification time is
+# part of what is checked; without that, dropping a fragment in would leave the
+# panel rendering a configuration that no longer exists on disk. As with the main
+# file, a fragment that does not parse or does not validate is logged and the
+# previous configuration stays in effect.

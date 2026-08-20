@@ -11,10 +11,12 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use time::UtcOffset;
 
 /// Inclusive bounds on a device's `refresh_rate`, in seconds.
 ///
@@ -46,6 +48,40 @@ pub const DEFAULT_MAX_FRAME_BYTES: usize = 90_000;
 /// size a cell's content box stops being able to fit a single glyph, and the text
 /// layout engine panics rather than returning an error.
 pub const MIN_CELL: u32 = 40;
+
+/// Smallest content box a cell may be left with, in pixels.
+///
+/// A hard safety floor like [`MIN_CELL`], and for the same reason: the text
+/// layout engine is handed a cell's content box directly and panics on a
+/// degenerate one. Configurable padding and border widths make that box something
+/// an author can shrink, so the combination has to be rejected here rather than
+/// discovered on the panel.
+pub const MIN_CONTENT: u32 = 16;
+
+/// Most decimal places a reading may be rounded to.
+///
+/// A wall panel is read from across a room, where the seventh decimal of a
+/// temperature is noise competing with the number for space.
+pub const MAX_PRECISION: u8 = 6;
+
+/// Ceiling on any one of a device's `chrome` measurements, in pixels.
+///
+/// A guard rather than taste: spacing is subtracted from every cell, so a typo
+/// with an extra digit is a dashboard with no cells rather than a wide one.
+pub const MAX_CHROME: u32 = 64;
+
+/// Ceiling on a grid's `cols` and `rows`.
+///
+/// Placement allocates one slot per cell, so an unbounded track count is an
+/// allocation an author can ask for by typo. Far above any grid a panel can
+/// actually show, which the [`MIN_CELL`] floor bounds much more tightly.
+pub const MAX_TRACKS: u32 = 64;
+
+/// Inclusive bounds on a status bar's thickness, in pixels.
+pub const STATUS_BAR_THICKNESS_BOUNDS: std::ops::RangeInclusive<u32> = 12..=256;
+
+/// A cell's rule, in pixels: the width the dashboard has always drawn.
+const HAIRLINE: f32 = 1.0;
 
 /// A validated configuration.
 #[derive(Debug, Clone, PartialEq)]
@@ -131,7 +167,219 @@ pub struct Device {
     /// check, which is right for a client that has real memory.
     pub max_frame_bytes: usize,
     pub grid: Grid,
+    /// The dashboard's spacing and rules, resolved to pixels.
+    pub chrome: Chrome,
+    /// A strip along one edge, outside the widget grid. `None` gives the grid the
+    /// whole frame.
+    pub status_bar: Option<StatusBar>,
     pub widgets: Vec<Widget>,
+}
+
+impl Device {
+    /// Every widget on this device, the children of every group included.
+    ///
+    /// Render prep walks this to collect the Home Assistant readings and the icons
+    /// a dashboard needs. Walking `widgets` alone would resolve neither for a
+    /// nested cell, which shows up as a group of cells all reading `no data`.
+    pub fn all_widgets(&self) -> impl Iterator<Item = &Widget> {
+        self.widgets.iter().flat_map(Widget::iter)
+    }
+
+    /// The rect the widget grid occupies, as `(x, y, width, height)` in frame
+    /// pixels: the whole frame, less the strip a status bar took.
+    ///
+    /// Defined here rather than in the renderer because three things must agree
+    /// about it — the layout, the tap hit test, and the validation that rejects a
+    /// bar leaving cells too small to render. Two of those live in other modules,
+    /// so the arithmetic is written once and read from there.
+    pub fn grid_area(&self) -> (u32, u32, u32, u32) {
+        grid_area(self.width, self.height, self.status_bar.as_ref())
+    }
+
+    /// The rect a status bar occupies, as `(x, y, width, height)` in frame pixels,
+    /// or `None` on a device that has no bar.
+    pub fn status_bar_area(&self) -> Option<(u32, u32, u32, u32)> {
+        let bar = self.status_bar.as_ref()?;
+        // Clamped, though validation already rejects a bar this thick: a rect that
+        // wrapped around would be drawn somewhere unpredictable rather than not at
+        // all.
+        let thickness = bar.thickness.min(match bar.edge {
+            Edge::Top | Edge::Bottom => self.height,
+            Edge::Left | Edge::Right => self.width,
+        });
+        Some(match bar.edge {
+            Edge::Top => (0, 0, self.width, thickness),
+            Edge::Bottom => (0, self.height - thickness, self.width, thickness),
+            Edge::Left => (0, 0, thickness, self.height),
+            Edge::Right => (self.width - thickness, 0, thickness, self.height),
+        })
+    }
+}
+
+/// The widget grid's rect within a frame, as `(x, y, width, height)`.
+///
+/// A free function as well as [`Device::grid_area`] because validation needs the
+/// answer while the [`Device`] is still being assembled.
+fn grid_area(width: u32, height: u32, bar: Option<&StatusBar>) -> (u32, u32, u32, u32) {
+    let Some(bar) = bar else {
+        return (0, 0, width, height);
+    };
+    let thickness = bar.thickness;
+    match bar.edge {
+        Edge::Top => (0, thickness, width, height.saturating_sub(thickness)),
+        Edge::Bottom => (0, 0, width, height.saturating_sub(thickness)),
+        Edge::Left => (thickness, 0, width.saturating_sub(thickness), height),
+        Edge::Right => (0, 0, width.saturating_sub(thickness), height),
+    }
+}
+
+/// One grid cell's usable size, in pixels: what a `1fr` track resolves to once
+/// the grid area's own margin and the gaps between tracks are taken out.
+///
+/// Shared by the renderer, the tap hit test and this module's own validation, so
+/// that a cell's box, the box a finger is resolved against, and the box validation
+/// held to a floor are all one box.
+pub fn cell_size(area_w: u32, area_h: u32, grid: Grid, chrome: Chrome) -> (f32, f32) {
+    let cols = grid.cols.max(1) as f32;
+    let rows = grid.rows.max(1) as f32;
+    (
+        (area_w as f32 - chrome.gap * (cols + 1.0)).max(1.0) / cols,
+        (area_h as f32 - chrome.gap * (rows + 1.0)).max(1.0) / rows,
+    )
+}
+
+/// One sub-cell of a group's grid, in pixels, given the group's content box.
+///
+/// The children fill that box with one [`Chrome::gap`] between them and no margin
+/// of their own — the group's padding already is that margin — so `n` tracks want
+/// `n - 1` gaps where the outer grid wants `n + 1`.
+pub fn sub_cell_size(box_w: f32, box_h: f32, grid: Grid, chrome: Chrome) -> (f32, f32) {
+    let cols = grid.cols.max(1) as f32;
+    let rows = grid.rows.max(1) as f32;
+    (
+        (box_w - chrome.gap * (cols - 1.0)).max(1.0) / cols,
+        (box_h - chrome.gap * (rows - 1.0)).max(1.0) / rows,
+    )
+}
+
+/// A dashboard's spacing and rules, in pixels.
+///
+/// Resolved to concrete pixel counts here rather than derived in the renderer, so
+/// that the layout, the hit test and validation read the same three numbers.
+/// Validation is why that matters: the layout engine panics on a degenerate
+/// content box, so a padding-and-border combination that would produce one has to
+/// be rejected before it reaches the engine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Chrome {
+    /// Between cells, and around the grid area.
+    pub gap: f32,
+    /// Inside a cell, between its rule and its content.
+    pub padding: f32,
+    /// A cell's rule. `0.0` draws no frame at all, which is what a dashboard of
+    /// bare readings wants.
+    pub border: f32,
+}
+
+impl Chrome {
+    /// The spacing a `grid` over a `width` x `height` area gets when the author
+    /// says nothing.
+    ///
+    /// Scaled to the cell rather than fixed. Fixed spacing is a trap on a small
+    /// panel or a dense grid: once padding exceeds the cell it is inside, the text
+    /// layout engine is handed a negative content box and panics.
+    pub fn derived(width: u32, height: u32, grid: Grid) -> Self {
+        let smallest_side =
+            (width as f32 / grid.cols.max(1) as f32).min(height as f32 / grid.rows.max(1) as f32);
+        Self {
+            gap: (smallest_side * 0.06).clamp(1.0, 10.0),
+            // A tighter ceiling than the gap's, because padding is charged twice —
+            // once on each side — and it comes straight off the width a figure has
+            // to fit in. The rule and the gap already separate two cells; a wider
+            // inset only shrinks the number inside one.
+            padding: (smallest_side * 0.10).clamp(2.0, 8.0),
+            border: HAIRLINE,
+        }
+    }
+
+    /// What a cell's content box loses to its own chrome, on each axis.
+    pub fn inset(&self) -> f32 {
+        (self.padding + self.border) * 2.0
+    }
+}
+
+/// A strip along one edge of the frame, outside the widget grid.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusBar {
+    pub edge: Edge,
+    /// Height on a horizontal edge, width on a vertical one, in pixels.
+    pub thickness: u32,
+    /// What the bar says, in the order written.
+    pub fields: Vec<StatusField>,
+    /// The fixed offset from UTC that [`StatusField::Date`] and
+    /// [`StatusField::Time`] are rendered in.
+    ///
+    /// A fixed offset, and deliberately not called a timezone: paneld carries no
+    /// timezone database, so nothing here could know when a region changes offset.
+    /// A panel in a DST region needs this edited twice a year, and a field named
+    /// `timezone` would have hidden that rather than said it.
+    pub utc_offset: UtcOffset,
+}
+
+/// Which edge of the frame a status bar takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum Edge {
+    #[serde(rename = "top")]
+    Top,
+    #[serde(rename = "bottom")]
+    Bottom,
+    #[serde(rename = "left")]
+    Left,
+    #[serde(rename = "right")]
+    Right,
+}
+
+impl std::fmt::Display for Edge {
+    /// The spelling the config file uses, so an error names what the author wrote.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+            Self::Left => "left",
+            Self::Right => "right",
+        })
+    }
+}
+
+/// One thing a status bar can show.
+///
+/// A closed set rather than a format string. Every field here is something this
+/// process already knows for certain; a template language would invite naming
+/// things it does not have, and a wall panel is a poor place to discover that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum StatusField {
+    /// The date, in the bar's own offset.
+    #[serde(rename = "date")]
+    Date,
+    /// The time of day, in the bar's own offset.
+    ///
+    /// Know what a clock costs before configuring one: it makes every frame differ
+    /// from the last, so the panel repaints on every render interval rather than
+    /// only when a reading changed.
+    #[serde(rename = "time")]
+    Time,
+    /// The device's last reported battery percentage.
+    #[serde(rename = "battery")]
+    Battery,
+    /// How often the device is told to poll, as a period.
+    #[serde(rename = "refresh")]
+    Refresh,
+    /// The device id, for a household running more than one panel.
+    #[serde(rename = "device")]
+    Device,
+    /// Signal strength as the device reported it. Worth knowing before
+    /// configuring it: the KOReader client in service hardcodes `rssi` to 0.
+    #[serde(rename = "signal")]
+    Signal,
 }
 
 /// The dashboard grid a device's widgets are placed on.
@@ -150,7 +398,8 @@ pub struct Grid {
 /// file may spell three ways — is resolved on the way here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Widget {
-    /// Also the content push address: `PUT /api/content/<id>`.
+    /// Also the content push address: `PUT /api/content/<id>`. Unique across the
+    /// whole device, group children included, precisely because of that.
     pub id: String,
     pub kind: WidgetKind,
     pub col: u32,
@@ -159,11 +408,25 @@ pub struct Widget {
     pub row_span: u32,
     pub label: Option<String>,
     pub unit: Option<String>,
+    /// Decimal places a numeric reading is rounded to. `None` renders whatever the
+    /// source said, digit for digit.
+    ///
+    /// Already folded with the device's default, so the renderer reads this and
+    /// nothing else.
+    pub precision: Option<u8>,
+    /// Whether a graphic reading is captioned in words: a beacon's `ON`/`OFF`, a
+    /// weather cell's condition.
+    ///
+    /// The graphic is the reading and the word only confirms it, so on a dense
+    /// dashboard the word is the part worth dropping — which is why it is a switch
+    /// rather than a fixed part of those two bodies.
+    pub state_text: bool,
     /// How long pushed content stays fresh, in seconds. `0` disables the
     /// staleness timer, which is the default: a widget should not start
     /// reporting itself stale just because its author never thought about it.
     pub stale_after: u64,
-    /// Home Assistant entity id, for `kind = "ha_entity"` and `kind = "weather"`.
+    /// Home Assistant entity id, for `kind = "ha_entity"` and `kind = "weather"`,
+    /// and the fallback source for any [`Reading`] that names none.
     pub entity: Option<String>,
     /// Read this attribute of the entity instead of its own state.
     ///
@@ -176,8 +439,65 @@ pub struct Widget {
     /// An icon drawn beside the cell's label, spelt the way
     /// [gethomepage](https://gethomepage.dev) spells one. See [`crate::icon`].
     pub icon: Option<String>,
+    /// A `beacon`'s indicator while it reads on, drawn in place of the dot.
+    pub icon_on: Option<String>,
+    /// A `beacon`'s indicator while it reads off, drawn in place of the dot.
+    pub icon_off: Option<String>,
+    /// What a `list` cell is made of, and what a `weather` cell hangs off its
+    /// condition. Empty for every other kind.
+    pub readings: Vec<Reading>,
+    /// The sub-grid and children of a `group`, and `None` for every other kind.
+    pub group: Option<Group>,
     /// What tapping this cell does. See [`crate::tap`].
     pub tap: Option<Tap>,
+}
+
+impl Widget {
+    /// This widget, and every child when it is a group.
+    ///
+    /// Flat rather than recursive because a group is one level deep by
+    /// construction: [`validate_widget`] rejects a group inside a group.
+    pub fn iter(&self) -> impl Iterator<Item = &Widget> {
+        std::iter::once(self).chain(self.group.iter().flat_map(|group| group.widgets.iter()))
+    }
+}
+
+/// One labelled value inside a multi-reading cell.
+///
+/// Shared by `list`, whose whole body is these, and by `weather`, which hangs them
+/// off the condition it already reads. One type because they are one thing: a
+/// Home Assistant value with a label, a unit and a precision of its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    /// What the row is called. A row without one is just its value.
+    pub label: Option<String>,
+    /// Resolved: the reading's own `entity`, or the widget's when it named none.
+    pub entity: String,
+    /// Read this attribute instead of the entity's state. How a weather cell gets
+    /// at the `temperature` and `humidity` that its condition does not carry.
+    pub attribute: Option<String>,
+    pub unit: Option<String>,
+    /// Decimal places, already folded with the widget's and the device's.
+    pub precision: Option<u8>,
+}
+
+/// A widget that is itself a grid of widgets.
+///
+/// One level deep, deliberately: a group inside a group is rejected. Arbitrary
+/// nesting would make placement, geometry and tap resolution recursive to serve a
+/// composition nobody asked for, when two levels is the whole ask — several small
+/// readings sharing one slot of the outer grid.
+///
+/// The children are laid out inside the group's *content box*, with one
+/// [`Chrome::gap`] between them and no outer margin of their own, because the
+/// group's own padding already is that margin. Pinned here because the renderer,
+/// the hit test and the validation that rejects an unreadably dense group all have
+/// to agree on it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Group {
+    /// The sub-grid the children are placed on, local to the group's own rect.
+    pub grid: Grid,
+    pub widgets: Vec<Widget>,
 }
 
 /// What tapping a widget's cell does.
@@ -221,6 +541,10 @@ fn one() -> u32 {
     1
 }
 
+fn yes() -> bool {
+    true
+}
+
 fn default_max_frame_bytes() -> usize {
     DEFAULT_MAX_FRAME_BYTES
 }
@@ -244,13 +568,24 @@ pub enum WidgetKind {
     /// An entity's state read from Home Assistant rather than from a push.
     #[serde(rename = "ha_entity")]
     HaEntity,
-    /// A `weather.*` entity's condition, as an icon and a named condition.
+    /// A `weather.*` entity's condition, as an icon and a named condition,
+    /// optionally with readings from the same entity beside it.
     ///
     /// Its own kind rather than an `ha_entity` that sniffs the entity id,
     /// because the two render nothing alike: a condition is a word from a closed
     /// set that wants a picture, not a figure in tabular numerals.
     #[serde(rename = "weather")]
     Weather,
+    /// Several readings as labelled rows in one cell.
+    ///
+    /// Distinct from a `group` and not a special case of one: a list is one
+    /// presentation of `n` values, sized and aligned together, where a group is
+    /// `n` independent widgets that happen to share a slot.
+    #[serde(rename = "list")]
+    List,
+    /// A sub-grid of widgets sharing one slot of the outer grid.
+    #[serde(rename = "group")]
+    Group,
 }
 
 impl std::fmt::Display for WidgetKind {
@@ -262,6 +597,8 @@ impl std::fmt::Display for WidgetKind {
             Self::Text => "text",
             Self::HaEntity => "ha_entity",
             Self::Weather => "weather",
+            Self::List => "list",
+            Self::Group => "group",
         })
     }
 }
@@ -305,31 +642,176 @@ pub enum Dither {
     None,
 }
 
-/// Reads and validates the configuration file at `path`.
-pub fn load(path: &Path) -> Result<Config> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading config file {}", path.display()))?;
-    parse(&text).with_context(|| format!("in config file {}", path.display()))
+/// One configuration document: its text, and the name an error should blame.
+#[derive(Debug, Clone, Copy)]
+pub struct Document<'a> {
+    /// How the document is named in an error — a path, or a test's label.
+    pub name: &'a str,
+    pub text: &'a str,
 }
 
-/// Parses and validates configuration text.
-///
-/// This is the config seam: a pure function from TOML text to a validated
-/// [`Config`].
-pub fn parse(text: &str) -> Result<Config> {
-    let file: File = toml::from_str(text).context("parsing TOML")?;
+/// Reads and validates the configuration at `path`, together with every fragment
+/// in its drop-in directory.
+pub fn load(path: &Path) -> Result<Config> {
+    let sources = sources(path);
+    let mut texts = Vec::with_capacity(sources.len());
+    for source in &sources {
+        texts.push(
+            std::fs::read_to_string(source)
+                .with_context(|| format!("reading config file {}", source.display()))?,
+        );
+    }
 
+    let names: Vec<String> = sources
+        .iter()
+        .map(|source| source.display().to_string())
+        .collect();
+    let documents: Vec<Document<'_>> = names
+        .iter()
+        .zip(&texts)
+        .map(|(name, text)| Document { name, text })
+        .collect();
+    parse_documents(&documents)
+}
+
+/// Every file [`load`] reads, in load order: the main file, then its fragments.
+pub fn sources(path: &Path) -> Vec<PathBuf> {
+    let mut sources = vec![path.to_path_buf()];
+    sources.extend(fragments(path));
+    sources
+}
+
+/// The drop-in directory for `path`.
+///
+/// `<file name>.d` beside the main file, after the convention systemd made
+/// familiar — `paneld.toml` reads `paneld.toml.d/`. Derived from the path rather
+/// than configured, so pointing `--config` somewhere else moves the fragments
+/// with it instead of leaving them behind.
+pub fn fragment_dir(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".d");
+    path.with_file_name(name)
+}
+
+/// The fragments in `path`'s drop-in directory, in load order.
+///
+/// Sorted by file name, so a merge conflict is reported the same way twice
+/// running rather than in whatever order the filesystem happened to answer in.
+/// Top-level `*.toml` only: a subdirectory, a dotfile and an editor's
+/// `paneld.toml.swp` all live in a config directory without being configuration.
+fn fragments(path: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(fragment_dir(path)) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path.file_name().and_then(|name| name.to_str());
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"))
+                && name.is_some_and(|name| !name.starts_with('.'))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// The most recent modification time across everything [`load`] reads.
+///
+/// The drop-in directory's own timestamp is included, and that is the point of
+/// this function rather than an incidental extra: adding or deleting a fragment
+/// modifies no file, so a check that only stats files sees nothing and the panel
+/// keeps rendering a configuration that no longer exists on disk.
+pub fn modified_at(path: &Path) -> Option<SystemTime> {
+    std::iter::once(path.to_path_buf())
+        .chain(std::iter::once(fragment_dir(path)))
+        .chain(fragments(path))
+        .filter_map(|path| std::fs::metadata(path).ok()?.modified().ok())
+        .max()
+}
+
+/// Parses and validates one configuration document.
+///
+/// The single-document spelling of [`parse_documents`], because most
+/// configurations are one file and nothing that does not care about merging
+/// should have to say so.
+pub fn parse(text: &str) -> Result<Config> {
+    parse_documents(&[Document {
+        name: "config",
+        text,
+    }])
+}
+
+/// Parses and validates a configuration spread across several documents.
+///
+/// This is the config seam: a pure function from named TOML texts to a validated
+/// [`Config`], so every merge rule below is asserted without touching a
+/// filesystem.
+///
+/// Merging is deliberately blunt: **each section is declared exactly once, in
+/// whichever document its author likes.** `[server]` and `[home_assistant]` may
+/// appear in one document only; a device id or a dashboard name may be declared
+/// once. Nothing is deep-merged and nothing overrides anything, because a
+/// fragment that silently replaced part of another file's device would produce a
+/// dashboard that no single file explains.
+pub fn parse_documents(documents: &[Document<'_>]) -> Result<Config> {
+    let mut server: Option<(&str, Server)> = None;
+    let mut home_assistant: Option<(&str, HomeAssistant)> = None;
+    let mut dashboards: Vec<(&str, RawDashboard)> = Vec::new();
+    let mut devices: Vec<(&str, RawDevice)> = Vec::new();
+
+    for document in documents {
+        let file: File = toml::from_str(document.text)
+            .with_context(|| format!("parsing TOML in {}", document.name))?;
+
+        if let Some(incoming) = file.server {
+            if let Some((first, _)) = &server {
+                bail!(
+                    "[server] is declared in both {first} and {}; it belongs to exactly \
+                     one document",
+                    document.name
+                );
+            }
+            server = Some((document.name, incoming));
+        }
+        if let Some(incoming) = file.home_assistant {
+            if let Some((first, _)) = &home_assistant {
+                bail!(
+                    "[home_assistant] is declared in both {first} and {}; it belongs to \
+                     exactly one document",
+                    document.name
+                );
+            }
+            home_assistant = Some((document.name, incoming));
+        }
+        dashboards.extend(
+            file.dashboards
+                .into_iter()
+                .map(|dashboard| (document.name, dashboard)),
+        );
+        devices.extend(
+            file.devices
+                .into_iter()
+                .map(|device| (document.name, device)),
+        );
+    }
+
+    let (_, server) = server
+        .context("no [server] section: one document must declare `listen` and `public_base_url`")?;
     let server = Server {
         public_base_url: validate_base_url(
-            &file.server.public_base_url,
+            &server.public_base_url,
             "server.public_base_url",
             true,
         )?,
-        ..file.server
+        ..server
     };
 
-    let home_assistant = match file.home_assistant {
-        Some(ha) => {
+    let home_assistant = match home_assistant {
+        Some((_, ha)) => {
             ensure!(
                 ha.token.is_some() != ha.token_env.is_some(),
                 "home_assistant needs exactly one of `token` or `token_env`, not both and not neither"
@@ -349,22 +831,48 @@ pub fn parse(text: &str) -> Result<Config> {
         None => None,
     };
 
-    let mut devices = Vec::with_capacity(file.devices.len());
-    for device in file.devices {
-        devices.push(validate_device(device, home_assistant.is_some())?);
+    let mut by_name: HashMap<String, (&str, RawDashboard)> = HashMap::new();
+    for (source, dashboard) in dashboards {
+        if let Some((first, _)) = by_name.get(&dashboard.name) {
+            bail!(
+                "dashboard `{}` is declared in both {first} and {source}",
+                dashboard.name
+            );
+        }
+        by_name.insert(dashboard.name.clone(), (source, dashboard));
+    }
+    let dashboards: HashMap<String, RawDashboard> = by_name
+        .into_iter()
+        .map(|(name, (_, dashboard))| (name, dashboard))
+        .collect();
+
+    // Checked before any device is validated, so a duplicate id is reported as the
+    // merge problem it is rather than as whichever field of the second copy
+    // happened to fail first.
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for (source, device) in &devices {
+        if let Some(first) = seen.get(device.id.as_str()) {
+            bail!(
+                "device `{}` is declared in both {first} and {source}",
+                device.id
+            );
+        }
+        seen.insert(device.id.as_str(), source);
     }
 
-    let mut seen = HashMap::new();
-    for device in &devices {
-        if seen.insert(device.id.as_str(), ()).is_some() {
-            bail!("duplicate device id `{}`", device.id);
-        }
+    let mut validated = Vec::with_capacity(devices.len());
+    for (_, device) in devices {
+        validated.push(validate_device(
+            device,
+            &dashboards,
+            home_assistant.is_some(),
+        )?);
     }
 
     Ok(Config {
         server,
         home_assistant,
-        devices,
+        devices: validated,
     })
 }
 
@@ -419,7 +927,11 @@ fn is_unreachable_host(host: &str) -> bool {
         || lower.starts_with("127.")
 }
 
-fn validate_device(device: RawDevice, has_home_assistant: bool) -> Result<Device> {
+fn validate_device(
+    device: RawDevice,
+    dashboards: &HashMap<String, RawDashboard>,
+    has_home_assistant: bool,
+) -> Result<Device> {
     let RawDevice {
         id,
         width,
@@ -429,7 +941,11 @@ fn validate_device(device: RawDevice, has_home_assistant: bool) -> Result<Device
         refresh_rate,
         render_interval,
         max_frame_bytes,
+        precision,
         grid,
+        chrome,
+        status_bar,
+        dashboard,
         widgets,
     } = device;
 
@@ -463,27 +979,87 @@ fn validate_device(device: RawDevice, has_home_assistant: bool) -> Result<Device
         RENDER_INTERVAL_BOUNDS.end()
     );
 
+    if let Some(precision) = precision {
+        ensure!(
+            precision <= MAX_PRECISION,
+            "device `{id}` has precision {precision}, above the {MAX_PRECISION} decimal \
+             places a panel can use"
+        );
+    }
+
+    // A dashboard is adopted whole. It brings the grid its widgets were laid out
+    // on, so taking one and overriding the other would place someone else's
+    // widgets on a grid their author never saw.
+    let (grid, raw_widgets, adopted) = match dashboard {
+        Some(name) => {
+            ensure!(
+                grid.is_none() && widgets.is_empty(),
+                "device `{id}` adopts dashboard `{name}` and also declares a `grid` or \
+                 widgets of its own; a dashboard brings both, so drop one or the other"
+            );
+            let dashboard = dashboards.get(&name).with_context(|| {
+                format!("device `{id}` adopts dashboard `{name}`, which nothing declares")
+            })?;
+            (dashboard.grid, dashboard.widgets.clone(), Some(name))
+        }
+        None => {
+            let grid = grid.with_context(|| {
+                format!("device `{id}` declares neither a `grid` nor a `dashboard` to adopt")
+            })?;
+            (grid, widgets, None)
+        }
+    };
+    validate_grid(grid, &format!("device `{id}`"))?;
+
+    let status_bar = match status_bar {
+        Some(raw) => Some(validate_status_bar(raw, &id, width, height)?),
+        None => None,
+    };
+
+    // Everything below is measured against the area the grid actually gets, which
+    // is the frame less whatever a status bar took off an edge.
+    let (_, _, area_w, area_h) = grid_area(width, height, status_bar.as_ref());
+    let chrome = validate_chrome(chrome, &id, area_w, area_h, grid)?;
+    let (cell_w, cell_h) = cell_size(area_w, area_h, grid, chrome);
+
     ensure!(
-        grid.cols >= 1 && grid.rows >= 1,
-        "device `{id}` has grid {}x{}; cols and rows must both be at least 1",
+        cell_w >= MIN_CELL as f32 && cell_h >= MIN_CELL as f32,
+        "device `{id}` gives its grid {area_w}x{area_h} pixels over {}x{} cells with a \
+         {} pixel gap, leaving {cell_w:.0}x{cell_h:.0} cells; a cell must be at least \
+         {MIN_CELL}x{MIN_CELL} to render anything",
         grid.cols,
-        grid.rows
+        grid.rows,
+        chrome.gap
+    );
+    ensure!(
+        cell_w - chrome.inset() >= MIN_CONTENT as f32
+            && cell_h - chrome.inset() >= MIN_CONTENT as f32,
+        "device `{id}` has {} pixels of padding and a {} pixel border on \
+         {cell_w:.0}x{cell_h:.0} cells, leaving a {:.0}x{:.0} content box; at least \
+         {MIN_CONTENT}x{MIN_CONTENT} is needed to render anything",
+        chrome.padding,
+        chrome.border,
+        cell_w - chrome.inset(),
+        cell_h - chrome.inset()
     );
 
-    let (cell_w, cell_h) = (width / grid.cols, height / grid.rows);
-    ensure!(
-        cell_w >= MIN_CELL && cell_h >= MIN_CELL,
-        "device `{id}` is {width}x{height} over a {}x{} grid, giving {cell_w}x{cell_h} cells; \
-         a cell must be at least {MIN_CELL}x{MIN_CELL} to render anything",
-        grid.cols,
-        grid.rows
-    );
-
-    let widgets = widgets
+    let widgets = raw_widgets
         .into_iter()
-        .map(|widget| validate_widget(widget, &id, has_home_assistant))
-        .collect::<Result<Vec<_>>>()?;
-    validate_placement(&id, grid, &widgets)?;
+        .map(|widget| validate_widget(widget, &id, precision, has_home_assistant))
+        .collect::<Result<Vec<_>>>();
+    // A dashboard's errors are reported against the device that adopted it: the
+    // author's next move is to fix the dashboard, but the panel that went blank is
+    // this one, and the message has to connect the two.
+    let widgets = match &adopted {
+        Some(name) => {
+            widgets.with_context(|| format!("in dashboard `{name}`, adopted by device `{id}`"))?
+        }
+        None => widgets?,
+    };
+
+    validate_placement(&id, None, grid, &widgets)?;
+    validate_ids(&id, &widgets)?;
+    validate_group_geometry(&id, chrome, cell_w, cell_h, &widgets)?;
 
     Ok(Device {
         id,
@@ -495,18 +1071,189 @@ fn validate_device(device: RawDevice, has_home_assistant: bool) -> Result<Device
         render_interval,
         max_frame_bytes,
         grid,
+        chrome,
+        status_bar,
         widgets,
     })
 }
 
-/// Rejects a widget that leaves the grid, and any two widgets sharing a cell.
-fn validate_placement(device_id: &str, grid: Grid, widgets: &[Widget]) -> Result<()> {
+/// Rejects a grid that cannot be laid out, or that is too large to be one.
+fn validate_grid(grid: Grid, what: &str) -> Result<()> {
+    ensure!(
+        grid.cols >= 1 && grid.rows >= 1,
+        "{what} has grid {}x{}; cols and rows must both be at least 1",
+        grid.cols,
+        grid.rows
+    );
+    ensure!(
+        grid.cols <= MAX_TRACKS && grid.rows <= MAX_TRACKS,
+        "{what} has grid {}x{}, above the {MAX_TRACKS} track ceiling",
+        grid.cols,
+        grid.rows
+    );
+    Ok(())
+}
+
+/// Resolves a device's spacing, filling in whatever the author left out.
+fn validate_chrome(
+    raw: Option<RawChrome>,
+    device_id: &str,
+    area_w: u32,
+    area_h: u32,
+    grid: Grid,
+) -> Result<Chrome> {
+    let derived = Chrome::derived(area_w, area_h, grid);
+    let Some(raw) = raw else {
+        return Ok(derived);
+    };
+
+    for (field, value) in [
+        ("gap", raw.gap),
+        ("padding", raw.padding),
+        ("border", raw.border),
+    ] {
+        if let Some(value) = value {
+            ensure!(
+                value <= MAX_CHROME,
+                "device `{device_id}` has chrome.{field} {value}, above the {MAX_CHROME} \
+                 pixel ceiling"
+            );
+        }
+    }
+
+    Ok(Chrome {
+        gap: raw.gap.map_or(derived.gap, |value| value as f32),
+        padding: raw.padding.map_or(derived.padding, |value| value as f32),
+        border: raw.border.map_or(derived.border, |value| value as f32),
+    })
+}
+
+/// Resolves a device's status bar, and rejects one that leaves no dashboard.
+fn validate_status_bar(
+    raw: RawStatusBar,
+    device_id: &str,
+    width: u32,
+    height: u32,
+) -> Result<StatusBar> {
+    let RawStatusBar {
+        edge,
+        thickness,
+        fields,
+        utc_offset,
+    } = raw;
+
+    ensure!(
+        !fields.is_empty(),
+        "device `{device_id}` has a status_bar with no `fields`; a bar with nothing in it \
+         is a strip of panel that nothing can use"
+    );
+
+    let across = match edge {
+        Edge::Top | Edge::Bottom => height,
+        Edge::Left | Edge::Right => width,
+    };
+    let thickness = thickness.unwrap_or_else(|| default_thickness(width, height));
+    ensure!(
+        STATUS_BAR_THICKNESS_BOUNDS.contains(&thickness),
+        "device `{device_id}` has a status_bar {thickness} pixels thick, outside {}..={}",
+        STATUS_BAR_THICKNESS_BOUNDS.start(),
+        STATUS_BAR_THICKNESS_BOUNDS.end()
+    );
+    ensure!(
+        thickness + MIN_CELL < across,
+        "device `{device_id}` has a {thickness} pixel status_bar on its {edge} edge, \
+         leaving {} of that axis's {across} pixels for the widget grid",
+        across.saturating_sub(thickness)
+    );
+
+    let utc_offset = match &utc_offset {
+        Some(raw) => parse_utc_offset(raw).with_context(|| {
+            format!("device `{device_id}` has an invalid status_bar utc_offset `{raw}`")
+        })?,
+        None => UtcOffset::UTC,
+    };
+
+    Ok(StatusBar {
+        edge,
+        thickness,
+        fields,
+        utc_offset,
+    })
+}
+
+/// A status bar's thickness when the author does not say, in pixels.
+///
+/// A twentieth of the frame's short side, bounded: enough for one line of chrome
+/// at the size the rest of the dashboard's chrome is set at, and never so much of
+/// a small panel that the dashboard is squeezed to make room for the clock.
+fn default_thickness(width: u32, height: u32) -> u32 {
+    ((width.min(height) as f32 * 0.05).round() as u32).clamp(18, 64)
+}
+
+/// Parses a fixed offset from UTC, spelt `+02:00`, `-0530`, `+2`, `Z` or `UTC`.
+///
+/// Hand-parsed rather than taken from a datetime library because this is the whole
+/// of what paneld understands about time zones, and saying so in twenty lines is
+/// more honest than reaching for a parser that implies a database behind it.
+fn parse_utc_offset(raw: &str) -> Result<UtcOffset> {
+    let text = raw.trim();
+    if text.eq_ignore_ascii_case("z") || text.eq_ignore_ascii_case("utc") {
+        return Ok(UtcOffset::UTC);
+    }
+    ensure!(
+        text.is_ascii() && !text.is_empty(),
+        "an offset is written like `+02:00`, `-0530`, `+2`, `Z` or `UTC`"
+    );
+
+    let (sign, rest) = match text.as_bytes()[0] {
+        b'+' => (1i8, &text[1..]),
+        b'-' => (-1i8, &text[1..]),
+        _ => (1i8, text),
+    };
+    let (hours, minutes) = match rest.split_once(':') {
+        Some((hours, minutes)) => (hours, minutes),
+        // `+0530`, the spelling with no separator. Anything longer than two digits
+        // is hours and minutes run together.
+        None if rest.len() > 2 => rest.split_at(rest.len() - 2),
+        None => (rest, "0"),
+    };
+
+    let hours: i8 = hours
+        .parse()
+        .with_context(|| format!("`{hours}` is not an hour count"))?;
+    let minutes: i8 = minutes
+        .parse()
+        .with_context(|| format!("`{minutes}` is not a minute count"))?;
+    ensure!(
+        (0..=23).contains(&hours) && (0..=59).contains(&minutes),
+        "an offset of {hours}:{minutes:02} is not a real one"
+    );
+
+    UtcOffset::from_hms(sign * hours, sign * minutes, 0)
+        .with_context(|| format!("`{raw}` is not an offset from UTC"))
+}
+
+/// Rejects a widget that leaves its grid, and any two widgets sharing a cell.
+///
+/// Applied to the device's own grid, and again to each group's sub-grid: nested
+/// placement is the same rule against a smaller grid, and `group` says which grid
+/// an error is about.
+fn validate_placement(
+    device_id: &str,
+    group: Option<&str>,
+    grid: Grid,
+    widgets: &[Widget],
+) -> Result<()> {
+    let scope = match group {
+        Some(group) => format!("in group `{group}` on device `{device_id}`"),
+        None => format!("on device `{device_id}`"),
+    };
     let mut occupant: Vec<Option<&str>> = vec![None; (grid.cols * grid.rows) as usize];
 
     for widget in widgets {
         ensure!(
             widget.col_span >= 1 && widget.row_span >= 1,
-            "widget `{}` on device `{device_id}` has a zero span; \
+            "widget `{}` {scope} has a zero span; \
              col_span and row_span must both be at least 1",
             widget.id
         );
@@ -515,7 +1262,7 @@ fn validate_placement(device_id: &str, grid: Grid, widgets: &[Widget]) -> Result
         let row_end = widget.row.saturating_add(widget.row_span);
         ensure!(
             col_end <= grid.cols && row_end <= grid.rows,
-            "widget `{}` on device `{device_id}` spans to column {col_end} row {row_end}, \
+            "widget `{}` {scope} spans to column {col_end} row {row_end}, \
              outside its {}x{} grid",
             widget.id,
             grid.cols,
@@ -527,7 +1274,7 @@ fn validate_placement(device_id: &str, grid: Grid, widgets: &[Widget]) -> Result
                 let cell = &mut occupant[(row * grid.cols + col) as usize];
                 if let Some(other) = cell {
                     bail!(
-                        "widgets `{other}` and `{}` on device `{device_id}` \
+                        "widgets `{other}` and `{}` {scope} \
                          both occupy grid cell col {col} row {row}",
                         widget.id
                     );
@@ -539,8 +1286,77 @@ fn validate_placement(device_id: &str, grid: Grid, widgets: &[Widget]) -> Result
     Ok(())
 }
 
+/// Rejects two widgets on one device sharing an id.
+///
+/// Across groups as well as beside them, because an id is a content push address:
+/// two widgets answering to `PUT /api/content/office_temp` means one publisher
+/// feeds a cell nobody chose.
+fn validate_ids(device_id: &str, widgets: &[Widget]) -> Result<()> {
+    let mut seen: HashMap<&str, ()> = HashMap::new();
+    for widget in widgets.iter().flat_map(Widget::iter) {
+        ensure!(
+            !widget.id.is_empty(),
+            "a widget on device `{device_id}` has an empty id"
+        );
+        if seen.insert(widget.id.as_str(), ()).is_some() {
+            bail!(
+                "two widgets on device `{device_id}` share the id `{}`, which is also the \
+                 address `PUT /api/content/{}` writes to",
+                widget.id,
+                widget.id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a group whose sub-grid leaves its children nothing to render in.
+///
+/// The floor the device's own cells are held to, one level down. Without it a
+/// group is the one place an author can still ask for a two-pixel content box, and
+/// the layout engine answers that with a panic rather than an error.
+fn validate_group_geometry(
+    device_id: &str,
+    chrome: Chrome,
+    cell_w: f32,
+    cell_h: f32,
+    widgets: &[Widget],
+) -> Result<()> {
+    for widget in widgets {
+        let Some(group) = &widget.group else {
+            continue;
+        };
+        // The group's own content box, which is what its children share.
+        let box_w = cell_w * widget.col_span as f32
+            + chrome.gap * widget.col_span.saturating_sub(1) as f32
+            - chrome.inset();
+        let box_h = cell_h * widget.row_span as f32
+            + chrome.gap * widget.row_span.saturating_sub(1) as f32
+            - chrome.inset();
+        let (sub_w, sub_h) = sub_cell_size(box_w, box_h, group.grid, chrome);
+        ensure!(
+            sub_w - chrome.inset() >= MIN_CONTENT as f32
+                && sub_h - chrome.inset() >= MIN_CONTENT as f32,
+            "group `{}` on device `{device_id}` is {box_w:.0}x{box_h:.0} pixels over a \
+             {}x{} sub-grid, leaving each child a {:.0}x{:.0} content box; at least \
+             {MIN_CONTENT}x{MIN_CONTENT} is needed to render anything",
+            widget.id,
+            group.grid.cols,
+            group.grid.rows,
+            sub_w - chrome.inset(),
+            sub_h - chrome.inset()
+        );
+    }
+    Ok(())
+}
+
 /// Resolves one widget, rejecting a combination of fields that cannot render.
-fn validate_widget(raw: RawWidget, device_id: &str, has_home_assistant: bool) -> Result<Widget> {
+fn validate_widget(
+    raw: RawWidget,
+    device_id: &str,
+    device_precision: Option<u8>,
+    has_home_assistant: bool,
+) -> Result<Widget> {
     let RawWidget {
         id,
         kind,
@@ -550,16 +1366,35 @@ fn validate_widget(raw: RawWidget, device_id: &str, has_home_assistant: bool) ->
         row_span,
         label,
         unit,
+        precision,
+        state_text,
         stale_after,
         entity,
         attribute,
         on_values,
         icon,
+        icon_on,
+        icon_off,
+        readings,
+        grid,
+        widgets,
         tap,
     } = raw;
 
-    let reads_home_assistant = matches!(kind, WidgetKind::HaEntity | WidgetKind::Weather);
-    if reads_home_assistant {
+    let precision = precision.or(device_precision);
+    if let Some(precision) = precision {
+        ensure!(
+            precision <= MAX_PRECISION,
+            "widget `{id}` on device `{device_id}` has precision {precision}, above the \
+             {MAX_PRECISION} decimal places a panel can use"
+        );
+    }
+
+    let reads_home_assistant = matches!(
+        kind,
+        WidgetKind::HaEntity | WidgetKind::Weather | WidgetKind::List
+    );
+    if matches!(kind, WidgetKind::HaEntity | WidgetKind::Weather) {
         ensure!(
             entity.is_some(),
             "widget `{id}` on device `{device_id}` has kind {kind} but no `entity`"
@@ -573,14 +1408,97 @@ fn validate_widget(raw: RawWidget, device_id: &str, has_home_assistant: bool) ->
     ensure!(
         !(kind == WidgetKind::Weather && attribute.is_some()),
         "widget `{id}` on device `{device_id}` has kind weather and an `attribute`; \
-         a weather cell draws the entity's own condition. Use kind `ha_entity` \
-         with an `attribute` to show one of its numbers"
+         a weather cell draws the entity's own condition. Use a `reading` to show one \
+         of its numbers beside the condition, or kind `ha_entity` to show one alone"
     );
 
-    if let Some(icon) = &icon {
-        crate::icon::validate(icon).with_context(|| {
-            format!("widget `{id}` on device `{device_id}` has an invalid icon")
-        })?;
+    // A field only one kind can act on is rejected rather than ignored. A silently
+    // ignored `icon_on` is an author staring at a dot, wondering which of the two
+    // spellings was wrong.
+    ensure!(
+        kind == WidgetKind::Beacon || (icon_on.is_none() && icon_off.is_none()),
+        "widget `{id}` on device `{device_id}` has kind {kind} and an `icon_on` or \
+         `icon_off`; only a beacon has two states to draw"
+    );
+    ensure!(
+        matches!(kind, WidgetKind::List | WidgetKind::Weather) || readings.is_empty(),
+        "widget `{id}` on device `{device_id}` has kind {kind} and a `reading`; only \
+         `list` and `weather` cells are made of readings"
+    );
+    if kind == WidgetKind::List {
+        ensure!(
+            !readings.is_empty(),
+            "widget `{id}` on device `{device_id}` has kind list but no `reading`; a list \
+             cell is its readings, so there would be nothing to draw"
+        );
+    }
+
+    let readings = readings
+        .into_iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            validate_reading(raw, index, &id, device_id, entity.as_deref(), precision)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let group = match kind {
+        WidgetKind::Group => {
+            let grid = grid.with_context(|| {
+                format!("widget `{id}` on device `{device_id}` has kind group but no `grid`")
+            })?;
+            validate_grid(grid, &format!("group `{id}` on device `{device_id}`"))?;
+            ensure!(
+                !widgets.is_empty(),
+                "widget `{id}` on device `{device_id}` has kind group but no children; \
+                 write them as [[device.widget.widget]] tables"
+            );
+            // A group is a grid. A unit, an entity or an attribute on one would
+            // describe a value it does not have.
+            ensure!(
+                entity.is_none() && attribute.is_none() && unit.is_none(),
+                "widget `{id}` on device `{device_id}` has kind group and an `entity`, \
+                 `attribute` or `unit`; a group draws no value of its own, its children do"
+            );
+
+            let children = widgets
+                .into_iter()
+                .map(|child| validate_widget(child, device_id, precision, has_home_assistant))
+                .collect::<Result<Vec<_>>>()?;
+            for child in &children {
+                ensure!(
+                    child.group.is_none(),
+                    "widget `{}` is a group inside group `{id}` on device `{device_id}`; \
+                     groups nest one level deep, which is the whole depth a panel can show \
+                     legibly",
+                    child.id
+                );
+            }
+            validate_placement(device_id, Some(&id), grid, &children)?;
+            Some(Group {
+                grid,
+                widgets: children,
+            })
+        }
+        _ => {
+            ensure!(
+                grid.is_none() && widgets.is_empty(),
+                "widget `{id}` on device `{device_id}` has kind {kind} and a `grid` or \
+                 children of its own; only a group holds widgets"
+            );
+            None
+        }
+    };
+
+    for (field, spec) in [
+        ("icon", &icon),
+        ("icon_on", &icon_on),
+        ("icon_off", &icon_off),
+    ] {
+        if let Some(spec) = spec {
+            crate::icon::validate(spec).with_context(|| {
+                format!("widget `{id}` on device `{device_id}` has an invalid {field}")
+            })?;
+        }
     }
 
     let tap = match tap {
@@ -606,12 +1524,63 @@ fn validate_widget(raw: RawWidget, device_id: &str, has_home_assistant: bool) ->
         row_span,
         label,
         unit,
+        precision,
+        state_text,
         stale_after,
         entity,
         attribute,
         on_values,
         icon,
+        icon_on,
+        icon_off,
+        readings,
+        group,
         tap,
+    })
+}
+
+/// Resolves one of a cell's readings, inheriting what it does not say from the
+/// widget holding it.
+fn validate_reading(
+    raw: RawReading,
+    index: usize,
+    widget_id: &str,
+    device_id: &str,
+    widget_entity: Option<&str>,
+    widget_precision: Option<u8>,
+) -> Result<Reading> {
+    let RawReading {
+        label,
+        entity,
+        attribute,
+        unit,
+        precision,
+    } = raw;
+
+    let entity = entity
+        .or_else(|| widget_entity.map(str::to_owned))
+        .with_context(|| {
+            format!(
+                "reading {} of widget `{widget_id}` on device `{device_id}` names no \
+                 `entity`, and the widget has none for it to fall back on",
+                index + 1
+            )
+        })?;
+    if let Some(precision) = precision {
+        ensure!(
+            precision <= MAX_PRECISION,
+            "reading {} of widget `{widget_id}` on device `{device_id}` has precision \
+             {precision}, above the {MAX_PRECISION} decimal places a panel can use",
+            index + 1
+        );
+    }
+
+    Ok(Reading {
+        label,
+        entity,
+        attribute,
+        unit,
+        precision: precision.or(widget_precision),
     })
 }
 
@@ -702,23 +1671,41 @@ fn to_json(value: toml::Value) -> serde_json::Value {
     }
 }
 
-/// The TOML document's shape.
+/// One document's shape.
 ///
-/// Distinct from [`Config`] only where the file is allowed to omit something the
-/// rest of the program should not have to think about: `render_interval` is
-/// optional here and resolved there. Using a sentinel instead would make an
-/// explicit `render_interval = 0` silently mean "default" rather than the config
-/// error it is.
+/// Distinct from [`Config`] wherever a document is allowed to omit something the
+/// rest of the program should not have to think about. Every section is optional
+/// here because a fragment may carry only devices, or only a dashboard;
+/// [`parse_documents`] is what insists that `[server]` was declared exactly once
+/// across the set.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
-    server: Server,
+    server: Option<Server>,
     home_assistant: Option<HomeAssistant>,
+    #[serde(default, rename = "dashboard")]
+    dashboards: Vec<RawDashboard>,
     #[serde(default, rename = "device")]
     devices: Vec<RawDevice>,
 }
 
-#[derive(Deserialize)]
+/// A named grid and widget set, declared once and adopted by any number of
+/// devices.
+///
+/// Cloned into each adopting device rather than shared behind a handle: a
+/// validated [`Device`] owns its widgets, which is what keeps rendering and tap
+/// resolution from having to chase a reference into the configuration that
+/// produced them.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct RawDashboard {
+    name: String,
+    grid: Grid,
+    #[serde(default, rename = "widget")]
+    widgets: Vec<RawWidget>,
+}
+
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct RawDevice {
     id: String,
@@ -730,12 +1717,38 @@ struct RawDevice {
     render_interval: Option<u32>,
     #[serde(default = "default_max_frame_bytes")]
     max_frame_bytes: usize,
-    grid: Grid,
+    /// Decimal places every widget on this device inherits.
+    precision: Option<u8>,
+    /// Required unless `dashboard` names one to adopt.
+    grid: Option<Grid>,
+    chrome: Option<RawChrome>,
+    status_bar: Option<RawStatusBar>,
+    /// A [`RawDashboard`] to adopt instead of declaring a grid and widgets.
+    dashboard: Option<String>,
     #[serde(default, rename = "widget")]
     widgets: Vec<RawWidget>,
 }
 
-#[derive(Deserialize)]
+/// A device's spacing, as the file may leave it: any field absent is derived from
+/// the cell size.
+#[derive(Deserialize, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+struct RawChrome {
+    gap: Option<u32>,
+    padding: Option<u32>,
+    border: Option<u32>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct RawStatusBar {
+    edge: Edge,
+    thickness: Option<u32>,
+    fields: Vec<StatusField>,
+    utc_offset: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct RawWidget {
     id: String,
@@ -748,6 +1761,9 @@ struct RawWidget {
     row_span: u32,
     label: Option<String>,
     unit: Option<String>,
+    precision: Option<u8>,
+    #[serde(default = "yes")]
+    state_text: bool,
     #[serde(default)]
     stale_after: u64,
     entity: Option<String>,
@@ -755,7 +1771,28 @@ struct RawWidget {
     #[serde(default = "default_on_values")]
     on_values: Vec<String>,
     icon: Option<String>,
+    icon_on: Option<String>,
+    icon_off: Option<String>,
+    #[serde(default, rename = "reading")]
+    readings: Vec<RawReading>,
+    /// A group's sub-grid.
+    grid: Option<Grid>,
+    /// A group's children.
+    #[serde(default, rename = "widget")]
+    widgets: Vec<RawWidget>,
     tap: Option<RawTap>,
+}
+
+/// One reading of a `list` or `weather` cell, as the file spells it.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct RawReading {
+    label: Option<String>,
+    /// Defaults to the widget's own `entity`.
+    entity: Option<String>,
+    attribute: Option<String>,
+    unit: Option<String>,
+    precision: Option<u8>,
 }
 
 /// A `tap` as the file may spell it.
@@ -763,14 +1800,14 @@ struct RawWidget {
 /// Untagged, so both spellings are the same key. The short one is a string
 /// because that is how it reads in a file — `tap = "light.toggle"` — and the long
 /// one is a table because a service with data has nowhere else to put it.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(untagged)]
 enum RawTap {
     Terse(String),
     Table(RawTapTable),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct RawTapTable {
     /// `domain.service`, e.g. `light.turn_on`.
@@ -803,15 +1840,99 @@ refresh_rate = 300
 grid = { cols = 4, rows = 3 }
 "#;
 
+    /// A dashboard declared once, for the devices that adopt it.
+    const DASHBOARD: &str = r#"
+[[dashboard]]
+name = "wall"
+grid = { cols = 2, rows = 2 }
+
+[[dashboard.widget]]
+id = "clock"
+kind = "text"
+col = 0
+row = 0
+"#;
+
+    /// A group of two children occupying the first cell of [`BASE`]'s grid.
+    const GROUP: &str = r#"
+[[device.widget]]
+id = "cluster"
+kind = "group"
+col = 0
+row = 0
+grid = { cols = 2, rows = 1 }
+
+[[device.widget.widget]]
+id = "left"
+kind = "text"
+col = 0
+row = 0
+
+[[device.widget.widget]]
+id = "right"
+kind = "text"
+col = 1
+row = 0
+"#;
+
     fn err(text: &str) -> String {
-        let error = parse(text).expect_err("expected this config to be rejected");
-        // Validation context is attached with `with_context`, so the offending
-        // detail can be on any link of the chain.
+        chain(parse(text).expect_err("expected this config to be rejected"))
+    }
+
+    /// [`err`] for a configuration spread across several documents.
+    fn err_documents(documents: &[Document<'_>]) -> String {
+        chain(parse_documents(documents).expect_err("expected this config to be rejected"))
+    }
+
+    /// An error and its causes, flattened to one line.
+    ///
+    /// Validation context is attached with `with_context`, so the offending detail
+    /// can be on any link of the chain.
+    fn chain(error: anyhow::Error) -> String {
         error
             .chain()
             .map(|cause| cause.to_string())
             .collect::<Vec<_>>()
             .join(": ")
+    }
+
+    /// [`BASE`] without its device, for a test declaring devices of its own.
+    fn server_only() -> &'static str {
+        &BASE[..BASE.find("[[device]]").unwrap()]
+    }
+
+    /// [`BASE`]'s device alone, for a test that puts it in a second document.
+    fn device_only() -> &'static str {
+        &BASE[BASE.find("[[device]]").unwrap()..]
+    }
+
+    /// A device that adopts a dashboard rather than declaring a grid of its own.
+    fn adopting(id: &str, dashboard: &str) -> String {
+        format!(
+            "\n[[device]]\nid = \"{id}\"\nwidth = 1024\nheight = 758\n\
+             palette = \"gray16\"\ndither = \"atkinson\"\nrefresh_rate = 300\n\
+             dashboard = \"{dashboard}\"\n"
+        )
+    }
+
+    /// [`BASE`] with `line` added to its device table.
+    fn with_device_line(line: &str) -> String {
+        BASE.replace("refresh_rate = 300", &format!("refresh_rate = 300\n{line}"))
+    }
+
+    /// [`BASE`] with a status bar, written as an inline table so that a case still
+    /// differs from the baseline by exactly one line.
+    fn with_status_bar(inline: &str) -> String {
+        with_device_line(&format!("status_bar = {{ {inline} }}"))
+    }
+
+    /// [`BASE`] with the `[home_assistant]` section every entity-reading kind
+    /// needs, and `widgets` after it.
+    fn with_home_assistant(widgets: &str) -> String {
+        format!(
+            "{BASE}\n[home_assistant]\nbase_url = \"http://ha.local:8123\"\ntoken = \"t\"\n\
+             {widgets}"
+        )
     }
 
     #[test]
@@ -1181,7 +2302,7 @@ entity = "sensor.office_temperature"
     fn rejects_duplicate_device_ids() {
         let text = format!("{BASE}{}", &BASE[BASE.find("[[device]]").unwrap()..]);
         let message = err(&text);
-        assert!(message.contains("duplicate device id"), "{message}");
+        assert!(message.contains("declared in both"), "{message}");
         assert!(message.contains("kindle"), "{message}");
     }
 
@@ -1241,10 +2362,18 @@ entity = "sensor.office_temperature"
 
     #[test]
     fn accepts_a_grid_whose_cells_are_exactly_at_the_floor() {
-        let text = BASE
+        // A zero gap is what makes "exactly at the floor" expressible at all: with
+        // one, a cell is the area less `n + 1` gaps, and the derived gap is itself
+        // a function of the size being chosen.
+        let text = with_device_line("chrome = { gap = 0 }")
             .replace("width = 1024", &format!("width = {}", MIN_CELL * 4))
             .replace("height = 758", &format!("height = {}", MIN_CELL * 3));
-        assert_eq!(parse(&text).unwrap().devices[0].width, MIN_CELL * 4);
+        let device = &parse(&text).unwrap().devices[0];
+        assert_eq!(device.width, MIN_CELL * 4);
+        assert_eq!(
+            cell_size(device.width, device.height, device.grid, device.chrome),
+            (MIN_CELL as f32, MIN_CELL as f32)
+        );
     }
 
     #[test]
@@ -1317,5 +2446,971 @@ entity = "sensor.office_temperature"
             parse(&text).unwrap().server.content_path,
             "/var/lib/paneld/content.json"
         );
+    }
+
+    #[test]
+    fn devices_from_two_documents_both_appear() {
+        let hallway = device_only().replace("kindle", "hallway");
+        let config = parse_documents(&[
+            Document {
+                name: "main.toml",
+                text: BASE,
+            },
+            Document {
+                name: "extra.toml",
+                text: &hallway,
+            },
+        ])
+        .unwrap();
+        let ids: Vec<&str> = config.devices.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["kindle", "hallway"], "devices follow document order");
+    }
+
+    #[test]
+    fn rejects_a_server_section_in_two_documents_naming_both() {
+        let message = err_documents(&[
+            Document {
+                name: "main.toml",
+                text: BASE,
+            },
+            Document {
+                name: "extra.toml",
+                text: "[server]\nlisten = \"0.0.0.0:4445\"\n\
+                       public_base_url = \"http://192.168.0.51:4445\"\n",
+            },
+        ]);
+        assert!(message.contains("[server]"), "{message}");
+        assert!(message.contains("main.toml"), "{message}");
+        assert!(message.contains("extra.toml"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_configuration_with_no_server_section_anywhere() {
+        let message = err_documents(&[Document {
+            name: "extra.toml",
+            text: device_only(),
+        }]);
+        assert!(message.contains("[server]"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_duplicate_device_id_across_documents_naming_both() {
+        let message = err_documents(&[
+            Document {
+                name: "main.toml",
+                text: BASE,
+            },
+            Document {
+                name: "extra.toml",
+                text: device_only(),
+            },
+        ]);
+        assert!(message.contains("kindle"), "{message}");
+        assert!(message.contains("main.toml"), "{message}");
+        assert!(message.contains("extra.toml"), "{message}");
+    }
+
+    #[test]
+    fn rejects_home_assistant_declared_twice_naming_both() {
+        let section = "[home_assistant]\nbase_url = \"http://ha.local:8123\"\ntoken = \"t\"\n";
+        let first = format!("{BASE}\n{section}");
+        let message = err_documents(&[
+            Document {
+                name: "main.toml",
+                text: &first,
+            },
+            Document {
+                name: "extra.toml",
+                text: section,
+            },
+        ]);
+        assert!(message.contains("[home_assistant]"), "{message}");
+        assert!(message.contains("main.toml"), "{message}");
+        assert!(message.contains("extra.toml"), "{message}");
+    }
+
+    #[test]
+    fn two_devices_adopting_one_dashboard_get_the_same_widgets() {
+        let text = format!(
+            "{}{DASHBOARD}{}{}",
+            server_only(),
+            adopting("kindle", "wall"),
+            adopting("hallway", "wall")
+        );
+        let config = parse(&text).unwrap();
+        assert_eq!(config.devices.len(), 2);
+        assert_eq!(config.devices[0].grid, Grid { cols: 2, rows: 2 });
+        assert_eq!(
+            config.devices[0].widgets, config.devices[1].widgets,
+            "a dashboard is adopted whole, so both devices hold the same cells"
+        );
+    }
+
+    #[test]
+    fn rejects_adopting_a_dashboard_nothing_declares() {
+        let message = err(&format!("{}{}", server_only(), adopting("kindle", "hall")));
+        assert!(message.contains("kindle"), "{message}");
+        assert!(message.contains("hall"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_dashboard_name_declared_twice() {
+        let text = format!(
+            "{}{DASHBOARD}{DASHBOARD}{}",
+            server_only(),
+            adopting("kindle", "wall")
+        );
+        let message = err(&text);
+        assert!(message.contains("declared in both"), "{message}");
+        assert!(message.contains("wall"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_device_that_adopts_a_dashboard_and_declares_its_own() {
+        // A dashboard brings the grid its widgets were laid out on, so taking one
+        // and overriding the other places someone else's widgets on a grid their
+        // author never saw.
+        for own in [
+            "grid = { cols = 4, rows = 3 }\n",
+            "\n[[device.widget]]\nid = \"solo\"\nkind = \"text\"\ncol = 0\nrow = 0\n",
+        ] {
+            let text = format!(
+                "{}{DASHBOARD}{}{own}",
+                server_only(),
+                adopting("kindle", "wall")
+            );
+            let message = err(&text);
+            assert!(message.contains("kindle"), "{own}: {message}");
+            assert!(message.contains("wall"), "{own}: {message}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_device_with_neither_a_grid_nor_a_dashboard() {
+        let message = err(&BASE.replace("grid = { cols = 4, rows = 3 }\n", ""));
+        assert!(message.contains("kindle"), "{message}");
+        assert!(message.contains("neither"), "{message}");
+    }
+
+    #[test]
+    fn a_failure_inside_an_adopted_dashboard_names_the_adopting_device() {
+        // The author's next move is to fix the dashboard, but the panel that went
+        // blank is the device, and the message has to connect the two.
+        let broken = DASHBOARD.replace(r#"kind = "text""#, r#"kind = "list""#);
+        let text = format!("{}{broken}{}", server_only(), adopting("kindle", "wall"));
+        let message = err(&text);
+        assert!(message.contains("wall"), "{message}");
+        assert!(message.contains("kindle"), "{message}");
+        assert!(message.contains("clock"), "{message}");
+    }
+
+    #[test]
+    fn chrome_overrides_the_derived_spacing() {
+        let chrome = parse(&with_device_line(
+            "chrome = { gap = 4, padding = 12, border = 2 }",
+        ))
+        .unwrap()
+        .devices[0]
+            .chrome;
+        assert_eq!(
+            chrome,
+            Chrome {
+                gap: 4.0,
+                padding: 12.0,
+                border: 2.0
+            }
+        );
+        assert_eq!(
+            chrome.inset(),
+            28.0,
+            "a content box pays for its padding and its rule on both sides"
+        );
+    }
+
+    #[test]
+    fn omitting_chrome_reproduces_the_derived_spacing() {
+        let device = &parse(BASE).unwrap().devices[0];
+        assert_eq!(
+            device.chrome,
+            Chrome::derived(device.width, device.height, device.grid)
+        );
+    }
+
+    #[test]
+    fn a_partial_chrome_leaves_the_rest_derived() {
+        let derived = Chrome::derived(1024, 758, Grid { cols: 4, rows: 3 });
+        let chrome = parse(&with_device_line("chrome = { gap = 2 }"))
+            .unwrap()
+            .devices[0]
+            .chrome;
+        assert_eq!(chrome.gap, 2.0);
+        assert_eq!(chrome.padding, derived.padding);
+        assert_eq!(chrome.border, derived.border);
+    }
+
+    #[test]
+    fn a_zero_border_draws_no_frame_and_is_accepted() {
+        let chrome = parse(&with_device_line("chrome = { border = 0 }"))
+            .unwrap()
+            .devices[0]
+            .chrome;
+        assert_eq!(
+            chrome.border, 0.0,
+            "a dashboard of bare readings wants none"
+        );
+        assert_eq!(chrome.inset(), chrome.padding * 2.0);
+    }
+
+    #[test]
+    fn rejects_a_gap_that_starves_the_grid() {
+        // A gap is charged `n + 1` times per axis, so a value well inside the
+        // MAX_CHROME ceiling still leaves cells below the legibility floor.
+        let text = with_device_line("chrome = { gap = 60 }")
+            .replace("width = 1024", "width = 400")
+            .replace("height = 758", "height = 400");
+        assert!(
+            parse(&text.replace("chrome = { gap = 60 }\n", "")).is_ok(),
+            "the panel itself has to be valid, so the gap is the only cause"
+        );
+        let message = err(&text);
+        assert!(message.contains("kindle"), "{message}");
+        assert!(message.contains("60 pixel gap"), "{message}");
+    }
+
+    #[test]
+    fn rejects_padding_and_a_border_that_leave_no_content_box() {
+        let message = err(&with_device_line("chrome = { padding = 64, border = 64 }"));
+        assert!(message.contains("kindle"), "{message}");
+        assert!(message.contains("content box"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_chrome_measurement_above_the_ceiling() {
+        for field in ["gap", "padding", "border"] {
+            let message = err(&with_device_line(&format!(
+                "chrome = {{ {field} = {} }}",
+                MAX_CHROME + 1
+            )));
+            assert!(
+                message.contains(&format!("chrome.{field} {}", MAX_CHROME + 1)),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sub_cell_pays_for_one_fewer_gap_than_an_outer_cell() {
+        // A group's own padding is its children's outer margin, so `n` sub-cells
+        // want `n - 1` gaps where `n` outer cells want `n + 1`.
+        let chrome = Chrome {
+            gap: 10.0,
+            padding: 8.0,
+            border: 1.0,
+        };
+        let grid = Grid { cols: 2, rows: 1 };
+        assert_eq!(cell_size(200, 100, grid, chrome), (85.0, 80.0));
+        assert_eq!(sub_cell_size(200.0, 100.0, grid, chrome), (95.0, 100.0));
+    }
+
+    #[test]
+    fn a_device_with_no_status_bar_gives_the_grid_the_whole_frame() {
+        let device = &parse(BASE).unwrap().devices[0];
+        assert!(device.status_bar.is_none());
+        assert_eq!(device.grid_area(), (0, 0, 1024, 758));
+        assert_eq!(device.status_bar_area(), None);
+    }
+
+    #[test]
+    fn each_status_bar_edge_takes_its_strip_off_the_grid_area() {
+        for (edge, grid, bar) in [
+            ("top", (0, 40, 1024, 718), (0, 0, 1024, 40)),
+            ("bottom", (0, 0, 1024, 718), (0, 718, 1024, 40)),
+            ("left", (40, 0, 984, 758), (0, 0, 40, 758)),
+            ("right", (0, 0, 984, 758), (984, 0, 40, 758)),
+        ] {
+            let text = with_status_bar(&format!(
+                "edge = \"{edge}\", thickness = 40, fields = [\"time\"]"
+            ));
+            let device = &parse(&text)
+                .unwrap_or_else(|e| panic!("a {edge} bar should parse: {e:#}"))
+                .devices[0];
+            assert_eq!(device.grid_area(), grid, "{edge}");
+            assert_eq!(device.status_bar_area(), Some(bar), "{edge}");
+        }
+    }
+
+    #[test]
+    fn a_status_bar_thickness_defaults_to_a_twentieth_of_the_short_side() {
+        let text = with_status_bar("edge = \"top\", fields = [\"date\", \"time\"]");
+        let config = parse(&text).unwrap();
+        let bar = config.devices[0].status_bar.as_ref().unwrap();
+        assert_eq!(bar.thickness, 38, "5% of 758, bounded to 18..=64");
+        assert_eq!(bar.edge, Edge::Top);
+        assert_eq!(bar.fields, [StatusField::Date, StatusField::Time]);
+    }
+
+    #[test]
+    fn parses_every_documented_status_field() {
+        for (name, expected) in [
+            ("date", StatusField::Date),
+            ("time", StatusField::Time),
+            ("battery", StatusField::Battery),
+            ("refresh", StatusField::Refresh),
+            ("device", StatusField::Device),
+            ("signal", StatusField::Signal),
+        ] {
+            let text = with_status_bar(&format!("edge = \"top\", fields = [\"{name}\"]"));
+            let config = parse(&text).unwrap_or_else(|e| panic!("{name} should parse: {e:#}"));
+            assert_eq!(
+                config.devices[0].status_bar.as_ref().unwrap().fields,
+                [expected]
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_status_bar_with_no_fields() {
+        let message = err(&with_status_bar("edge = \"top\", fields = []"));
+        assert!(message.contains("kindle"), "{message}");
+        assert!(message.contains("fields"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_status_bar_that_starves_the_grid() {
+        let bar = "edge = \"left\", thickness = 250, fields = [\"time\"]";
+        let text = with_status_bar(bar).replace("width = 1024", "width = 280");
+        let without = text.replace(&format!("status_bar = {{ {bar} }}\n"), "");
+        assert!(
+            parse(&without).is_ok(),
+            "the panel itself has to be valid, so the bar is the only cause"
+        );
+        let message = err(&text);
+        assert!(message.contains("kindle"), "{message}");
+        assert!(message.contains("status_bar"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_status_bar_thickness_outside_its_bounds() {
+        for thickness in [
+            *STATUS_BAR_THICKNESS_BOUNDS.start() - 1,
+            *STATUS_BAR_THICKNESS_BOUNDS.end() + 1,
+        ] {
+            let message = err(&with_status_bar(&format!(
+                "edge = \"top\", thickness = {thickness}, fields = [\"time\"]"
+            )));
+            assert!(
+                message.contains(&format!("{thickness} pixels thick")),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_every_offset_spelling() {
+        for (raw, seconds) in [
+            ("+02:00", 7_200),
+            ("-0530", -19_800),
+            ("+2", 7_200),
+            ("Z", 0),
+            ("UTC", 0),
+        ] {
+            let text = with_status_bar(&format!(
+                "edge = \"top\", fields = [\"time\"], utc_offset = \"{raw}\""
+            ));
+            let config = parse(&text).unwrap_or_else(|e| panic!("{raw} should parse: {e:#}"));
+            let bar = config.devices[0].status_bar.as_ref().unwrap();
+            assert_eq!(bar.utc_offset.whole_seconds(), seconds, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rejects_an_offset_that_is_not_one() {
+        for raw in ["midday", "+25:00", "+02:75", "two", "+"] {
+            let text = with_status_bar(&format!(
+                "edge = \"top\", fields = [\"time\"], utc_offset = \"{raw}\""
+            ));
+            let message = err(&text);
+            assert!(
+                message.contains("utc_offset") && message.contains(raw),
+                "{raw} should be rejected, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_offset_is_utc() {
+        // paneld carries no timezone database, so UTC is the only offset it can
+        // assume without implying it knows where the panel is.
+        let text = with_status_bar("edge = \"top\", fields = [\"time\"]");
+        let config = parse(&text).unwrap();
+        assert_eq!(
+            config.devices[0].status_bar.as_ref().unwrap().utc_offset,
+            UtcOffset::UTC
+        );
+    }
+
+    #[test]
+    fn derived_chrome_is_measured_against_the_grid_area_not_the_frame() {
+        // The cells live in the grid area, so spacing derived from the whole frame
+        // would be spacing for a grid this device does not have.
+        let text = with_status_bar("edge = \"top\", thickness = 150, fields = [\"time\"]")
+            .replace("width = 1024", "width = 400")
+            .replace("height = 758", "height = 400");
+        let device = &parse(&text).unwrap().devices[0];
+        assert_eq!(device.grid_area(), (0, 150, 400, 250));
+        assert_eq!(device.chrome, Chrome::derived(400, 250, device.grid));
+        assert_ne!(device.chrome, Chrome::derived(400, 400, device.grid));
+    }
+
+    #[test]
+    fn precision_is_absent_unless_asked_for() {
+        let text =
+            format!("{BASE}\n[[device.widget]]\nid = \"a\"\nkind = \"value\"\ncol = 0\nrow = 0\n");
+        assert_eq!(
+            parse(&text).unwrap().devices[0].widgets[0].precision,
+            None,
+            "no precision renders whatever the source said, digit for digit"
+        );
+    }
+
+    #[test]
+    fn a_device_precision_is_inherited_by_its_widgets() {
+        let text = format!(
+            "{}\n[[device.widget]]\nid = \"a\"\nkind = \"value\"\ncol = 0\nrow = 0\n",
+            with_device_line("precision = 1")
+        );
+        assert_eq!(
+            parse(&text).unwrap().devices[0].widgets[0].precision,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_widget_precision_overrides_the_device_default() {
+        let text = format!(
+            "{}\n[[device.widget]]\nid = \"a\"\nkind = \"value\"\ncol = 0\nrow = 0\n\
+             precision = 3\n",
+            with_device_line("precision = 1")
+        );
+        assert_eq!(
+            parse(&text).unwrap().devices[0].widgets[0].precision,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_reading_precision_overrides_the_widget_and_the_device() {
+        let text = with_home_assistant(
+            r#"
+[[device.widget]]
+id = "climate"
+kind = "list"
+col = 0
+row = 0
+precision = 2
+entity = "sensor.office"
+
+[[device.widget.reading]]
+label = "Temp"
+attribute = "temperature"
+
+[[device.widget.reading]]
+label = "Humidity"
+attribute = "humidity"
+precision = 0
+"#,
+        )
+        .replace("refresh_rate = 300", "refresh_rate = 300\nprecision = 4");
+        let config = parse(&text).unwrap();
+        let widget = &config.devices[0].widgets[0];
+        assert_eq!(
+            widget.precision,
+            Some(2),
+            "the widget's own precision wins over the device's"
+        );
+        assert_eq!(
+            widget.readings[0].precision,
+            Some(2),
+            "a reading that says nothing inherits the widget's"
+        );
+        assert_eq!(
+            widget.readings[1].precision,
+            Some(0),
+            "a reading's own precision wins over both"
+        );
+    }
+
+    #[test]
+    fn rejects_a_device_precision_above_the_ceiling() {
+        let message = err(&with_device_line(&format!(
+            "precision = {}",
+            MAX_PRECISION + 1
+        )));
+        assert!(message.contains("kindle"), "{message}");
+        assert!(
+            message.contains(&format!("precision {}", MAX_PRECISION + 1)),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_widget_precision_above_the_ceiling() {
+        let text = format!(
+            "{BASE}\n[[device.widget]]\nid = \"a\"\nkind = \"value\"\ncol = 0\nrow = 0\n\
+             precision = {}\n",
+            MAX_PRECISION + 1
+        );
+        let message = err(&text);
+        assert!(message.contains("widget `a`"), "{message}");
+        assert!(
+            message.contains(&format!("precision {}", MAX_PRECISION + 1)),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_reading_precision_above_the_ceiling() {
+        let text = with_home_assistant(&format!(
+            "\n[[device.widget]]\nid = \"climate\"\nkind = \"list\"\ncol = 0\nrow = 0\n\
+             entity = \"sensor.office\"\n\n[[device.widget.reading]]\nlabel = \"Temp\"\n\
+             precision = {}\n",
+            MAX_PRECISION + 1
+        ));
+        let message = err(&text);
+        assert!(message.contains("reading 1"), "{message}");
+        assert!(
+            message.contains(&format!("precision {}", MAX_PRECISION + 1)),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_list_with_no_reading() {
+        // A list cell *is* its readings, so there would be nothing to draw.
+        let text = with_home_assistant(
+            "\n[[device.widget]]\nid = \"empty\"\nkind = \"list\"\ncol = 0\nrow = 0\n\
+             entity = \"sensor.office\"\n",
+        );
+        let message = err(&text);
+        assert!(message.contains("empty"), "{message}");
+        assert!(message.contains("reading"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_reading_with_no_entity_anywhere_naming_its_position() {
+        let text = with_home_assistant(
+            r#"
+[[device.widget]]
+id = "climate"
+kind = "list"
+col = 0
+row = 0
+
+[[device.widget.reading]]
+entity = "sensor.office"
+
+[[device.widget.reading]]
+label = "Humidity"
+"#,
+        );
+        let message = err(&text);
+        assert!(message.contains("reading 2"), "{message}");
+        assert!(message.contains("climate"), "{message}");
+    }
+
+    #[test]
+    fn a_reading_inherits_the_widgets_entity() {
+        let text = with_home_assistant(
+            r#"
+[[device.widget]]
+id = "climate"
+kind = "list"
+col = 0
+row = 0
+entity = "sensor.office"
+
+[[device.widget.reading]]
+label = "Temp"
+attribute = "temperature"
+"#,
+        );
+        let config = parse(&text).unwrap();
+        let reading = &config.devices[0].widgets[0].readings[0];
+        assert_eq!(reading.entity, "sensor.office");
+        assert_eq!(reading.attribute.as_deref(), Some("temperature"));
+    }
+
+    #[test]
+    fn rejects_a_reading_on_a_kind_that_is_not_made_of_them() {
+        let text = format!(
+            "{BASE}\n[[device.widget]]\nid = \"solo\"\nkind = \"value\"\ncol = 0\nrow = 0\n\n\
+             [[device.widget.reading]]\nentity = \"sensor.office\"\n"
+        );
+        let message = err(&text);
+        assert!(message.contains("solo"), "{message}");
+        assert!(message.contains("value"), "{message}");
+    }
+
+    #[test]
+    fn a_weather_widget_takes_readings_but_still_refuses_an_attribute() {
+        let text = with_home_assistant(
+            r#"
+[[device.widget]]
+id = "sky"
+kind = "weather"
+col = 0
+row = 0
+entity = "weather.home"
+
+[[device.widget.reading]]
+label = "Temp"
+attribute = "temperature"
+"#,
+        );
+        let config = parse(&text).unwrap();
+        let widget = &config.devices[0].widgets[0];
+        assert_eq!(widget.readings.len(), 1);
+        assert_eq!(
+            widget.readings[0].entity, "weather.home",
+            "a reading falls back to the cell's own entity"
+        );
+
+        // A weather condition *is* the entity's state, so an `attribute` on the
+        // cell says "read something else", which this kind cannot do.
+        let message = err(&text.replace(
+            "entity = \"weather.home\"",
+            "entity = \"weather.home\"\nattribute = \"temperature\"",
+        ));
+        assert!(message.contains("sky"), "{message}");
+        assert!(message.contains("weather"), "{message}");
+    }
+
+    #[test]
+    fn a_groups_children_parse_and_are_reachable_through_all_widgets() {
+        let config = parse(&format!("{BASE}{GROUP}")).unwrap();
+        let device = &config.devices[0];
+        assert_eq!(
+            device.widgets.len(),
+            1,
+            "a group is one cell of the outer grid"
+        );
+        let group = device.widgets[0].group.as_ref().unwrap();
+        assert_eq!(group.grid, Grid { cols: 2, rows: 1 });
+        let ids: Vec<&str> = device.all_widgets().map(|w| w.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["cluster", "left", "right"],
+            "render prep walks all_widgets, so a child it misses reads `no data`"
+        );
+    }
+
+    #[test]
+    fn rejects_a_group_inside_a_group() {
+        // Arbitrary nesting would make placement, geometry and tap resolution
+        // recursive to serve a composition nobody asked for.
+        let message = err(&format!(
+            r#"{BASE}
+[[device.widget]]
+id = "outer"
+kind = "group"
+col = 0
+row = 0
+grid = {{ cols = 1, rows = 1 }}
+
+[[device.widget.widget]]
+id = "inner"
+kind = "group"
+col = 0
+row = 0
+grid = {{ cols = 1, rows = 1 }}
+
+[[device.widget.widget.widget]]
+id = "leaf"
+kind = "text"
+col = 0
+row = 0
+"#
+        ));
+        assert!(message.contains("inner"), "{message}");
+        assert!(message.contains("outer"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_group_child_outside_the_sub_grid() {
+        let message = err(&format!("{BASE}{}", GROUP.replace("col = 1", "col = 2")));
+        assert!(message.contains("cluster"), "{message}");
+        assert!(message.contains("right"), "{message}");
+    }
+
+    #[test]
+    fn rejects_two_group_children_sharing_a_sub_cell() {
+        let message = err(&format!(
+            "{BASE}{}",
+            GROUP.replace("col = 1\nrow = 0", "col = 0\nrow = 0")
+        ));
+        assert!(message.contains("cluster"), "{message}");
+        assert!(message.contains("left"), "{message}");
+        assert!(message.contains("right"), "{message}");
+    }
+
+    #[test]
+    fn rejects_two_widgets_sharing_an_id_anywhere_on_the_device() {
+        // An id is a content push address, so two cells answering to it means one
+        // publisher feeds a cell nobody chose.
+        let text = format!(
+            "{BASE}{GROUP}\n[[device.widget]]\nid = \"left\"\nkind = \"text\"\ncol = 1\nrow = 0\n"
+        );
+        let message = err(&text);
+        assert!(message.contains("share the id `left`"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_group_with_no_grid() {
+        let message = err(&format!(
+            "{BASE}{}",
+            GROUP.replace("grid = { cols = 2, rows = 1 }\n", "")
+        ));
+        assert!(message.contains("cluster"), "{message}");
+        assert!(message.contains("grid"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_group_with_no_children() {
+        let childless = &GROUP[..GROUP.find("[[device.widget.widget]]").unwrap()];
+        let message = err(&format!("{BASE}{childless}"));
+        assert!(message.contains("cluster"), "{message}");
+        assert!(message.contains("children"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_group_that_carries_a_value_of_its_own() {
+        // A group draws no value, its children do, so any of these would describe
+        // something it does not have.
+        for field in [
+            "entity = \"sensor.office\"",
+            "attribute = \"temperature\"",
+            "unit = \"°C\"",
+        ] {
+            let text = format!(
+                "{BASE}{}",
+                GROUP.replace(
+                    "grid = { cols = 2, rows = 1 }",
+                    &format!("grid = {{ cols = 2, rows = 1 }}\n{field}")
+                )
+            );
+            let message = err(&text);
+            assert!(message.contains("cluster"), "{field}: {message}");
+            assert!(message.contains("group"), "{field}: {message}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_sub_grid_too_dense_to_leave_a_content_box() {
+        // The floor the device's own cells are held to, one level down: without it
+        // a group is the one place an author can still ask for a two-pixel box, and
+        // the layout engine answers that with a panic rather than an error.
+        let text = format!(
+            "{BASE}{}",
+            GROUP.replace(
+                "grid = { cols = 2, rows = 1 }",
+                "grid = { cols = 6, rows = 6 }"
+            )
+        );
+        let message = err(&text);
+        assert!(message.contains("cluster"), "{message}");
+        assert!(message.contains("sub-grid"), "{message}");
+    }
+
+    #[test]
+    fn a_beacon_takes_an_icon_for_each_of_its_two_states() {
+        let text = format!(
+            "{BASE}\n[[device.widget]]\nid = \"lamp\"\nkind = \"beacon\"\ncol = 0\nrow = 0\n\
+             icon_on = \"mdi-lightbulb\"\nicon_off = \"mdi-lightbulb-outline\"\n"
+        );
+        let config = parse(&text).unwrap();
+        let widget = &config.devices[0].widgets[0];
+        assert_eq!(widget.icon_on.as_deref(), Some("mdi-lightbulb"));
+        assert_eq!(widget.icon_off.as_deref(), Some("mdi-lightbulb-outline"));
+    }
+
+    #[test]
+    fn rejects_two_state_icons_on_a_kind_with_one_state() {
+        // Rejected rather than ignored: a silently dropped `icon_on` is an author
+        // staring at a dot, wondering which of the two spellings was wrong.
+        for kind in ["value", "text"] {
+            for field in ["icon_on", "icon_off"] {
+                let text = format!(
+                    "{BASE}\n[[device.widget]]\nid = \"w\"\nkind = \"{kind}\"\ncol = 0\nrow = 0\n\
+                     {field} = \"mdi-lightbulb\"\n"
+                );
+                let message = err(&text);
+                assert!(
+                    message.contains("only a beacon"),
+                    "{kind}/{field}: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_an_invalid_icon_spec_naming_the_field_it_came_from() {
+        for field in ["icon", "icon_on", "icon_off"] {
+            let text = format!(
+                "{BASE}\n[[device.widget]]\nid = \"lamp\"\nkind = \"beacon\"\ncol = 0\nrow = 0\n\
+                 {field} = \"mdi-\"\n"
+            );
+            let message = err(&text);
+            assert!(message.contains(&format!("invalid {field}")), "{message}");
+        }
+    }
+
+    #[test]
+    fn state_text_defaults_to_on_and_can_be_turned_off() {
+        // The graphic is the reading and the word only confirms it, so on a dense
+        // dashboard the word is the part worth dropping.
+        let text = format!(
+            "{BASE}\n[[device.widget]]\nid = \"lamp\"\nkind = \"beacon\"\ncol = 0\nrow = 0\n"
+        );
+        assert!(parse(&text).unwrap().devices[0].widgets[0].state_text);
+        let quiet = format!("{text}state_text = false\n");
+        assert!(!parse(&quiet).unwrap().devices[0].widgets[0].state_text);
+    }
+
+    /// A configuration directory under the temp dir, removed when a test ends.
+    ///
+    /// A guard rather than a bare path because these tests write real files: a
+    /// failing assertion unwinds, and a leftover directory would be picked up by
+    /// the next run of the same test.
+    struct TempConfig {
+        dir: PathBuf,
+    }
+
+    impl TempConfig {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "paneld-config-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        /// The main configuration file's path, whether or not it exists yet.
+        fn main(&self) -> PathBuf {
+            self.dir.join("paneld.toml")
+        }
+
+        fn write_main(&self, text: &str) {
+            std::fs::write(self.main(), text).unwrap();
+        }
+
+        /// Writes a file into the drop-in directory, creating the directory if it
+        /// is the first one.
+        fn write_fragment(&self, name: &str, text: &str) {
+            let dir = fragment_dir(&self.main());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Sets a path's modification time, so a test can say which of the inputs
+    /// [`modified_at`] folded rather than race the clock's resolution.
+    ///
+    /// Opened for reading, which is all a directory can be opened for and all
+    /// `futimens` needs from the caller of a file it owns.
+    fn stamp(path: &Path, at: SystemTime) {
+        std::fs::File::options()
+            .read(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(at))
+            .unwrap();
+    }
+
+    #[test]
+    fn load_reads_the_main_file_and_every_fragment() {
+        let config = TempConfig::new("load");
+        config.write_main(BASE);
+        config.write_fragment(
+            "10-hallway.toml",
+            &device_only().replace("kindle", "hallway"),
+        );
+        // Neither of these is configuration, and reading either would make the
+        // panel's behaviour depend on an editor's habits. Both are invalid TOML, so
+        // picking one up fails loudly rather than quietly.
+        config.write_fragment("notes.txt", "id =");
+        config.write_fragment(".hidden.toml", "id =");
+
+        let loaded = load(&config.main()).unwrap();
+        let ids: Vec<&str> = loaded.devices.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["kindle", "hallway"]);
+    }
+
+    #[test]
+    fn sources_lists_the_main_file_then_its_fragments_in_name_order() {
+        let config = TempConfig::new("sources");
+        config.write_main(BASE);
+        // Written out of order deliberately: the load order is the sorted one, so
+        // that a merge conflict is reported the same way twice running rather than
+        // in whatever order the filesystem answered in.
+        config.write_fragment("20-later.toml", "");
+        config.write_fragment("10-earlier.toml", "");
+        config.write_fragment("notes.txt", "");
+
+        let names: Vec<String> = sources(&config.main())
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["paneld.toml", "10-earlier.toml", "20-later.toml"]);
+    }
+
+    #[test]
+    fn a_fragment_that_is_not_toml_is_named_by_its_path() {
+        let config = TempConfig::new("broken");
+        config.write_main(BASE);
+        config.write_fragment("10-broken.toml", "id =\n");
+
+        let error = load(&config.main()).expect_err("a fragment that is not TOML is not usable");
+        assert!(chain(error).contains("10-broken.toml"));
+    }
+
+    #[test]
+    fn modified_at_folds_the_main_file_the_directory_and_every_fragment() {
+        let config = TempConfig::new("modified");
+        config.write_main(BASE);
+        config.write_fragment("10-hallway.toml", "");
+
+        let main = config.main();
+        let dir = fragment_dir(&main);
+        let fragment = dir.join("10-hallway.toml");
+        let epoch = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        for path in [&main, &dir, &fragment] {
+            stamp(path, epoch);
+        }
+        assert_eq!(modified_at(&main), Some(epoch));
+
+        // Each input in turn is the newest, and each has to be the answer. The
+        // directory is the case worth having: adding or deleting a fragment
+        // modifies no file, so a check that stats only files keeps the panel
+        // rendering a configuration that is no longer on disk.
+        let later = epoch + std::time::Duration::from_secs(60);
+        for path in [&main, &dir, &fragment] {
+            stamp(path, later);
+            assert_eq!(
+                modified_at(&main),
+                Some(later),
+                "{} was the newest input",
+                path.display()
+            );
+            stamp(path, epoch);
+        }
     }
 }

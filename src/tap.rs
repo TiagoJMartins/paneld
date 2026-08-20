@@ -280,11 +280,17 @@ mod tests {
             row_span: 1,
             label: None,
             unit: None,
+            precision: None,
+            state_text: true,
             stale_after: 0,
             entity: None,
             attribute: None,
             on_values: Vec::new(),
             icon: None,
+            icon_on: None,
+            icon_off: None,
+            readings: Vec::new(),
+            group: None,
             tap,
         }
     }

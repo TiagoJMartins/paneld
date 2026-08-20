@@ -183,6 +183,10 @@ impl Runtime {
         let ha_states = self.ha_states(device).await;
         let icons = self.icons(device).await;
         let content = self.content.snapshot();
+        // Read once, here, rather than inside the renderer: a frame is a pure
+        // function of its inputs, and a status bar reaching into the status store
+        // mid-rasterise would be the one thing in the render path that is not.
+        let telemetry = self.status.telemetry(device_id);
 
         // The layout engine asserts internally on degenerate geometry, so a panic
         // here is possible in a way an error is not. Containing it matters more
@@ -197,6 +201,7 @@ impl Runtime {
                     content: &content,
                     ha_states: &ha_states,
                     icons: &icons,
+                    telemetry: &telemetry,
                     now,
                 },
             )
@@ -226,17 +231,25 @@ impl Runtime {
     /// A missing client or a per-reading failure leaves that cell showing its last
     /// value, muted, rather than failing the frame.
     async fn ha_states(&self, device: &Device) -> HashMap<Reading, Reported> {
-        let readings: Vec<Reading> = device
-            .widgets
-            .iter()
-            .filter_map(|widget| {
-                let entity = widget.entity.as_ref()?;
-                Some(match &widget.attribute {
+        // Every widget, group children included, and every configured reading
+        // within each: a `list` cell is made of readings and a `weather` cell hangs
+        // them off its condition, so a fetch list built from widgets alone would
+        // leave those rows permanently empty.
+        let mut readings: Vec<Reading> = Vec::new();
+        for widget in device.all_widgets() {
+            if let Some(entity) = &widget.entity {
+                readings.push(match &widget.attribute {
                     Some(attribute) => Reading::attribute(entity, attribute),
                     None => Reading::state(entity),
-                })
-            })
-            .collect();
+                });
+            }
+            for reading in &widget.readings {
+                readings.push(match &reading.attribute {
+                    Some(attribute) => Reading::attribute(&reading.entity, attribute),
+                    None => Reading::state(&reading.entity),
+                });
+            }
+        }
         if readings.is_empty() {
             return HashMap::new();
         }
@@ -260,15 +273,23 @@ impl Runtime {
     /// Resolves every icon this device's dashboard references.
     ///
     /// Keyed by the spec rather than by widget, so two cells asking for the same
-    /// icon share one fetch and one cache entry.
+    /// icon share one fetch and one cache entry. A beacon's two state icons are
+    /// collected alongside every header icon, because they are drawn by the same
+    /// code path and so must be resolved by the same one.
     async fn icons(&self, device: &Device) -> HashMap<String, crate::icon::Icon> {
         let Some(store) = &self.icons else {
             return HashMap::new();
         };
+        // Group children are walked too: a nested cell's icon is fetched exactly
+        // like a top-level one's.
         let specs: Vec<String> = device
-            .widgets
-            .iter()
-            .filter_map(|widget| widget.icon.clone())
+            .all_widgets()
+            .flat_map(|widget| {
+                [&widget.icon, &widget.icon_on, &widget.icon_off]
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+            })
             .collect();
         if specs.is_empty() {
             return HashMap::new();

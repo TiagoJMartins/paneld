@@ -12,6 +12,7 @@
 mod encode;
 mod grid;
 mod icon;
+mod status_bar;
 
 pub use encode::{frame_hash, quantise_and_encode};
 pub use grid::Layout;
@@ -22,10 +23,11 @@ use anyhow::{Context, Result, anyhow};
 use takumi::prelude::*;
 use time::OffsetDateTime;
 
-use crate::config::{Device, Dither, Palette, Widget, WidgetKind};
+use crate::config::{Device, Dither, Edge, Palette, Widget, WidgetKind};
 use crate::content::{ContentRecord, Row};
 use crate::ha::{Reading, Reported};
 use crate::icon::Icon;
+use crate::telemetry::Telemetry;
 
 /// Family name the UI text is registered and requested under.
 ///
@@ -71,6 +73,13 @@ pub struct RenderInputs<'a> {
     /// The instant staleness is measured against. A parameter rather than a call
     /// to `now_utc()` so a frame is reproducible.
     pub now: OffsetDateTime,
+    /// What the device last told us about itself, for a status bar to show.
+    ///
+    /// Handed in already resolved like everything else here, and that is the point
+    /// of it being a field rather than a store this module reads: a status bar adds
+    /// no fetch, no lock and no clock to [`render_frame`], so a frame is still a
+    /// pure function of its inputs.
+    pub telemetry: &'a Telemetry,
 }
 
 /// Builds the embedded font collection.
@@ -217,12 +226,68 @@ fn rasterise(fonts: &Fonts, node: Node, width: u32, height: u32) -> Result<Vec<u
     Ok(bitmap.into_raw())
 }
 
-/// The whole dashboard: a CSS grid container with one child per widget.
+/// The whole frame: the widget grid, and the status bar strip beside it when one
+/// is configured.
+///
+/// The background, the text colour and the font family live on this outermost node
+/// rather than on the grid, so a status bar inherits exactly what a cell does
+/// instead of restating it.
 fn dashboard_node(fonts: &Fonts, inputs: &RenderInputs<'_>) -> Node {
+    let device = inputs.device;
+    let frame = Style::default()
+        .with(StyleDeclaration::width(Length::Px(device.width as f32)))
+        .with(StyleDeclaration::height(Length::Px(device.height as f32)))
+        .with(StyleDeclaration::background_color(paper()))
+        .with(StyleDeclaration::color(ink()))
+        .with(StyleDeclaration::font_family(family(UI_FAMILY)));
+
+    let grid = grid_node(fonts, inputs);
+    let Some(bar) = device.status_bar.as_ref() else {
+        // Block flow with a single child sized to the whole frame, which is what a
+        // barless device rendered as before this wrapper existed. Byte-identical
+        // matters rather than being tidy: the panel caches frames by their hash, so
+        // a wrapper that shifted one pixel would repaint every panel in service.
+        return Node::container(vec![grid])
+            .with_style(frame.with(StyleDeclaration::display(Display::Block)));
+    };
+
+    // The flex axis crosses the edge the bar sits on: a bar runs *along* its edge,
+    // so the bar and the grid stack perpendicular to it. Which of the two comes
+    // first is the edge as well — a top or left bar precedes the grid, a bottom or
+    // right one follows it.
+    let (direction, bar_first) = match bar.edge {
+        Edge::Top => (FlexDirection::Column, true),
+        Edge::Bottom => (FlexDirection::Column, false),
+        Edge::Left => (FlexDirection::Row, true),
+        Edge::Right => (FlexDirection::Row, false),
+    };
+    let bar = status_bar::node(fonts, device, bar, inputs);
+    let children = if bar_first {
+        vec![bar, grid]
+    } else {
+        vec![grid, bar]
+    };
+
+    Node::container(children).with_style(
+        frame
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::flex_direction(direction)),
+    )
+}
+
+/// The widget grid: a CSS grid container with one child per widget, sized to the
+/// area [`Device::grid_area`] left it rather than to the frame.
+///
+/// Sized from the area and never from the device, because those differ by exactly
+/// the strip a status bar took. Deriving the size here instead would be a second
+/// copy of that arithmetic, and the copy that drifted would put every cell
+/// somewhere the tap hit test does not look.
+fn grid_node(fonts: &Fonts, inputs: &RenderInputs<'_>) -> Node {
     let device = inputs.device;
     let grid = device.grid;
     let layout = Layout::for_device(device);
     let gutter = layout.gutter();
+    let (_, _, area_w, area_h) = device.grid_area();
 
     let children = device
         .widgets
@@ -236,8 +301,8 @@ fn dashboard_node(fonts: &Fonts, inputs: &RenderInputs<'_>) -> Node {
             // as a grid must say so or its children are laid out inline and every
             // grid placement is silently ignored.
             .with(StyleDeclaration::display(Display::Grid))
-            .with(StyleDeclaration::width(Length::Px(device.width as f32)))
-            .with(StyleDeclaration::height(Length::Px(device.height as f32)))
+            .with(StyleDeclaration::width(Length::Px(area_w as f32)))
+            .with(StyleDeclaration::height(Length::Px(area_h as f32)))
             .with(StyleDeclaration::grid_template_columns(Some(equal_tracks(
                 grid.cols,
             ))))
@@ -252,9 +317,11 @@ fn dashboard_node(fonts: &Fonts, inputs: &RenderInputs<'_>) -> Node {
             .with(StyleDeclaration::padding_right(Length::Px(gutter)))
             .with(StyleDeclaration::padding_bottom(Length::Px(gutter)))
             .with(StyleDeclaration::padding_left(Length::Px(gutter)))
-            .with(StyleDeclaration::background_color(paper()))
-            .with(StyleDeclaration::color(ink()))
-            .with(StyleDeclaration::font_family(family(UI_FAMILY))),
+            // Never shrunk to make room for the bar beside it. The two are already
+            // sized to partition the frame exactly, so any shrinking here would be
+            // the flex algorithm moving cells away from where `Layout::rect` — and
+            // therefore the tap hit test — says they are.
+            .with(StyleDeclaration::flex_shrink(Some(FlexGrow(0.0)))),
     )
 }
 
@@ -266,6 +333,11 @@ fn equal_tracks(n: u32) -> GridTemplateComponents {
 }
 
 /// One widget's cell, placed explicitly on the grid.
+///
+/// Recursive, and terminating without a depth guard of any kind: a group's
+/// children are ordinary widgets drawn by this same function, and config
+/// validation rejects a group inside a group, so the recursion is exactly one
+/// level deep by construction.
 fn cell_node(
     fonts: &Fonts,
     widget: &Widget,
@@ -279,8 +351,11 @@ fn cell_node(
     // `Layout::rect` places it — the exact disagreement `rect` exists to prevent.
     let (_, _, span_w, span_h) = layout.rect(widget);
     let padding = layout.padding();
-    // Padding on both sides, plus the hairline rule on each.
-    let chrome = padding * 2.0 + 2.0;
+    let border = layout.border();
+    // Padding on both sides, plus a rule on each. Read from the layout rather than
+    // added up here, so the box a reading is fitted into is the same box validation
+    // held to its floor.
+    let chrome = layout.inset();
     // What a cell's contents actually have to fit inside.
     let content_w = (span_w - chrome).max(1.0);
     // Chrome is sized to one cell and never to the span: a label is chrome, and a
@@ -289,20 +364,33 @@ fn cell_node(
     let label_px = (layout.cell().1 * 0.11).max(MIN_TYPE_PX);
     let gap = (span_h * 0.03).clamp(2.0, 8.0);
 
-    let header = header_node(fonts, widget, cell, inputs, content_w, label_px);
-    // Measured rather than derived from `label_px`: a line box is the layout
-    // engine's answer and not the font size, and the body is sized from whatever
-    // the header leaves — so an estimate here shows up either as a body that
-    // overflows its cell or as a strip of the cell nothing ever uses.
-    let content_h = (span_h - chrome - intrinsic_size(fonts, header.clone()).1 - gap).max(1.0);
+    let mut children = Vec::new();
+    let mut content_h = span_h - chrome;
+    // A group's header is optional where a leaf cell's is not. A leaf always emits
+    // one because the not-confirmed mark has to have somewhere to sit; a group reads
+    // nothing of its own, so it has no value to mark and no reason to spend any of
+    // its box unless it was given a title. That is what lets an untitled group's
+    // children fill exactly the content box `Layout::sub_layout` measures them
+    // against, and so what keeps a tap landing on the child a finger was over.
+    if widget.group.is_none() || widget.label.is_some() || widget.icon.is_some() {
+        let header = header_node(fonts, widget, cell, inputs, content_w, label_px);
+        // Measured rather than derived from `label_px`: a line box is the layout
+        // engine's answer and not the font size, and the body is sized from whatever
+        // the header leaves — so an estimate here shows up either as a body that
+        // overflows its cell or as a strip of the cell nothing ever uses.
+        content_h -= intrinsic_size(fonts, header.clone()).1 + gap;
+        children.push(header);
+    }
+    let content_h = content_h.max(1.0);
 
-    let mut children = vec![header];
-    // The body sits in its own growing box so that the header is pinned to the top
-    // of every cell while the body is centred in whatever space is left. Laying
-    // both out in one column instead would centre them as a group, which makes a
-    // label's height depend on how tall its neighbour's content happens to be.
-    children.push(
-        Node::container(body_nodes(
+    children.push(match &widget.group {
+        Some(group) => group_node(fonts, widget, group, inputs, layout),
+        // The body sits in its own growing box so that the header is pinned to the
+        // top of every cell while the body is centred in whatever space is left.
+        // Laying both out in one column instead would centre them as a group, which
+        // makes a label's height depend on how tall its neighbour's content happens
+        // to be.
+        None => Node::container(body_nodes(
             fonts, &cell.body, cell.ink, content_w, content_h, label_px,
         ))
         .with_style(
@@ -317,23 +405,28 @@ fn cell_node(
                     (span_h * 0.02).clamp(1.0, 6.0),
                 )))),
         ),
-    );
+    });
 
-    Node::container(children).with_style(
-        Style::default()
-            .with(StyleDeclaration::display(Display::Flex))
-            .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-            .with(StyleDeclaration::justify_content(JustifyContent::Start))
-            .with(StyleDeclaration::align_items(AlignItems::Start))
-            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(gap))))
-            .with(StyleDeclaration::padding_top(Length::Px(padding)))
-            .with(StyleDeclaration::padding_right(Length::Px(padding)))
-            .with(StyleDeclaration::padding_bottom(Length::Px(padding)))
-            .with(StyleDeclaration::padding_left(Length::Px(padding)))
-            .with(StyleDeclaration::border_top_width(hairline()))
-            .with(StyleDeclaration::border_right_width(hairline()))
-            .with(StyleDeclaration::border_bottom_width(hairline()))
-            .with(StyleDeclaration::border_left_width(hairline()))
+    let mut style = Style::default()
+        .with(StyleDeclaration::display(Display::Flex))
+        .with(StyleDeclaration::flex_direction(FlexDirection::Column))
+        .with(StyleDeclaration::justify_content(JustifyContent::Start))
+        .with(StyleDeclaration::align_items(AlignItems::Start))
+        .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(gap))))
+        .with(StyleDeclaration::padding_top(Length::Px(padding)))
+        .with(StyleDeclaration::padding_right(Length::Px(padding)))
+        .with(StyleDeclaration::padding_bottom(Length::Px(padding)))
+        .with(StyleDeclaration::padding_left(Length::Px(padding)));
+    // A frameless cell is the *absence* of these declarations, not a width of
+    // nothing. A zero-width solid edge still costs the layout engine a pass on each
+    // of the four sides, and `border = 0` is an author asking for a dashboard of
+    // bare readings — which a rule drawn at zero width is only accidentally.
+    if border > 0.0 {
+        style = style
+            .with(StyleDeclaration::border_top_width(rule_width(border)))
+            .with(StyleDeclaration::border_right_width(rule_width(border)))
+            .with(StyleDeclaration::border_bottom_width(rule_width(border)))
+            .with(StyleDeclaration::border_left_width(rule_width(border)))
             .with(StyleDeclaration::border_top_style(BorderStyle::Solid))
             .with(StyleDeclaration::border_right_style(BorderStyle::Solid))
             .with(StyleDeclaration::border_bottom_style(BorderStyle::Solid))
@@ -341,7 +434,11 @@ fn cell_node(
             .with(StyleDeclaration::border_top_color(rule()))
             .with(StyleDeclaration::border_right_color(rule()))
             .with(StyleDeclaration::border_bottom_color(rule()))
-            .with(StyleDeclaration::border_left_color(rule()))
+            .with(StyleDeclaration::border_left_color(rule()));
+    }
+
+    Node::container(children).with_style(
+        style
             .with(StyleDeclaration::grid_column_start(line(widget.col)))
             .with(StyleDeclaration::grid_column_end(line(
                 widget.col + widget.col_span,
@@ -353,12 +450,65 @@ fn cell_node(
     )
 }
 
+/// A group's body: a grid of its children, filling the group's content box.
+///
+/// The children are laid out with one gutter between them and no margin of their
+/// own, because the group's own padding already *is* that margin. That is the
+/// arrangement [`crate::config::sub_cell_size`] computes and the tap hit test
+/// resolves against, so the grid is told to take the whole box rather than left to
+/// size itself to its content: all three have to agree to the pixel or a finger on
+/// one child fires another child's action.
+///
+/// Each child places itself with the same `grid_column_start` and `grid_row_start`
+/// styles a top-level cell writes, because a child's `col` and `row` are already
+/// coordinates on this grid rather than on the device's.
+fn group_node(
+    fonts: &Fonts,
+    widget: &Widget,
+    group: &crate::config::Group,
+    inputs: &RenderInputs<'_>,
+    layout: &Layout,
+) -> Node {
+    let sub = layout
+        .sub_layout(widget)
+        .expect("a widget carrying a group has a sub-layout");
+    let gutter = layout.gutter();
+    let children = group
+        .widgets
+        .iter()
+        .map(|child| cell_node(fonts, child, &resolve(child, inputs), inputs, &sub))
+        .collect::<Vec<_>>();
+
+    Node::container(children).with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Grid))
+            .with(StyleDeclaration::grid_template_columns(Some(equal_tracks(
+                group.grid.cols,
+            ))))
+            .with(StyleDeclaration::grid_template_rows(Some(equal_tracks(
+                group.grid.rows,
+            ))))
+            .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
+                gutter,
+            ))))
+            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(gutter))))
+            .with(StyleDeclaration::width(Length::Percentage(100.0)))
+            .with(StyleDeclaration::height(Length::Percentage(100.0))),
+    )
+}
+
 /// The strip across the top of a cell: its icon and label on the left, and on
 /// the right the mark that says the value below is not confirmed current.
 ///
-/// Always emitted, even for a cell with no label and no icon, because the mark
-/// has to have somewhere to sit. An empty header collapses to nothing taller than
-/// its own zero-height children, so it costs an unlabelled cell no space.
+/// Emitted for every leaf cell, even one with no label and no icon, because the
+/// mark has to have somewhere to sit. An empty header collapses to nothing taller
+/// than its own zero-height children, so it costs an unlabelled cell no space.
+///
+/// A group is the exception, and [`cell_node`] is where that is decided: a group
+/// reads nothing of its own, so it has no unconfirmed value to mark and is given a
+/// header only when it was given a title to put in one. The label and icon drawn
+/// here are then the group's own — each child resolves and draws its own header
+/// inside its own sub-cell.
 fn header_node(
     fonts: &Fonts,
     widget: &Widget,
@@ -474,99 +624,22 @@ fn body_nodes(
             })]
         }
 
-        Body::Sky { svg, condition } => {
-            // Sized as one block, not as a glyph and a caption that each guessed at
-            // the cell: the glyph is the reading and the words are its caption, so
-            // their ratio belongs in [`sky_node`] and the pair is fitted together.
-            // Sizing them apart is what put a 316px glyph and 34px words in a 699x688
-            // cell.
-            //
-            // The centring wrapper is outside the fit because `width: 100%` inside a
-            // measured node measures as the measuring viewport, not as the cell.
-            vec![
-                Node::container(vec![fitted_box(
-                    fonts,
-                    content_w,
-                    content_h,
-                    content_h,
-                    |size| sky_node(svg, condition, ink, size),
-                )])
-                .with_style(
-                    Style::default()
-                        .with(StyleDeclaration::display(Display::Flex))
-                        .with(StyleDeclaration::justify_content(JustifyContent::Center))
-                        .with(StyleDeclaration::width(Length::Percentage(100.0))),
-                ),
-            ]
-        }
+        Body::Sky {
+            svg,
+            condition,
+            rows,
+        } => sky_nodes(
+            fonts,
+            svg,
+            condition.as_deref(),
+            rows,
+            ink,
+            content_w,
+            content_h,
+        ),
 
-        Body::Beacon { on } => {
-            // The dot is the reading, so it takes the height it is given, bounded by
-            // the width it has to share with the word beside it.
-            let dot = (content_h * 0.42).min(content_w * 0.35).max(14.0);
-            vec![
-                Node::container(vec![
-                    // Drawn as a shape rather than a glyph so the indicator does not
-                    // depend on the embedded faces covering any particular symbol.
-                    Node::container(Vec::new()).with_style(
-                        Style::default()
-                            .with(StyleDeclaration::width(Length::Px(dot)))
-                            .with(StyleDeclaration::height(Length::Px(dot)))
-                            .with(StyleDeclaration::border_top_left_radius(radius(dot)))
-                            .with(StyleDeclaration::border_top_right_radius(radius(dot)))
-                            .with(StyleDeclaration::border_bottom_right_radius(radius(dot)))
-                            .with(StyleDeclaration::border_bottom_left_radius(radius(dot)))
-                            .with(StyleDeclaration::background_color(if *on {
-                                ink.colour()
-                            } else {
-                                paper()
-                            }))
-                            .with(StyleDeclaration::border_top_width(LineWidth::Length(
-                                Length::Px(2.0),
-                            )))
-                            .with(StyleDeclaration::border_right_width(LineWidth::Length(
-                                Length::Px(2.0),
-                            )))
-                            .with(StyleDeclaration::border_bottom_width(LineWidth::Length(
-                                Length::Px(2.0),
-                            )))
-                            .with(StyleDeclaration::border_left_width(LineWidth::Length(
-                                Length::Px(2.0),
-                            )))
-                            .with(StyleDeclaration::border_top_style(BorderStyle::Solid))
-                            .with(StyleDeclaration::border_right_style(BorderStyle::Solid))
-                            .with(StyleDeclaration::border_bottom_style(BorderStyle::Solid))
-                            .with(StyleDeclaration::border_left_style(BorderStyle::Solid))
-                            .with(StyleDeclaration::border_top_color(ink.colour()))
-                            .with(StyleDeclaration::border_right_color(ink.colour()))
-                            .with(StyleDeclaration::border_bottom_color(ink.colour()))
-                            .with(StyleDeclaration::border_left_color(ink.colour())),
-                    ),
-                    fitted(
-                        fonts,
-                        (content_w - dot * 1.5).max(1.0),
-                        (dot * 0.78).max(13.0),
-                        |size| {
-                            text_node(
-                                if *on { "ON" } else { "OFF" },
-                                one_line(
-                                    text_style(size, 700.0, UI_FAMILY)
-                                        .with(StyleDeclaration::color(ink.colour())),
-                                ),
-                            )
-                        },
-                    ),
-                ])
-                .with_style(
-                    Style::default()
-                        .with(StyleDeclaration::display(Display::Flex))
-                        .with(StyleDeclaration::flex_direction(FlexDirection::Row))
-                        .with(StyleDeclaration::align_items(AlignItems::Center))
-                        .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
-                            dot * 0.5,
-                        )))),
-                ),
-            ]
+        Body::Beacon { on, icon, text } => {
+            beacon_nodes(fonts, *on, icon.as_ref(), *text, ink, content_w, content_h)
         }
 
         Body::Prose(text) => {
@@ -577,6 +650,15 @@ fn body_nodes(
                 text_style(prose_px, 400.0, UI_FAMILY)
                     .with(StyleDeclaration::color(ink.colour()))
                     .with(StyleDeclaration::line_height(LineHeight::Unitless(1.3)))
+                    // The width the run wraps at, stated rather than inherited. A
+                    // bare text node is block-level, so left alone it takes its
+                    // container's width — and inside a group that container is a
+                    // grid item of a grid item, where the width resolved during
+                    // measurement and the width resolved during line breaking
+                    // disagree by more than a pixel and the text engine asserts.
+                    // Every other length in this module comes out of the content
+                    // box; this one has to as well.
+                    .with(StyleDeclaration::width(Length::Px(content_w)))
                     // Bounded so a long push is clipped to the cell instead of
                     // pushing the layout around.
                     .with(StyleDeclaration::max_lines(Some(
@@ -586,46 +668,293 @@ fn body_nodes(
             )]
         }
 
-        Body::Rows(rows) => {
-            // Every row plus every gap between them fills the box: a row's line box
-            // is about 1.2 of its size and the gaps are 0.28 of it, so `n` rows want
-            // `1.48n - 0.28` sizes' worth of height.
-            let row_px = (content_h / (rows.len().max(1) as f32 * 1.48 - 0.28)).max(MIN_TYPE_PX);
-            let children = rows
-                .iter()
-                .map(|row| row_node(row, row_px, ink))
-                .collect::<Vec<_>>();
-            vec![
-                Node::container(children).with_style(
-                    Style::default()
-                        .with(StyleDeclaration::display(Display::Flex))
-                        .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-                        .with(StyleDeclaration::width(Length::Percentage(100.0)))
-                        .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(
-                            row_px * 0.28,
-                        )))),
-                ),
-            ]
-        }
+        Body::Rows(rows) => vec![rows_node(fonts, rows, content_w, content_h)],
+
+        // A group's children are cells in their own right, drawn by `cell_node`.
+        // There is nothing to add here, and an empty container would still be a box
+        // — one taking a share of the very space those children are laid out in.
+        Body::Group => Vec::new(),
 
         // An absence is not a reading, so it is set at chrome size rather than filling
         // the cell a value would have filled. Scaling it to the box put `no data`
         // across a 2x2 in 97px type, which shouts about the one cell with nothing to
         // say, and made the same words two sizes on one dashboard.
-        Body::Absent(reason) => vec![fitted(
+        //
+        // Wrapped in a box of a definite width, and the wrapper is not cosmetic: the
+        // run inside it is block-level, so on its own it takes its container's width
+        // — and inside a group that container is a grid item of a grid item, where
+        // the width resolved while measuring and the width resolved while breaking
+        // lines disagree by more than a pixel and the text engine asserts. The width
+        // goes on the wrapper rather than on the run because [`fitted`] measures the
+        // run, and a run already told how wide to be measures as exactly that.
+        Body::Absent(reason) => vec![
+            Node::container(vec![fitted(
+                fonts,
+                content_w,
+                (label_px * 1.1).max(MIN_TYPE_PX),
+                |size| {
+                    text_node(
+                        reason,
+                        one_line(
+                            text_style(size, 400.0, UI_FAMILY)
+                                .with(StyleDeclaration::color(muted())),
+                        ),
+                    )
+                },
+            )])
+            .with_style(
+                Style::default()
+                    .with(StyleDeclaration::display(Display::Flex))
+                    .with(StyleDeclaration::flex_direction(FlexDirection::Row))
+                    .with(StyleDeclaration::width(Length::Px(content_w))),
+            ),
+        ],
+    }
+}
+
+/// The weather body: the condition's glyph, its caption when the cell asked for
+/// one, and any readings hung beside or beneath it.
+///
+/// With no readings the glyph block gets the whole content box, which is what a
+/// weather cell has always done.
+///
+/// With readings the box is split along its *long* axis — the glyph beside the rows
+/// in a wide cell, above them in a tall or square one. Splitting the short axis
+/// instead would hand both halves a letterbox, and neither survives one: a glyph is
+/// square, and labelled rows need width for their labels before they need anything
+/// else. Splitting the long axis keeps both halves as close to square as the cell
+/// allows.
+fn sky_nodes(
+    fonts: &Fonts,
+    svg: &str,
+    condition: Option<&str>,
+    rows: &[Line],
+    ink: Ink,
+    content_w: f32,
+    content_h: f32,
+) -> Vec<Node> {
+    if rows.is_empty() {
+        // Sized as one block, not as a glyph and a caption that each guessed at
+        // the cell: the glyph is the reading and the words are its caption, so
+        // their ratio belongs in [`sky_node`] and the pair is fitted together.
+        // Sizing them apart is what put a 316px glyph and 34px words in a 699x688
+        // cell.
+        //
+        // The centring wrapper is outside the fit because `width: 100%` inside a
+        // measured node measures as the measuring viewport, not as the cell.
+        return vec![
+            Node::container(vec![fitted_box(
+                fonts,
+                content_w,
+                content_h,
+                content_h,
+                |size| sky_node(svg, condition, ink, size),
+            )])
+            .with_style(
+                Style::default()
+                    .with(StyleDeclaration::display(Display::Flex))
+                    .with(StyleDeclaration::justify_content(JustifyContent::Center))
+                    .with(StyleDeclaration::width(Length::Percentage(100.0))),
+            ),
+        ];
+    }
+
+    let beside = content_w > content_h;
+    let gap = (content_w.min(content_h) * 0.06).clamp(2.0, 12.0);
+    // The glyph takes under half of a split width and half of a split height. Side
+    // by side the readings carry far more glyphs than the picture does, and their
+    // labels are what runs out of room first; stacked, the two are equals.
+    let (glyph_w, glyph_h) = match beside {
+        true => ((content_w - gap) * 0.40, content_h),
+        false => (content_w, (content_h - gap) * 0.50),
+    };
+    let (rows_w, rows_h) = match beside {
+        true => (content_w - gap - glyph_w, content_h),
+        false => (content_w, content_h - gap - glyph_h),
+    };
+
+    let glyph = Node::container(vec![fitted_box(fonts, glyph_w, glyph_h, glyph_h, |size| {
+        sky_node(svg, condition, ink, size)
+    })])
+    .with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::justify_content(JustifyContent::Center))
+            .with(StyleDeclaration::align_items(AlignItems::Center))
+            .with(StyleDeclaration::width(Length::Px(glyph_w)))
+            .with(StyleDeclaration::height(Length::Px(glyph_h)))
+            // Never gives its half back: the picture is the reading, and a row of
+            // long labels would otherwise squeeze it to nothing.
+            .with(StyleDeclaration::flex_shrink(Some(FlexGrow(0.0)))),
+    );
+
+    vec![
+        Node::container(vec![glyph, rows_node(fonts, rows, rows_w, rows_h)]).with_style(
+            Style::default()
+                .with(StyleDeclaration::display(Display::Flex))
+                .with(StyleDeclaration::flex_direction(match beside {
+                    true => FlexDirection::Row,
+                    false => FlexDirection::Column,
+                }))
+                .with(StyleDeclaration::align_items(AlignItems::Center))
+                // Only the gap on the main axis applies, and which axis that is has
+                // just been decided, so both are set rather than branched over again.
+                .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(gap))))
+                .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(gap))))
+                .with(StyleDeclaration::width(Length::Percentage(100.0))),
+        ),
+    ]
+}
+
+/// The beacon body: an indicator, and `ON`/`OFF` beside it when the cell asked for
+/// words.
+///
+/// Without the caption the indicator is sized against the whole content box rather
+/// than against a word's share of the width. Merely dropping the text node would
+/// leave the indicator at the size it had while it was sharing the cell, and a third
+/// of the cell blank beside a dot that could have been half again as large.
+fn beacon_nodes(
+    fonts: &Fonts,
+    on: bool,
+    icon: Option<&Icon>,
+    text: bool,
+    ink: Ink,
+    content_w: f32,
+    content_h: f32,
+) -> Vec<Node> {
+    // The indicator is the reading, so it takes the height it is given, bounded by
+    // whatever width the caption leaves it. With no caption it is bounded by the box
+    // itself, just short of it so that it never touches the cell's rule.
+    let size = match text {
+        true => (content_h * 0.42).min(content_w * 0.35),
+        false => (content_h * 0.9).min(content_w * 0.9),
+    }
+    .max(14.0);
+
+    let indicator = match icon {
+        // At the dot's size and in the dot's place, so configuring an icon is a
+        // change of picture rather than a change of layout.
+        Some(icon) => icon_node(icon, size, ink),
+        None => dot_node(size, on, ink),
+    };
+    let mut children = vec![indicator];
+    if text {
+        children.push(fitted(
             fonts,
-            content_w,
-            (label_px * 1.1).max(MIN_TYPE_PX),
-            |size| {
+            (content_w - size * 1.5).max(1.0),
+            (size * 0.78).max(13.0),
+            |px| {
                 text_node(
-                    reason,
+                    if on { "ON" } else { "OFF" },
                     one_line(
-                        text_style(size, 400.0, UI_FAMILY).with(StyleDeclaration::color(muted())),
+                        text_style(px, 700.0, UI_FAMILY)
+                            .with(StyleDeclaration::color(ink.colour())),
                     ),
                 )
             },
-        )],
+        ));
     }
+
+    vec![
+        Node::container(children).with_style(
+            Style::default()
+                .with(StyleDeclaration::display(Display::Flex))
+                .with(StyleDeclaration::flex_direction(FlexDirection::Row))
+                .with(StyleDeclaration::align_items(AlignItems::Center))
+                .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
+                    size * 0.5,
+                )))),
+        ),
+    ]
+}
+
+/// A beacon's indicator as a filled or hollow circle.
+///
+/// Drawn as a shape rather than a glyph so the indicator does not depend on the
+/// embedded faces covering any particular symbol.
+fn dot_node(size: f32, on: bool, ink: Ink) -> Node {
+    Node::container(Vec::new()).with_style(
+        Style::default()
+            .with(StyleDeclaration::width(Length::Px(size)))
+            .with(StyleDeclaration::height(Length::Px(size)))
+            .with(StyleDeclaration::border_top_left_radius(radius(size)))
+            .with(StyleDeclaration::border_top_right_radius(radius(size)))
+            .with(StyleDeclaration::border_bottom_right_radius(radius(size)))
+            .with(StyleDeclaration::border_bottom_left_radius(radius(size)))
+            .with(StyleDeclaration::background_color(match on {
+                true => ink.colour(),
+                false => paper(),
+            }))
+            .with(StyleDeclaration::border_top_width(LineWidth::Length(
+                Length::Px(2.0),
+            )))
+            .with(StyleDeclaration::border_right_width(LineWidth::Length(
+                Length::Px(2.0),
+            )))
+            .with(StyleDeclaration::border_bottom_width(LineWidth::Length(
+                Length::Px(2.0),
+            )))
+            .with(StyleDeclaration::border_left_width(LineWidth::Length(
+                Length::Px(2.0),
+            )))
+            .with(StyleDeclaration::border_top_style(BorderStyle::Solid))
+            .with(StyleDeclaration::border_right_style(BorderStyle::Solid))
+            .with(StyleDeclaration::border_bottom_style(BorderStyle::Solid))
+            .with(StyleDeclaration::border_left_style(BorderStyle::Solid))
+            .with(StyleDeclaration::border_top_color(ink.colour()))
+            .with(StyleDeclaration::border_right_color(ink.colour()))
+            .with(StyleDeclaration::border_bottom_color(ink.colour()))
+            .with(StyleDeclaration::border_left_color(ink.colour())),
+    )
+}
+
+/// A column of labelled rows filling a box, each row inked by its own trust.
+///
+/// Shared by a `list` body and by a weather cell's readings, because they are one
+/// thing: `n` labelled values sized and aligned to a box together.
+fn rows_node(fonts: &Fonts, rows: &[Line], width: f32, height: f32) -> Node {
+    // Every row plus every gap between them fills the box: a row's line box is about
+    // 1.2 of its size and the gaps are 0.28 of it, so `n` rows want `1.48n - 0.28`
+    // sizes' worth of height.
+    let by_height = (height / (rows.len().max(1) as f32 * 1.48 - 0.28)).max(MIN_TYPE_PX);
+    let row_px = rows_size(fonts, rows, width, by_height);
+    let children = rows
+        .iter()
+        // Each line's own ink, not the cell's: one unreachable sensor mutes its own
+        // line and leaves the readings around it black.
+        .map(|line| row_node(&line.row, row_px, line.ink))
+        .collect::<Vec<_>>();
+    Node::container(children).with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::flex_direction(FlexDirection::Column))
+            .with(StyleDeclaration::justify_content(JustifyContent::Center))
+            .with(StyleDeclaration::width(Length::Px(width)))
+            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(
+                row_px * 0.28,
+            )))),
+    )
+}
+
+/// The one size every row in a column is set at, fitted to the box's width.
+///
+/// The height decides first, because a column of readings is laid out down the
+/// box; then the widest row decides, because it is the one that runs out of width.
+/// Both are needed and the second was missing: sized by height alone, three
+/// readings in a 322x302 cell were set at 74px, and `Office 21.3 °C` at 74px is
+/// half again as wide as the cell it was drawn in — it overprinted its
+/// neighbours.
+///
+/// One size for every row rather than one per row, and that is the point of a
+/// list: rows sized individually read as unrelated readings that happen to be
+/// stacked, where a shared size reads as a table. So the widest row decides for
+/// all of them.
+fn rows_size(fonts: &Fonts, rows: &[Line], width: f32, design: f32) -> f32 {
+    let widest = rows
+        .iter()
+        .map(|line| intrinsic_width(fonts, row_runs(&line.row, design, line.ink)))
+        .fold(0.0, f32::max);
+    fit_size(widest, width, design)
 }
 
 /// A large figure with its unit set beside it.
@@ -687,17 +1016,26 @@ fn figure_node(text: &str, unit: Option<&str>, ink: Ink, size: f32) -> Node {
 /// number sizes the pair and [`fitted_box`] can fit them to a cell together. The
 /// two are centred as one block: a big glyph with a short caption under one corner
 /// of it reads as two unrelated things sharing a box.
-fn sky_node(svg: &str, condition: &str, ink: Ink, size: f32) -> Node {
+///
+/// `condition` is `None` when the cell asked for the glyph alone, and then the glyph
+/// *is* the block: it is returned bare rather than wrapped in a one-child column, so
+/// [`fitted_box`] fits the picture to the whole box instead of to a box with a
+/// caption's worth of height and a row gap still reserved inside it.
+fn sky_node(svg: &str, condition: Option<&str>, ink: Ink, size: f32) -> Node {
+    let glyph = icon_node(
+        &Icon::Svg {
+            markup: svg.to_owned(),
+            ink: None,
+        },
+        size,
+        ink,
+    );
+    let Some(condition) = condition else {
+        return glyph;
+    };
     let caption_px = size * SKY_CAPTION_SCALE;
     Node::container(vec![
-        icon_node(
-            &Icon::Svg {
-                markup: svg.to_owned(),
-                ink: None,
-            },
-            size,
-            ink,
-        ),
+        glyph,
         text_node(
             condition,
             one_line(
@@ -723,6 +1061,9 @@ fn sky_node(svg: &str, condition: &str, ink: Ink, size: f32) -> Node {
 /// The glyph is the reading and the words underneath confirm it, so the caption is
 /// deliberately a sixth of the glyph: large enough to read across a room, small
 /// enough that it never competes with the picture for the eye.
+///
+/// Applies only where there is a caption. A cell with `state_text = false` has no
+/// words to size, and its glyph takes the box whole.
 const SKY_CAPTION_SCALE: f32 = 0.16;
 
 /// How far the unit must be lifted to share the figure's baseline, as a fraction
@@ -930,32 +1271,10 @@ fn paint_svg(markup: &str, colour: ColorInput) -> String {
     )
 }
 
-/// One line of a multi-reading widget: label on the left, value on the right.
+/// One line of a multi-reading widget: label on the left, value on the right,
+/// stretched across the box it is laid out in.
 fn row_node(row: &Row, size: f32, ink: Ink) -> Node {
-    let label = row
-        .label
-        .clone()
-        .or_else(|| row.id.clone())
-        .unwrap_or_default();
-    let mut value = row.value.as_ref().map(value_text).unwrap_or_default();
-    if let Some(unit) = &row.unit {
-        value.push(' ');
-        value.push_str(unit);
-    }
-
-    Node::container(vec![
-        text_node(
-            &label,
-            one_line(text_style(size, 400.0, UI_FAMILY).with(StyleDeclaration::color(muted()))),
-        ),
-        text_node(
-            &value,
-            one_line(
-                text_style(size, 700.0, NUMERIC_FAMILY).with(StyleDeclaration::color(ink.colour())),
-            ),
-        ),
-    ])
-    .with_style(
+    Node::container(row_runs_children(row, size, ink)).with_style(
         Style::default()
             .with(StyleDeclaration::display(Display::Flex))
             .with(StyleDeclaration::flex_direction(FlexDirection::Row))
@@ -968,6 +1287,62 @@ fn row_node(row: &Row, size: f32, ink: Ink) -> Node {
             ))))
             .with(StyleDeclaration::width(Length::Percentage(100.0))),
     )
+}
+
+/// The same row, sized to its own runs instead of to its box.
+///
+/// This is the shape that can be *measured*, and the reason it exists: a box that
+/// is `width: 100%` measures as the measuring viewport rather than as the row, so
+/// the fit that decides a column's type size has to be taken on a content-sized
+/// copy. The gap between label and value is kept, because it is width the row
+/// genuinely needs.
+fn row_runs(row: &Row, size: f32, ink: Ink) -> Node {
+    Node::container(row_runs_children(row, size, ink)).with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::flex_direction(FlexDirection::Row))
+            .with(StyleDeclaration::align_items(AlignItems::Center))
+            .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
+                size * 0.5,
+            )))),
+    )
+}
+
+/// A row's two runs: its label in chrome grey, its value in the tabular face.
+///
+/// The value carries its unit rather than setting it apart, because a row is one
+/// line and `21.3 °C` is one reading — the figure-and-unit treatment a whole cell
+/// gets has no room to work at this size.
+///
+/// Both runs are one-line, and therefore elided rather than wrapped when a column
+/// cannot be fitted even at [`MIN_TYPE_PX`] — a publisher sending
+/// `21.299999237060547` into a cell a few characters wide. That case is what
+/// [`one_line`]'s ellipsis is for: a run that wrapped inside a one-line box printed
+/// over the reading beneath it.
+fn row_runs_children(row: &Row, size: f32, ink: Ink) -> Vec<Node> {
+    let label = row
+        .label
+        .clone()
+        .or_else(|| row.id.clone())
+        .unwrap_or_default();
+    let mut value = row.value.as_ref().map(value_text).unwrap_or_default();
+    if let Some(unit) = &row.unit {
+        value.push(' ');
+        value.push_str(unit);
+    }
+
+    vec![
+        text_node(
+            &label,
+            one_line(text_style(size, 400.0, UI_FAMILY).with(StyleDeclaration::color(muted()))),
+        ),
+        text_node(
+            &value,
+            one_line(
+                text_style(size, 700.0, NUMERIC_FAMILY).with(StyleDeclaration::color(ink.colour())),
+            ),
+        ),
+    ]
 }
 
 /// A run of text.
@@ -990,16 +1365,31 @@ fn text_style(size: f32, weight: f32, family_name: &str) -> Style {
 }
 
 /// Text that must stay on one line rather than wrap out of its cell.
+///
+/// Elided rather than merely bounded, because the two are not the same failure. A
+/// run this module could not shrink to fit — every fit here floors at
+/// [`MIN_TYPE_PX`], so one exists — is a publisher or config problem, and it should
+/// look like one: an ellipsis says "there is more of this than fits", where a run
+/// cut off mid-glyph reads as a value. That is the worst failure a panel has,
+/// because nobody looking at it knows the number is wrong.
 fn one_line(style: Style) -> Style {
-    style.with(StyleDeclaration::max_lines(Some(1)))
+    style
+        .with(StyleDeclaration::max_lines(Some(1)))
+        .with(StyleDeclaration::text_overflow(TextOverflow::Ellipsis))
 }
 
 fn family(name: &str) -> FontFamily {
     FontFamily::from_names([name.to_owned()])
 }
 
-fn hairline() -> LineWidth {
-    LineWidth::Length(Length::Px(1.0))
+/// A rule at a configured width.
+///
+/// Takes its width because a cell's rule is configuration: the same function draws
+/// the hairline a dashboard gets by default and the heavier frame an author asked
+/// for. A width of zero is never passed here — a frameless cell writes no border
+/// declarations at all.
+fn rule_width(px: f32) -> LineWidth {
+    LineWidth::Length(Length::Px(px))
 }
 
 fn radius(diameter: f32) -> SpacePair<Length> {
@@ -1058,21 +1448,45 @@ impl Ink {
     }
 }
 
+/// One line of a multi-reading body, with how far its own value can be trusted.
+///
+/// The ink is per line rather than per cell, and that is the whole reason the type
+/// exists: a `list` is `n` independent sensors sharing a box, so one unreachable
+/// sensor mutes its own line and the lines around it stay black. A single cell-wide
+/// ink would throw away `n - 1` good readings in order to report one bad one.
+#[derive(Debug, Clone, PartialEq)]
+struct Line {
+    row: Row,
+    ink: Ink,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Body {
     /// A large figure with an optional unit.
     Figure { text: String, unit: Option<String> },
-    /// A weather condition: its icon, and its name underneath.
+    /// A weather condition: its glyph, the condition in words when the cell asked
+    /// for words, and any readings hung off the same entity.
     Sky {
         svg: &'static str,
-        condition: String,
+        condition: Option<String>,
+        rows: Vec<Line>,
     },
-    /// A two-state indicator.
-    Beacon { on: bool },
+    /// A two-state indicator: the icon configured for the state it is in, or a dot
+    /// when that state named none, captioned `ON`/`OFF` unless the cell asked for
+    /// the indicator alone.
+    Beacon {
+        on: bool,
+        icon: Option<Icon>,
+        text: bool,
+    },
     /// Free text, wrapped to the cell.
     Prose(String),
-    /// A small group of related readings.
-    Rows(Vec<Row>),
+    /// A small group of related readings, each trusted on its own.
+    Rows(Vec<Line>),
+    /// A sub-grid of widgets, and a marker only: a group's children are cells in
+    /// their own right, resolved and drawn by [`cell_node`], so there is nothing
+    /// here for [`body_nodes`] to build.
+    Group,
     /// Nothing has ever been pushed, or nothing has ever been read.
     ///
     /// Distinct from a held value, and the distinction is the point: "no data"
@@ -1081,10 +1495,19 @@ enum Body {
     Absent(&'static str),
 }
 
+/// Every kind is named rather than swept into a wildcard, so adding one is a
+/// compile error here instead of a cell that silently waits for a push that will
+/// never come.
 fn resolve(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
     match widget.kind {
-        WidgetKind::HaEntity | WidgetKind::Weather => resolve_ha(widget, inputs),
-        _ => resolve_pushed(widget, inputs),
+        // A group holds no reading of its own; its children are resolved
+        // individually, which is what `cell_node` does when it draws them.
+        WidgetKind::Group => Cell {
+            body: Body::Group,
+            ink: Ink::Current,
+        },
+        WidgetKind::HaEntity | WidgetKind::Weather | WidgetKind::List => resolve_ha(widget, inputs),
+        WidgetKind::Value | WidgetKind::Beacon | WidgetKind::Text => resolve_pushed(widget, inputs),
     }
 }
 
@@ -1109,31 +1532,90 @@ fn resolve_pushed(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
     // `rows` is a presentation override available to any kind: when it is present
     // the scalar `value` is ignored, which is what lets one widget show a small
     // group of related readings.
+    //
+    // Every row shares the record's trust, unlike a `list`'s. One push either
+    // arrived in time or did not: a pushed row names no source of its own, so there
+    // is nothing for it to be separately unreachable from.
     if let Some(rows) = &record.rows {
         return Cell {
-            body: Body::Rows(rows.clone()),
+            body: Body::Rows(
+                rows.iter()
+                    .map(|row| Line {
+                        row: rounded_row(row, widget.precision),
+                        ink,
+                    })
+                    .collect(),
+            ),
             ink,
         };
     }
 
     let body = match widget.kind {
         WidgetKind::Value => Body::Figure {
-            text: value_text(&record.value),
+            text: format_reading(&value_text(&record.value), widget.precision),
             unit: record.unit.clone().or_else(|| widget.unit.clone()),
         },
-        WidgetKind::Beacon => Body::Beacon {
-            on: beacon_is_on(record, &widget.on_values),
-        },
+        WidgetKind::Beacon => {
+            let on = beacon_is_on(record, &widget.on_values);
+            Body::Beacon {
+                on,
+                icon: beacon_icon(widget, on, inputs),
+                text: widget.state_text,
+            }
+        }
         WidgetKind::Text => Body::Prose(value_text(&record.value)),
-        WidgetKind::HaEntity | WidgetKind::Weather => unreachable!("handled by resolve_ha"),
+        WidgetKind::HaEntity | WidgetKind::Weather | WidgetKind::List => {
+            unreachable!("handled by resolve_ha")
+        }
+        WidgetKind::Group => unreachable!("handled by resolve"),
     };
     Cell { body, ink }
+}
+
+/// A pushed row with its value rounded to the widget's precision.
+///
+/// A publisher's row is a numeric reading like any other, so it goes through the one
+/// formatter rather than around it. With no precision configured — the default —
+/// [`format_reading`] hands the text back untouched, so a publisher's own digits
+/// survive unless somebody actually asked for rounding.
+fn rounded_row(row: &Row, precision: Option<u8>) -> Row {
+    Row {
+        // A row with no value at all keeps none, rather than becoming an empty
+        // string that would render as a label with a blank beside it.
+        value: row
+            .value
+            .as_ref()
+            .map(|value| serde_json::Value::String(format_reading(&value_text(value), precision))),
+        ..row.clone()
+    }
+}
+
+/// A beacon's indicator icon for the state it is currently in.
+///
+/// `None` when that state names no icon, and equally when it names one the icon
+/// store could not resolve. Both fall back to the dot, and that is what makes
+/// configuring `icon_on` alone legal: the on state gets its picture and the off
+/// state stays the hollow dot it has always been, rather than the cell losing its
+/// indicator entirely.
+fn beacon_icon(widget: &Widget, on: bool, inputs: &RenderInputs<'_>) -> Option<Icon> {
+    let spec = match on {
+        true => widget.icon_on.as_ref(),
+        false => widget.icon_off.as_ref(),
+    }?;
+    inputs.icons.get(spec).cloned()
 }
 
 /// A cell read from Home Assistant. A fetch failure degrades this cell only: the
 /// frame still renders, because one unreachable integration must not blank the
 /// dashboard.
 fn resolve_ha(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
+    // A list has no reading of its own — its body *is* its readings, each naming its
+    // own entity — so it resolves ahead of the entity check below, which it would
+    // otherwise fail for want of a widget-level entity it never needed.
+    if widget.kind == WidgetKind::List {
+        return resolve_list(widget, inputs);
+    }
+
     let Some(entity) = &widget.entity else {
         // Config validation rejects this, so it cannot happen from a config file.
         return Cell {
@@ -1141,10 +1623,7 @@ fn resolve_ha(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
             ink: Ink::Current,
         };
     };
-    let reading = match &widget.attribute {
-        Some(attribute) => Reading::attribute(entity, attribute),
-        None => Reading::state(entity),
-    };
+    let reading = ha_reading(entity, widget.attribute.as_deref());
 
     let (value, ink) = match inputs.ha_states.get(&reading) {
         Some(Reported::Fresh(value)) => (value.as_str(), Ink::Current),
@@ -1164,25 +1643,150 @@ fn resolve_ha(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
         }
     };
 
+    // Empty for every kind but `weather`, and cheap when it is: an empty `Vec` does
+    // not allocate.
+    let rows = lines(&widget.readings, inputs);
+    // A weather cell's condition may be current while a reading beside it is held,
+    // so the cell's mark is decided over both. Per-line muting says which line is
+    // stale; the mark is what a viewer scanning the whole dashboard sees first.
+    let ink = held_over(ink, &rows);
+
     let body = match widget.kind {
-        WidgetKind::Weather => match icon::Condition::parse(value) {
-            Some(condition) => Body::Sky {
-                svg: condition.svg(),
-                condition: condition.label().to_owned(),
-            },
-            // An unrecognised condition still shows what Home Assistant said,
-            // because a new condition slug is a thing to notice rather than hide.
-            None => Body::Sky {
-                svg: icon::UNKNOWN_SKY,
-                condition: value.to_owned(),
-            },
-        },
+        WidgetKind::Weather => {
+            let (svg, label) = match icon::Condition::parse(value) {
+                Some(condition) => (condition.svg(), condition.label().to_owned()),
+                // An unrecognised condition still shows what Home Assistant said,
+                // because a new condition slug is a thing to notice rather than hide.
+                None => (icon::UNKNOWN_SKY, value.to_owned()),
+            };
+            Body::Sky {
+                svg,
+                condition: widget.state_text.then_some(label),
+                rows,
+            }
+        }
         _ => Body::Figure {
-            text: value.to_owned(),
+            text: format_reading(value, widget.precision),
             unit: widget.unit.clone(),
         },
     };
     Cell { body, ink }
+}
+
+/// A cell whose body is its configured readings, one line each.
+///
+/// Every line is trusted on its own, which is the feature: a reading the last
+/// request could not confirm is muted where it stands, one that was never read shows
+/// an em dash, and the lines around either of them stay black. Muting the whole cell
+/// because one sensor is unreachable would throw away the readings the panel does
+/// still have.
+fn resolve_list(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
+    if widget.readings.is_empty() {
+        // Config validation rejects this, so it cannot happen from a config file.
+        return Cell {
+            body: Body::Absent("no readings"),
+            ink: Ink::Current,
+        };
+    }
+    let rows = lines(&widget.readings, inputs);
+    let ink = held_over(Ink::Current, &rows);
+    Cell {
+        body: Body::Rows(rows),
+        ink,
+    }
+}
+
+/// Every configured reading of a cell, resolved to lines in the order written.
+fn lines(readings: &[crate::config::Reading], inputs: &RenderInputs<'_>) -> Vec<Line> {
+    readings
+        .iter()
+        .map(|reading| reading_line(reading, inputs))
+        .collect()
+}
+
+/// One configured reading as a line, carrying how far its own value can be trusted.
+///
+/// A reading nothing was ever read for keeps its label and its place with a null
+/// value, which renders as an em dash: the cell still lists what it is meant to
+/// have, and says of that one line that it does not know. Dropping the line instead
+/// would silently shorten the list, and a short list reads as configuration rather
+/// than as a failure.
+fn reading_line(reading: &crate::config::Reading, inputs: &RenderInputs<'_>) -> Line {
+    let key = ha_reading(&reading.entity, reading.attribute.as_deref());
+    let (value, unit, ink) = match inputs.ha_states.get(&key) {
+        Some(Reported::Fresh(text)) => (
+            serde_json::Value::String(format_reading(text, reading.precision)),
+            reading.unit.clone(),
+            Ink::Current,
+        ),
+        Some(Reported::Held(text)) => (
+            serde_json::Value::String(format_reading(text, reading.precision)),
+            reading.unit.clone(),
+            Ink::Held,
+        ),
+        // The unit goes with the value it qualified. `— °C` claims a reading in
+        // degrees that nobody has.
+        Some(Reported::Lost) | None => (serde_json::Value::Null, None, Ink::Held),
+    };
+    Line {
+        row: Row {
+            id: None,
+            label: reading.label.clone(),
+            value: Some(value),
+            unit,
+            state: None,
+        },
+        ink,
+    }
+}
+
+/// The Home Assistant reading an entity and an optional attribute name.
+///
+/// One function so that a widget's own reading, a `list` row's and a weather cell's
+/// extra readings are all looked up under the same key. A second spelling of this
+/// arithmetic is a cell reading `no data` because it asked the map a question the
+/// fetcher never answered.
+fn ha_reading(entity: &str, attribute: Option<&str>) -> Reading {
+    match attribute {
+        Some(attribute) => Reading::attribute(entity, attribute),
+        None => Reading::state(entity),
+    }
+}
+
+/// A cell's ink, given its own reading's and its lines'.
+///
+/// [`Ink::Held`] wins. The corner mark means "something in this cell is not
+/// confirmed current", and that is true the moment one line is holding or missing a
+/// value, however black the rest of the cell is.
+fn held_over(own: Ink, lines: &[Line]) -> Ink {
+    match own == Ink::Held || lines.iter().any(|line| line.ink == Ink::Held) {
+        true => Ink::Held,
+        false => Ink::Current,
+    }
+}
+
+/// A reading's text at a configured number of decimal places.
+///
+/// The one place rounding happens, so that a widget's `precision`, a device's
+/// default and a single reading's override cannot come to mean three slightly
+/// different things in three cells.
+///
+/// `None` hands the text back untouched, and so does anything that does not parse as
+/// a number. That fallthrough is the whole subtlety: a Home Assistant state is a
+/// string that merely happens to be numeric most of the time, so `unavailable`,
+/// `partlycloudy` and a publisher's `23.4 °C` all arrive here and all have to
+/// survive verbatim. Refusing to render them would turn a cosmetic setting into a
+/// blank cell, and coercing them to `0.0` would be worse still — a number on the
+/// glass that no sensor ever reported, and one that looks exactly like a reading.
+fn format_reading(text: &str, precision: Option<u8>) -> String {
+    let Some(places) = precision else {
+        return text.to_owned();
+    };
+    let Ok(number) = text.trim().parse::<f64>() else {
+        return text.to_owned();
+    };
+    let places = places as usize;
+    format!("{number:.places$}")
 }
 
 /// Whether a pushed record is older than its widget's `stale_after`.
@@ -1239,7 +1843,7 @@ fn truncate(text: &str, chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::DEFAULT_MAX_FRAME_BYTES;
-    use crate::config::{Grid, Palette};
+    use crate::config::{Chrome, Grid, Group, Palette};
     use std::sync::LazyLock;
     use time::Duration;
 
@@ -1248,6 +1852,7 @@ mod tests {
     static FONTS: LazyLock<Fonts> = LazyLock::new(|| fonts().expect("embedded fonts must load"));
 
     fn device(widgets: Vec<Widget>) -> Device {
+        const GRID: Grid = Grid { cols: 2, rows: 2 };
         Device {
             id: "kindle".to_owned(),
             width: 400,
@@ -1257,7 +1862,9 @@ mod tests {
             refresh_rate: 300,
             render_interval: 300,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
-            grid: Grid { cols: 2, rows: 2 },
+            grid: GRID,
+            chrome: Chrome::derived(400, 300, GRID),
+            status_bar: None,
             widgets,
         }
     }
@@ -1272,11 +1879,17 @@ mod tests {
             row_span: 1,
             label: Some(id.to_owned()),
             unit: None,
+            precision: None,
+            state_text: true,
             stale_after: 0,
             entity: None,
             attribute: None,
             on_values: vec!["on".to_owned(), "true".to_owned(), "alert".to_owned()],
             icon: None,
+            icon_on: None,
+            icon_off: None,
+            readings: Vec::new(),
+            group: None,
             tap: None,
         }
     }
@@ -1321,6 +1934,7 @@ mod tests {
                 ha_states,
                 icons,
                 now: now(),
+                telemetry: &Telemetry::default(),
             },
         )
         .expect("frame should render")
@@ -1337,8 +1951,57 @@ mod tests {
                 ha_states,
                 icons: &HashMap::new(),
                 now: now(),
+                telemetry: &Telemetry::default(),
             },
         )
+    }
+
+    /// The cell one widget resolves to, given pushed content and resolved icons.
+    fn resolved_push(
+        widget: &Widget,
+        content: &HashMap<String, ContentRecord>,
+        icons: &HashMap<String, Icon>,
+    ) -> Cell {
+        let device = device(vec![widget.clone()]);
+        resolve(
+            widget,
+            &RenderInputs {
+                device: &device,
+                content,
+                ha_states: &HashMap::new(),
+                icons,
+                now: now(),
+                telemetry: &Telemetry::default(),
+            },
+        )
+    }
+
+    /// One configured reading, as a `list` or a `weather` cell hangs off it.
+    fn reading(label: &str, entity: &str, attribute: Option<&str>) -> crate::config::Reading {
+        crate::config::Reading {
+            label: Some(label.to_owned()),
+            entity: entity.to_owned(),
+            attribute: attribute.map(str::to_owned),
+            unit: Some("\u{b0}C".to_owned()),
+            precision: Some(1),
+        }
+    }
+
+    /// One resolved line, spelt the way `resolve` builds it.
+    ///
+    /// Not called `line`: the module already has a `line` for grid placement, and a
+    /// test helper shadowing it is a trap for whoever writes the next placement test.
+    fn resolved_line(label: &str, value: serde_json::Value, unit: Option<&str>, ink: Ink) -> Line {
+        Line {
+            row: Row {
+                id: None,
+                label: Some(label.to_owned()),
+                value: Some(value),
+                unit: unit.map(str::to_owned),
+                state: None,
+            },
+            ink,
+        }
     }
 
     fn dimensions(png: &[u8]) -> (u32, u32) {
@@ -1466,6 +2129,7 @@ mod tests {
                 ha_states: &HashMap::new(),
                 icons: &HashMap::new(),
                 now: now(),
+                telemetry: &Telemetry::default(),
             },
         );
         assert_eq!(
@@ -1672,7 +2336,8 @@ mod tests {
             Cell {
                 body: Body::Sky {
                     svg: icon::Condition::PartlyCloudy.svg(),
-                    condition: "Partly cloudy".to_owned(),
+                    condition: Some("Partly cloudy".to_owned()),
+                    rows: Vec::new(),
                 },
                 ink: Ink::Current,
             }
@@ -1689,7 +2354,8 @@ mod tests {
             Cell {
                 body: Body::Sky {
                     svg: icon::UNKNOWN_SKY,
-                    condition: "meteor-shower".to_owned(),
+                    condition: Some("meteor-shower".to_owned()),
+                    rows: Vec::new(),
                 },
                 ink: Ink::Current,
             }
@@ -1807,6 +2473,7 @@ mod tests {
             ha_states: ha,
             icons: &HashMap::new(),
             now: now(),
+            telemetry: &Telemetry::default(),
         };
         let raster = rasterise(
             &FONTS,
@@ -1835,11 +2502,17 @@ mod tests {
     }
 
     /// The panel in service: a 6-inch Kindle Paperwhite, landscape, on a 4x3 grid.
+    ///
+    /// `chrome` is re-derived rather than inherited from [`device`]: it is scaled to
+    /// the cell, so a device that overrides the dimensions and the grid but keeps the
+    /// 400x300 spacing is testing a dashboard no configuration can produce.
     fn panel(widgets: Vec<Widget>) -> Device {
+        const GRID: Grid = Grid { cols: 4, rows: 3 };
         Device {
             width: 1448,
             height: 1072,
-            grid: Grid { cols: 4, rows: 3 },
+            grid: GRID,
+            chrome: Chrome::derived(1448, 1072, GRID),
             ..device(widgets)
         }
     }
@@ -2044,6 +2717,7 @@ mod tests {
                     ha_states: &ha,
                     icons: &HashMap::new(),
                     now: now(),
+                    telemetry: &Telemetry::default(),
                 }
             ),
             Cell {
@@ -2094,10 +2768,12 @@ mod tests {
                 widgets.push(w);
             }
         }
+        const GRID: Grid = Grid { cols: 4, rows: 3 };
         let device = Device {
             width: 1024,
             height: 758,
-            grid: Grid { cols: 4, rows: 3 },
+            grid: GRID,
+            chrome: Chrome::derived(1024, 758, GRID),
             ..device(widgets)
         };
         let mut content = HashMap::new();
@@ -2179,5 +2855,868 @@ mod tests {
     fn truncates_an_over_long_device_id() {
         assert_eq!(truncate("short", 64), "short");
         assert_eq!(truncate("abcdef", 3), "abc\u{2026}");
+    }
+
+    /// The palette's top level: paper, on a 16-level greyscale panel.
+    const PAPER: u8 = 15;
+
+    /// The frame's palette levels, one per pixel, read back out of the encoded PNG.
+    ///
+    /// Read off the frame the panel is actually handed rather than tapped out of the
+    /// rasteriser, and exact rather than approximate: a 16-level greyscale panel
+    /// rendered with [`Dither::None`] maps paper onto the top level and a cell's rule
+    /// onto the level nearest its grey, so a probe distinguishes the two with no
+    /// tolerance to tune.
+    fn greys(png: &[u8]) -> (u32, u32, Vec<u8>) {
+        let decoder = png::Decoder::new(std::io::Cursor::new(png));
+        let mut reader = decoder.read_info().expect("should be a PNG");
+        assert_eq!(
+            reader.info().bit_depth,
+            png::BitDepth::Four,
+            "these probes read a 16-level greyscale frame"
+        );
+        let mut packed = vec![0; reader.output_buffer_size().expect("a bounded frame")];
+        let info = reader.next_frame(&mut packed).expect("frame should decode");
+
+        // Two pixels per byte, leftmost in the high nibble, every row padded to a byte
+        // boundary — so the row stride is read from the decoder rather than computed
+        // from the width.
+        let mut levels = Vec::with_capacity((info.width * info.height) as usize);
+        for y in 0..info.height as usize {
+            let row = &packed[y * info.line_size..][..info.line_size];
+            for x in 0..info.width as usize {
+                levels.push(if x % 2 == 0 {
+                    row[x / 2] >> 4
+                } else {
+                    row[x / 2] & 0x0F
+                });
+            }
+        }
+        (info.width, info.height, levels)
+    }
+
+    /// Whether anything inside a rect is darker than paper.
+    fn inked(levels: &[u8], width: u32, rect: (f32, f32, f32, f32)) -> bool {
+        let (x, y, w, h) = rect;
+        let (x0, y0) = (x.max(0.0) as u32, y.max(0.0) as u32);
+        let (x1, y1) = ((x + w).ceil() as u32, (y + h).ceil() as u32);
+        (y0..y1).any(|y| {
+            (x0..x1).any(|x| {
+                let index = (y * width + x) as usize;
+                index < levels.len() && levels[index] < PAPER
+            })
+        })
+    }
+
+    /// How many separate runs of ink cross the one-pixel band at `y`, between `x0`
+    /// and `x1`.
+    ///
+    /// Aimed at a row of cells' top rules, where it counts the cells themselves
+    /// rather than standing in for them: a cell's content sits a padding inside its
+    /// own rule, so that row holds the rules and nothing else. The band covers every
+    /// row the rule can touch, which is two of them when it falls at a fractional
+    /// offset and is antialiased across both.
+    fn rule_runs(levels: &[u8], width: u32, y: f32, x0: f32, x1: f32) -> usize {
+        let band = y.floor() as u32..(y + 1.0).ceil() as u32;
+        let mut runs = 0;
+        let mut inside = false;
+        for x in x0.floor() as u32..x1.ceil() as u32 {
+            let ink = band
+                .clone()
+                .any(|y| levels[(y * width + x) as usize] < PAPER);
+            runs += usize::from(ink && !inside);
+            inside = ink;
+        }
+        runs
+    }
+
+    /// A 2x1 group filling the panel's top-left slot, its two children each holding
+    /// a pushed reading.
+    ///
+    /// `title` is the *group's* own label. The children always carry theirs, because
+    /// a child of a group is an ordinary cell and draws its own header.
+    fn grouped_panel(title: Option<&str>) -> (Device, HashMap<String, ContentRecord>) {
+        let mut group = widget("indoors", WidgetKind::Group, 0, 0);
+        group.label = title.map(str::to_owned);
+        group.group = Some(Group {
+            grid: Grid { cols: 2, rows: 1 },
+            widgets: vec![
+                widget("left", WidgetKind::Value, 0, 0),
+                widget("right", WidgetKind::Value, 1, 0),
+            ],
+        });
+        let device = Device {
+            // Both dithering modes texture flat tone, which is exactly what these
+            // probes measure. Without dithering paper stays paper and a rule stays a
+            // rule, everywhere.
+            dither: Dither::None,
+            ..panel(vec![group])
+        };
+        let content = HashMap::from([
+            ("left".to_owned(), record(serde_json::json!("21.4"), now())),
+            ("right".to_owned(), record(serde_json::json!("48"), now())),
+        ]);
+        (device, content)
+    }
+
+    #[test]
+    fn a_group_draws_one_cell_per_child_where_sub_layout_puts_it() {
+        // Asserted against `sub_layout` because the renderer and the tap hit test read
+        // it as one answer: if a child's cell were drawn anywhere other than the rect
+        // `sub_layout` reports, a finger over one reading would fire another's action.
+        let (device, content) = grouped_panel(None);
+        let (width, _, levels) = greys(&render(&device, &content));
+
+        let group = &device.widgets[0];
+        let sub = Layout::for_device(&device)
+            .sub_layout(group)
+            .expect("a group has a sub-layout");
+        let children = &group.group.as_ref().expect("the group is set").widgets;
+
+        // Each child's own content box, not merely its rect: a rect holds the child's
+        // rule whether or not anything was drawn inside it, so probing the rect would
+        // pass on a row of empty boxes.
+        let inset = sub.padding() + sub.border();
+        for child in children {
+            let (x, y, w, h) = sub.rect(child);
+            let content = (x + inset, y + inset, w - inset * 2.0, h - inset * 2.0);
+            assert!(
+                inked(&levels, width, content),
+                "child `{}` drew nothing inside {content:?}",
+                child.id
+            );
+        }
+
+        // Two cells side by side rather than one box holding two readings: the gutter
+        // between them is untouched, and the row of their top rules crosses ink
+        // exactly twice.
+        let (x, y, w, h) = sub.rect(&children[0]);
+        let gutter = sub.gutter();
+        assert!(
+            !inked(&levels, width, (x + w + 2.0, y, gutter - 4.0, h)),
+            "the gutter between two children must stay paper"
+        );
+        assert_eq!(
+            rule_runs(&levels, width, y, x, x + w + gutter + w),
+            2,
+            "a 2x1 group must draw two child cells, edge to edge across its content box"
+        );
+    }
+
+    #[test]
+    fn a_titled_group_draws_its_own_header_across_its_children() {
+        // A group is a cell, so it can be titled like one. The gutter between its
+        // children is what proves the header is the group's own and not a child's: the
+        // title spans the whole content box and crosses that gutter, which nothing
+        // inside a child can reach.
+        let (untitled, content) = grouped_panel(None);
+        let (titled, _) = grouped_panel(Some("INDOORS AND OUT"));
+
+        let group = &untitled.widgets[0];
+        let sub = Layout::for_device(&untitled)
+            .sub_layout(group)
+            .expect("a group has a sub-layout");
+        let children = &group.group.as_ref().expect("the group is set").widgets;
+        let (x, y, w, h) = sub.rect(&children[0]);
+        // The gutter between the two children, clear of both their rules. Nothing
+        // inside a child can reach it, so ink here is the group's own.
+        let between = (x + w + 2.0, y, sub.gutter() - 4.0, h);
+
+        let (width, _, plain) = greys(&render(&untitled, &content));
+        assert!(
+            !inked(&plain, width, between),
+            "an untitled group draws no header, so its gutter is paper"
+        );
+
+        let (_, _, headed) = greys(&render(&titled, &content));
+        assert!(
+            inked(&headed, width, between),
+            "a titled group must draw its own header, spanning its children"
+        );
+    }
+
+    #[test]
+    fn a_zero_border_draws_no_rules() {
+        // A frameless dashboard has to be the *absence* of the border declarations. A
+        // zero-width solid edge still costs the layout engine a pass on each of the
+        // four sides, and `border = 0` is an author asking for bare readings rather
+        // than for a rule nobody can see.
+        let framed = Device {
+            dither: Dither::None,
+            ..device(vec![widget("a", WidgetKind::Value, 0, 0)])
+        };
+        let frameless = Device {
+            chrome: Chrome {
+                border: 0.0,
+                ..framed.chrome
+            },
+            ..framed.clone()
+        };
+        let content = HashMap::from([("a".to_owned(), record(serde_json::json!("21.4"), now()))]);
+
+        // The cell's top edge, which a rule traces corner to corner and nothing else
+        // reaches: a cell's content sits a padding inside it.
+        let (x, y, w, h) = Layout::for_device(&framed).rect(&framed.widgets[0]);
+        let edge = (x + 2.0, y, w - 4.0, 1.0);
+
+        let (width, _, ruled) = greys(&render(&framed, &content));
+        assert!(
+            inked(&ruled, width, edge),
+            "a cell's rule must trace its top edge"
+        );
+
+        let (width, _, bare) = greys(&render(&frameless, &content));
+        assert!(
+            !inked(&bare, width, edge),
+            "a zero border must draw nothing at all"
+        );
+        // And the cell still has its label and its reading in it, so the assertion
+        // above cannot be passing on a blank frame.
+        assert!(
+            inked(&bare, width, (x, y, w, h)),
+            "a frameless cell must still draw its contents"
+        );
+    }
+
+    #[test]
+    fn a_status_bar_takes_its_edge_and_leaves_the_grid_the_rest() {
+        use crate::config::{StatusBar, StatusField};
+        use time::UtcOffset;
+
+        // All four edges, because the edge decides both the flex axis and which of
+        // the bar and the grid comes first. Getting the order backwards draws the bar
+        // over the grid's first row, which on the glass looks exactly like a bar that
+        // simply did not render.
+        for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+            let mut barred = Device {
+                dither: Dither::None,
+                status_bar: Some(StatusBar {
+                    edge,
+                    thickness: 24,
+                    fields: vec![StatusField::Device, StatusField::Refresh],
+                    utc_offset: UtcOffset::UTC,
+                }),
+                ..device(vec![widget("a", WidgetKind::Value, 0, 0)])
+            };
+            // Spacing comes off the grid *area* and not the frame, which is how
+            // `validate_device` derives it once the bar's strip is subtracted. A
+            // fixture that kept the frame's spacing would be a dashboard no config
+            // file can produce, and its cells a gap away from where they belong.
+            let (_, _, area_w, area_h) = barred.grid_area();
+            barred.chrome = Chrome::derived(area_w, area_h, barred.grid);
+            let content =
+                HashMap::from([("a".to_owned(), record(serde_json::json!("21.4"), now()))]);
+
+            let png = render(&barred, &content);
+            assert_eq!(
+                dimensions(&png),
+                (barred.width, barred.height),
+                "a {edge} bar must not change the frame's size"
+            );
+            let (width, _, levels) = greys(&png);
+
+            // The strip inks, and only the bar can have inked it: the grid area starts
+            // where the strip ends, and a cell's own rule is a gutter inside that.
+            let (bx, by, bw, bh) = barred.status_bar_area().expect("this device has a bar");
+            assert!(
+                inked(&levels, width, (bx as f32, by as f32, bw as f32, bh as f32)),
+                "the {edge} bar must draw inside its own strip"
+            );
+
+            // And the grid moved out of its way rather than under it.
+            let (x, y, w, h) = Layout::for_device(&barred).rect(&barred.widgets[0]);
+            let (gx, gy, gw, gh) = barred.grid_area();
+            assert!(
+                x >= gx as f32
+                    && y >= gy as f32
+                    && x + w <= (gx + gw) as f32
+                    && y + h <= (gy + gh) as f32,
+                "a {edge} bar must shrink the grid, not overlap it: cell at \
+                 ({x}, {y}, {w}, {h}) against area ({gx}, {gy}, {gw}, {gh})"
+            );
+            assert!(
+                inked(&levels, width, (x, y, w, h)),
+                "the cell beside the {edge} bar must still draw its contents"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_without_a_status_bar_places_its_grid_exactly_as_before() {
+        // The barless frame is now a grid inside a wrapper rather than a grid at the
+        // root, and it has to be the same frame down to the pixel: the panel caches
+        // frames by their hash, so a wrapper that nudged the grid would repaint every
+        // device in service for a change nobody asked for and nobody can see.
+        let bare = Device {
+            dither: Dither::None,
+            ..device(vec![widget("a", WidgetKind::Value, 0, 0)])
+        };
+        assert_eq!(
+            bare.grid_area(),
+            (0, 0, bare.width, bare.height),
+            "with no bar the grid is the whole frame"
+        );
+
+        let content = HashMap::from([("a".to_owned(), record(serde_json::json!("21.4"), now()))]);
+        let (width, _, levels) = greys(&render(&bare, &content));
+
+        // The cell's top rule traces the rect the layout places it at, and nothing
+        // else reaches that line — a cell's content sits a padding inside its own
+        // rule. Had the wrapper shifted the grid, the row above would be the inked one.
+        let (x, y, w, _) = Layout::for_device(&bare).rect(&bare.widgets[0]);
+        assert!(
+            inked(&levels, width, (x + 2.0, y, w - 4.0, 1.0)),
+            "the cell's rule must still trace the top edge the layout gives it"
+        );
+        assert!(
+            !inked(&levels, width, (x + 2.0, y - 2.0, w - 4.0, 1.0)),
+            "and the row above it must be blank: the wrapper moved nothing"
+        );
+    }
+
+    #[test]
+    fn precision_rounds_a_number_and_leaves_anything_else_alone() {
+        // One formatter for every reading on the dashboard, so the same `precision`
+        // cannot come to mean two things in two cells.
+        assert_eq!(format_reading("21.456", None), "21.456");
+        assert_eq!(format_reading("21.456", Some(1)), "21.5");
+        assert_eq!(format_reading("21.456", Some(0)), "21");
+        // Padded when the source carries fewer digits than were asked for, so a
+        // value walking between 21 and 21.05 does not change width under the eye.
+        assert_eq!(format_reading("21", Some(2)), "21.00");
+        assert_eq!(format_reading("-3.75", Some(1)), "-3.8");
+        assert_eq!(format_reading(" 4.2 ", Some(1)), "4.2");
+
+        // The fallthrough that matters: a Home Assistant state is a string that
+        // merely happens to be numeric most of the time, and every one of these
+        // reaches the formatter on a cell whose author set a precision.
+        assert_eq!(format_reading("partlycloudy", Some(1)), "partlycloudy");
+        assert_eq!(format_reading("unavailable", Some(2)), "unavailable");
+        assert_eq!(
+            format_reading("23.4 \u{b0}C", Some(1)),
+            "23.4 \u{b0}C",
+            "a value carrying its own unit is not a number"
+        );
+        assert_eq!(format_reading("", Some(2)), "");
+    }
+
+    #[test]
+    fn a_configured_precision_reaches_both_reading_paths() {
+        // Pushed and read are two functions, and a formatter applied in only one of
+        // them is a dashboard where `precision` works on some cells and not others.
+        let pushed = Widget {
+            precision: Some(1),
+            ..widget("a", WidgetKind::Value, 0, 0)
+        };
+        let content = HashMap::from([("a".to_owned(), record(serde_json::json!("21.456"), now()))]);
+        assert_eq!(
+            resolved_push(&pushed, &content, &HashMap::new()).body,
+            Body::Figure {
+                text: "21.5".to_owned(),
+                unit: None,
+            }
+        );
+
+        let read = Widget {
+            precision: Some(1),
+            ..ha_widget("temp", "sensor.office", WidgetKind::HaEntity)
+        };
+        let ha = HashMap::from([(
+            Reading::state("sensor.office"),
+            Reported::Fresh("21.456".to_owned()),
+        )]);
+        assert_eq!(
+            resolved(&read, &ha).body,
+            Body::Figure {
+                text: "21.5".to_owned(),
+                unit: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_beacon_without_state_text_keeps_the_indicator_and_drops_the_word() {
+        let captioned = widget("a", WidgetKind::Beacon, 0, 0);
+        let bare = Widget {
+            state_text: false,
+            ..captioned.clone()
+        };
+        let content = HashMap::from([("a".to_owned(), record(serde_json::json!("on"), now()))]);
+
+        assert_eq!(
+            resolved_push(&captioned, &content, &HashMap::new()).body,
+            Body::Beacon {
+                on: true,
+                icon: None,
+                text: true,
+            }
+        );
+        assert_eq!(
+            resolved_push(&bare, &content, &HashMap::new()).body,
+            Body::Beacon {
+                on: true,
+                icon: None,
+                text: false,
+            }
+        );
+    }
+
+    #[test]
+    fn an_uncaptioned_beacon_takes_the_cell_the_caption_would_have_had() {
+        // Measured in pixels because the resolved body cannot say it: dropping the
+        // word alone would leave the indicator at the size it had while it was
+        // sharing the width, and a third of the cell blank beside it.
+        let captioned = widget("a", WidgetKind::Beacon, 0, 0);
+        let bare = Widget {
+            state_text: false,
+            ..captioned.clone()
+        };
+        let content = HashMap::from([("a".to_owned(), record(serde_json::json!("on"), now()))]);
+        let with_word = panel(vec![captioned]);
+        let without = panel(vec![bare]);
+
+        let (_, shorter) = cell_fill(&with_word, "a", &content, &HashMap::new());
+        let (_, taller) = cell_fill(&without, "a", &content, &HashMap::new());
+        assert!(
+            taller > shorter * 1.1,
+            "the uncaptioned indicator must grow into the space the word had: \
+             {taller:.2} of the height against {shorter:.2}"
+        );
+    }
+
+    #[test]
+    fn a_weather_cell_can_stand_without_its_condition_in_words() {
+        let captioned = ha_widget("sky", "weather.braga", WidgetKind::Weather);
+        let bare = Widget {
+            state_text: false,
+            ..captioned.clone()
+        };
+        let ha = HashMap::from([(
+            Reading::state("weather.braga"),
+            Reported::Fresh("partlycloudy".to_owned()),
+        )]);
+
+        assert_eq!(
+            resolved(&captioned, &ha).body,
+            Body::Sky {
+                svg: icon::Condition::PartlyCloudy.svg(),
+                condition: Some("Partly cloudy".to_owned()),
+                rows: Vec::new(),
+            }
+        );
+        assert_eq!(
+            resolved(&bare, &ha).body,
+            Body::Sky {
+                svg: icon::Condition::PartlyCloudy.svg(),
+                condition: None,
+                rows: Vec::new(),
+            },
+            "the glyph is the reading, so it stands on its own"
+        );
+    }
+
+    #[test]
+    fn a_beacon_draws_its_state_icon_and_falls_back_to_the_dot_without_one() {
+        // Configuring `icon_on` alone is legal, which is the point of the fallback:
+        // the on state gets its picture and the off state stays the hollow dot,
+        // rather than the cell losing its indicator half the time.
+        let w = Widget {
+            icon_on: Some("mdi-lightbulb-on".to_owned()),
+            ..widget("a", WidgetKind::Beacon, 0, 0)
+        };
+        let bulb = Icon::Svg {
+            markup: r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="9"/></svg>"#
+                .to_owned(),
+            ink: None,
+        };
+        let icons = HashMap::from([("mdi-lightbulb-on".to_owned(), bulb.clone())]);
+        let on = HashMap::from([("a".to_owned(), record(serde_json::json!("on"), now()))]);
+        let off = HashMap::from([("a".to_owned(), record(serde_json::json!("off"), now()))]);
+
+        assert_eq!(
+            resolved_push(&w, &on, &icons).body,
+            Body::Beacon {
+                on: true,
+                icon: Some(bulb),
+                text: true,
+            }
+        );
+        assert_eq!(
+            resolved_push(&w, &off, &icons).body,
+            Body::Beacon {
+                on: false,
+                icon: None,
+                text: true,
+            },
+            "the off state configured no icon, so it stays a dot"
+        );
+        // A spec the icon store could not resolve falls back the same way: an
+        // unreachable icon host must not cost the cell its indicator.
+        assert_eq!(
+            resolved_push(&w, &on, &HashMap::new()).body,
+            Body::Beacon {
+                on: true,
+                icon: None,
+                text: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_weather_cell_carries_its_own_readings_beside_the_condition() {
+        // The attributes a `weather.*` entity's state does not carry: the condition is
+        // a word, and the temperature and humidity hang off the same entity.
+        let w = Widget {
+            readings: vec![
+                reading("Temp", "weather.braga", Some("temperature")),
+                crate::config::Reading {
+                    unit: Some("%".to_owned()),
+                    precision: Some(0),
+                    ..reading("Humidity", "weather.braga", Some("humidity"))
+                },
+            ],
+            ..ha_widget("sky", "weather.braga", WidgetKind::Weather)
+        };
+        let ha = HashMap::from([
+            (
+                Reading::state("weather.braga"),
+                Reported::Fresh("sunny".to_owned()),
+            ),
+            (
+                Reading::attribute("weather.braga", "temperature"),
+                Reported::Fresh("23.456".to_owned()),
+            ),
+            (
+                Reading::attribute("weather.braga", "humidity"),
+                Reported::Fresh("61.8".to_owned()),
+            ),
+        ]);
+
+        assert_eq!(
+            resolved(&w, &ha),
+            Cell {
+                body: Body::Sky {
+                    svg: icon::Condition::Sunny.svg(),
+                    condition: Some("Sunny".to_owned()),
+                    rows: vec![
+                        resolved_line(
+                            "Temp",
+                            serde_json::json!("23.5"),
+                            Some("\u{b0}C"),
+                            Ink::Current
+                        ),
+                        resolved_line("Humidity", serde_json::json!("62"), Some("%"), Ink::Current),
+                    ],
+                },
+                ink: Ink::Current,
+            }
+        );
+    }
+
+    #[test]
+    fn a_list_mutes_only_the_reading_it_could_not_get() {
+        // The whole point of a per-line ink: one unreachable sensor must not take the
+        // two working readings beside it off the glass.
+        let w = Widget {
+            readings: vec![
+                reading("Office", "sensor.office", None),
+                reading("Hall", "sensor.hall", None),
+                reading("Shed", "sensor.shed", None),
+            ],
+            ..widget("rooms", WidgetKind::List, 0, 0)
+        };
+        let ha = HashMap::from([
+            (
+                Reading::state("sensor.office"),
+                Reported::Fresh("21.44".to_owned()),
+            ),
+            (
+                Reading::state("sensor.hall"),
+                Reported::Fresh("19.0".to_owned()),
+            ),
+            (Reading::state("sensor.shed"), Reported::Lost),
+        ]);
+
+        assert_eq!(
+            resolved(&w, &ha),
+            Cell {
+                body: Body::Rows(vec![
+                    resolved_line(
+                        "Office",
+                        serde_json::json!("21.4"),
+                        Some("\u{b0}C"),
+                        Ink::Current
+                    ),
+                    resolved_line(
+                        "Hall",
+                        serde_json::json!("19.0"),
+                        Some("\u{b0}C"),
+                        Ink::Current
+                    ),
+                    // The lost reading keeps its label and its place. Its value is
+                    // null, which renders as an em dash, and its unit goes with the
+                    // value it qualified — `— °C` would claim a reading in degrees
+                    // that nobody has.
+                    resolved_line("Shed", serde_json::Value::Null, None, Ink::Held),
+                ]),
+                // Marked, because one line in this cell is not confirmed current.
+                ink: Ink::Held,
+            }
+        );
+    }
+
+    #[test]
+    fn a_list_renders_a_frame_with_a_reading_it_could_not_get() {
+        // The resolved cell says the right thing; this says the em-dash path actually
+        // rasterises, which is the half a `Cell` assertion cannot reach.
+        let w = Widget {
+            readings: vec![
+                reading("Office", "sensor.office", None),
+                reading("Shed", "sensor.shed", None),
+            ],
+            ..widget("rooms", WidgetKind::List, 0, 0)
+        };
+        let device = device(vec![w]);
+        let partial = HashMap::from([
+            (
+                Reading::state("sensor.office"),
+                Reported::Fresh("21.4".to_owned()),
+            ),
+            (Reading::state("sensor.shed"), Reported::Lost),
+        ]);
+        let whole = HashMap::from([
+            (
+                Reading::state("sensor.office"),
+                Reported::Fresh("21.4".to_owned()),
+            ),
+            (
+                Reading::state("sensor.shed"),
+                Reported::Fresh("8.2".to_owned()),
+            ),
+        ]);
+
+        let degraded = render_with(&device, &HashMap::new(), &partial, &HashMap::new());
+        assert_eq!(dimensions(&degraded), (400, 300));
+        assert_ne!(
+            degraded,
+            render_with(&device, &HashMap::new(), &whole, &HashMap::new()),
+            "a reading that could not be got must be visibly distinct from one that could"
+        );
+    }
+
+    #[test]
+    fn a_group_resolves_to_a_marker_with_no_body_of_its_own() {
+        // The body is deliberately empty: `cell_node` draws a group's children, and a
+        // body node here would take a share of the box they are laid out in.
+        let w = widget("box", WidgetKind::Group, 0, 0);
+        assert_eq!(
+            resolved(&w, &HashMap::new()),
+            Cell {
+                body: Body::Group,
+                ink: Ink::Current,
+            }
+        );
+        assert!(
+            body_nodes(&FONTS, &Body::Group, Ink::Current, 200.0, 200.0, 14.0).is_empty(),
+            "a group's cell has no body of its own to draw"
+        );
+    }
+
+    /// A band-counting probe: how many separate horizontal strips of ink lie inside
+    /// a rect.
+    ///
+    /// One band per line of text, so it counts *lines* — which is what tells a
+    /// column of three readings apart from three readings where one of them wrapped
+    /// onto a second line and printed over its neighbour.
+    fn ink_bands(levels: &[u8], width: u32, rect: (f32, f32, f32, f32)) -> usize {
+        let (x, y, w, h) = rect;
+        let (x0, x1) = (x.max(0.0) as u32, (x + w).ceil() as u32);
+        let mut bands = 0;
+        let mut inside = false;
+        for y in y.max(0.0) as u32..(y + h).ceil() as u32 {
+            let ink = (x0..x1).any(|x| {
+                let index = (y * width + x) as usize;
+                index < levels.len() && levels[index] < PAPER
+            });
+            bands += usize::from(ink && !inside);
+            inside = ink;
+        }
+        bands
+    }
+
+    /// A panel whose only cell is a `list` of three readings, on a grid dense enough
+    /// that the readings have to be fitted to the width they are given.
+    ///
+    /// Sized as the second panel in service is — 800x600 on a 4x3 grid, so a cell is
+    /// about 184 pixels of content wide. That is the width a reading with no
+    /// `precision` set overflows even at [`MIN_TYPE_PX`], which is the case worth
+    /// having a fixture for.
+    fn listed_panel(values: [&str; 3]) -> (Device, HashMap<Reading, Reported>) {
+        const GRID: Grid = Grid { cols: 4, rows: 3 };
+        let mut list = widget("climate", WidgetKind::List, 0, 0);
+        list.label = Some("Climate".to_owned());
+        // No `precision`, deliberately: rounding is what keeps a reading short, and
+        // the case worth a fixture is the author who has not configured any.
+        list.readings = ["Office", "Bedroom", "Hall"]
+            .iter()
+            .zip(["sensor.office", "sensor.bedroom", "sensor.hall"])
+            .map(|(label, entity)| crate::config::Reading {
+                precision: None,
+                ..reading(label, entity, None)
+            })
+            .collect();
+        let device = Device {
+            dither: Dither::None,
+            width: 800,
+            height: 600,
+            grid: GRID,
+            chrome: Chrome::derived(800, 600, GRID),
+            ..panel(vec![list])
+        };
+        let states = HashMap::from([
+            (
+                Reading::state("sensor.office"),
+                Reported::Fresh(values[0].to_owned()),
+            ),
+            (
+                Reading::state("sensor.bedroom"),
+                Reported::Fresh(values[1].to_owned()),
+            ),
+            (
+                Reading::state("sensor.hall"),
+                Reported::Fresh(values[2].to_owned()),
+            ),
+        ]);
+        (device, states)
+    }
+
+    #[test]
+    fn a_column_of_readings_is_fitted_to_its_width_and_not_only_its_height() {
+        // Sized by height alone — which is all this did — three readings in a 322x302
+        // cell were set at 74px, and `Office 21.3 °C` at 74px is half again as wide as
+        // the cell it was drawn in. It overprinted the readings under it.
+        let rows = [
+            resolved_line(
+                "Office",
+                serde_json::json!("21.3"),
+                Some("\u{b0}C"),
+                Ink::Current,
+            ),
+            resolved_line(
+                "Bedroom",
+                serde_json::json!("19.1"),
+                Some("\u{b0}C"),
+                Ink::Current,
+            ),
+            resolved_line("Hall", serde_json::json!("48"), Some("%"), Ink::Current),
+        ];
+
+        let tall = 302.0;
+        let by_height = tall / (3.0 * 1.48 - 0.28);
+        let wide = rows_size(&FONTS, &rows, 900.0, by_height);
+        let narrow = rows_size(&FONTS, &rows, 322.0, by_height);
+
+        assert!(
+            (wide - by_height).abs() < 1.0,
+            "given width to spare the height decides: {wide} should be about {by_height}"
+        );
+        assert!(
+            narrow < by_height * 0.8,
+            "in a 322px box the widest row has to shrink the column: {narrow} vs {by_height}"
+        );
+        assert!(
+            narrow >= MIN_TYPE_PX,
+            "the fit still floors at the readable size: {narrow}"
+        );
+    }
+
+    #[test]
+    fn every_reading_in_a_list_keeps_its_own_line() {
+        // Three readings, three lines of ink — including the case the fit cannot
+        // satisfy. A value too long for the box even at [`MIN_TYPE_PX`] used to wrap,
+        // and a wrapped line inside a one-line box prints over the reading beneath it,
+        // so the count is what catches it.
+        for values in [
+            ["21.3", "19.1", "48"],
+            // What a publisher sends when nobody configured `precision`.
+            ["21.299999237060547", "19.050000190734863", "47.8231"],
+        ] {
+            let (device, states) = listed_panel(values);
+            let png = render_with(&device, &HashMap::new(), &states, &HashMap::new());
+            let (width, _, levels) = greys(&png);
+
+            let layout = Layout::for_device(&device);
+            let (x, y, w, h) = layout.rect(&device.widgets[0]);
+            let inset = layout.inset() / 2.0;
+            // Below the header, so the label above the readings is not counted as one.
+            let body = (
+                x + inset,
+                y + inset + h * 0.25,
+                w - inset * 2.0,
+                h * 0.75 - inset * 2.0,
+            );
+
+            assert_eq!(
+                ink_bands(&levels, width, body),
+                3,
+                "three readings must draw three lines, whatever their values ({values:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nested_cell_with_nothing_to_say_still_renders() {
+        // The regression this pins is a panic, not a misdraw. A run that inherits its
+        // width from its container measures one width and breaks lines at another once
+        // that container is a grid item of a grid item, and the text engine asserts on
+        // the disagreement — so a group holding a `text` cell, or any cell with no data
+        // yet, killed the whole frame. Both bodies are bare runs; every other body
+        // wraps its text in a box and was never affected.
+        let mut group = widget("utility", WidgetKind::Group, 0, 0);
+        group.group = Some(Group {
+            grid: Grid { cols: 2, rows: 2 },
+            widgets: vec![
+                widget("prose", WidgetKind::Text, 0, 0),
+                widget("absent", WidgetKind::Value, 1, 0),
+                widget("figure", WidgetKind::Value, 0, 1),
+            ],
+        });
+        let device = panel(vec![group]);
+        let content = HashMap::from([
+            (
+                "prose".to_owned(),
+                record(
+                    serde_json::json!("Bin day Tuesday, and the boiler is booked"),
+                    now(),
+                ),
+            ),
+            (
+                "figure".to_owned(),
+                record(serde_json::json!("21.4"), now()),
+            ),
+        ]);
+
+        let png = render(&device, &content);
+        assert_eq!(dimensions(&png), (1448, 1072));
+
+        // And the absence really was drawn, rather than skipped along with the panic.
+        let (width, _, levels) = greys(&render(
+            &Device {
+                dither: Dither::None,
+                ..device.clone()
+            },
+            &content,
+        ));
+        let sub = Layout::for_device(&device)
+            .sub_layout(&device.widgets[0])
+            .expect("a group has a sub-layout");
+        let children = &device.widgets[0].group.as_ref().expect("set").widgets;
+        for child in children {
+            assert!(
+                inked(&levels, width, sub.rect(child)),
+                "nested cell `{}` drew nothing at all",
+                child.id
+            );
+        }
     }
 }

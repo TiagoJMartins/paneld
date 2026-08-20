@@ -681,11 +681,16 @@ fn find_device<'a>(config: &'a Config, device_id: &str) -> Option<&'a Device> {
 }
 
 /// Every device whose dashboard declares `widget_id`.
+///
+/// Walks a group's children as well as the widgets beside it: a nested cell has a
+/// push address like any other, and a push that resolved to no device is a cell
+/// that stays as it was until the render interval comes round — a change the
+/// publisher was told had been accepted, on a panel that has not shown it.
 fn devices_using(config: &Config, widget_id: &str) -> Vec<String> {
     config
         .devices
         .iter()
-        .filter(|device| device.widgets.iter().any(|widget| widget.id == widget_id))
+        .filter(|device| device.all_widgets().any(|widget| widget.id == widget_id))
         .map(|device| device.id.clone())
         .collect()
 }

@@ -90,6 +90,18 @@ impl StatusStore {
         self.lock().clone()
     }
 
+    /// What `device` last reported about itself, merged across every poll.
+    ///
+    /// A copy rather than a borrow: the renderer needs the values, not the lock,
+    /// and a status bar that held this mutex while rasterising a frame would stall
+    /// every display poll behind it.
+    pub fn telemetry(&self, device: &str) -> Telemetry {
+        self.lock()
+            .get(device)
+            .map(|status| status.telemetry.clone())
+            .unwrap_or_default()
+    }
+
     /// A panicking handler must not wedge status reporting for the rest of the
     /// process: the map is structurally intact either way, so recover the guard.
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, DeviceStatus>> {

@@ -473,6 +473,52 @@ row = 0
 label = "Kitchen"
 "#;
 
+/// One device whose dashboard puts two cells inside a group, so that a push has to
+/// resolve through a nested widget to reach a device.
+const GROUPED: &str = r#"
+[server]
+listen = "0.0.0.0:4444"
+public_base_url = "http://192.168.0.50:4444"
+
+[[device]]
+id = "kindle"
+width = 400
+height = 300
+palette = "gray16"
+dither = "bayer"
+refresh_rate = 300
+render_interval = 300
+grid = { cols = 2, rows = 1 }
+
+[[device.widget]]
+id = "beside"
+kind = "value"
+col = 0
+row = 0
+label = "Beside"
+
+[[device.widget]]
+id = "box"
+kind = "group"
+col = 1
+row = 0
+grid = { cols = 1, rows = 2 }
+
+[[device.widget.widget]]
+id = "nested"
+kind = "value"
+col = 0
+row = 0
+label = "Nested"
+
+[[device.widget.widget]]
+id = "also_nested"
+kind = "text"
+col = 0
+row = 1
+label = "Also"
+"#;
+
 /// The bytes a device is currently being served, fetched over HTTP the way the
 /// firmware does: poll, then GET the `image_url` it was handed.
 async fn served_bytes(harness: &Harness, device: &str) -> Vec<u8> {
@@ -581,6 +627,23 @@ async fn a_widget_on_one_dashboard_rebuilds_only_that_device() {
         1,
         "a push to a widget kindle does not declare must not cost it a render"
     );
+}
+
+#[tokio::test]
+async fn a_push_to_a_cell_inside_a_group_rebuilds_its_device() {
+    // A group's children have push addresses like any other cell, and the lookup
+    // that turns an address into a device used to walk only the widgets beside the
+    // group. A publisher was told `200 OK`, nothing was queued, and the panel went
+    // on showing the previous value until its render interval came round.
+    let mut harness = Harness::start(GROUPED).await;
+
+    let (status, _) = harness
+        .put("/api/content/nested", json!({ "value": 7, "render": true }))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    assert_eq!(harness.tick(NO_TIME).await, ["kindle"]);
+    assert_eq!(harness.render_count("kindle").await, 2, "startup plus one");
 }
 
 // ---------------------------------------------------------------------------

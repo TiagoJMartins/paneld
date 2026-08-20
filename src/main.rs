@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -10,7 +10,7 @@ use paneld::app::Runtime;
 use paneld::{config, http, renderer};
 use time::OffsetDateTime;
 
-/// How often the configuration file's modification time is checked.
+/// How often the configuration's modification time is checked.
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Parser)]
@@ -69,8 +69,15 @@ async fn main() -> Result<()> {
 /// Reports what the configuration describes, or why it is not usable.
 fn validate(config_path: &Path) -> Result<()> {
     let config = config::load(config_path)?;
+    let sources = config::sources(config_path);
 
     println!("{} ok", config_path.display());
+    // Which fragments are in effect is the first question a `<file>.d` directory
+    // raises, and it is a question the main file's own text cannot answer.
+    println!("  files            {}", sources.len());
+    for source in &sources {
+        println!("    - {}", source.display());
+    }
     println!("  listen           {}", config.server.listen);
     println!("  public_base_url  {}", config.server.public_base_url);
     println!("  content_path     {}", config.server.content_path);
@@ -99,21 +106,65 @@ fn validate(config_path: &Path) -> Result<()> {
             device.render_interval,
         );
         println!(
-            "    grid {}x{}, {} of {} cells used by {} widget(s)",
+            "    grid {}x{}, {} of {} cells used by {} widget(s), gap {} padding {} border {}",
             device.grid.cols,
             device.grid.rows,
             occupied,
             cells,
             device.widgets.len(),
+            device.chrome.gap,
+            device.chrome.padding,
+            device.chrome.border,
         );
-        for widget in &device.widgets {
+        if let Some(bar) = &device.status_bar {
+            let fields: Vec<String> = bar
+                .fields
+                .iter()
+                .map(|field| format!("{field:?}").to_lowercase())
+                .collect();
             println!(
-                "    - {:<16} {:?} at col {} row {} span {}x{}",
-                widget.id, widget.kind, widget.col, widget.row, widget.col_span, widget.row_span,
+                "    status bar on the {} edge, {}px, offset {}: {}",
+                bar.edge,
+                bar.thickness,
+                bar.utc_offset,
+                fields.join(" ")
             );
+        }
+        for widget in &device.widgets {
+            print_widget(widget, 4);
+            // A group's children are widgets in their own right — each with its own
+            // push address — so a report that stopped at the group would leave an
+            // author unable to see the ids they are meant to publish to.
+            for child in widget.group.iter().flat_map(|group| &group.widgets) {
+                print_widget(child, 8);
+            }
         }
     }
     Ok(())
+}
+
+/// One widget's line in the `validate` report, indented to its depth.
+///
+/// Names the id first because that is what an author looks one up by: it is the
+/// content push address as well as the config key.
+fn print_widget(widget: &paneld::config::Widget, indent: usize) {
+    let pad = " ".repeat(indent);
+    print!(
+        "{pad}- {:<16} {:?} at col {} row {} span {}x{}",
+        widget.id, widget.kind, widget.col, widget.row, widget.col_span, widget.row_span,
+    );
+    if let Some(group) = &widget.group {
+        print!(
+            ", a {}x{} sub-grid of {}",
+            group.grid.cols,
+            group.grid.rows,
+            group.widgets.len()
+        );
+    }
+    if !widget.readings.is_empty() {
+        print!(", {} reading(s)", widget.readings.len());
+    }
+    println!();
 }
 
 async fn serve(config_path: &Path) -> Result<()> {
@@ -172,7 +223,14 @@ async fn preview(config_path: &Path, device_id: &str, output: &Path) -> Result<(
     Ok(())
 }
 
-/// Re-reads the configuration when the file changes on disk.
+/// Re-reads the configuration when anything it is built from changes on disk.
+///
+/// That is the main file, its `<file name>.d` drop-in directory *and* every
+/// fragment in it, which is what [`config::modified_at`] folds into one instant.
+/// The directory's own timestamp is in there deliberately: adding or deleting a
+/// fragment modifies no file, so a check that stats only files never notices a
+/// dropped-in override arriving, and keeps rendering a deleted one long after it
+/// stopped existing.
 ///
 /// A parse or validation error leaves the previously loaded configuration in
 /// effect and logs the error, so a typo never blanks the panel.
@@ -181,12 +239,12 @@ async fn preview(config_path: &Path, device_id: &str, output: &Path) -> Result<(
 /// filesystem notification API, and it cannot miss the editors that write a config
 /// by renaming a temporary file over it — a case where an inode watch sees nothing.
 async fn watch_config(runtime: Arc<Runtime>, path: PathBuf) {
-    let mut last_seen = modified_at(&path);
+    let mut last_seen = config::modified_at(&path);
 
     loop {
         tokio::time::sleep(CONFIG_POLL_INTERVAL).await;
 
-        let current = modified_at(&path);
+        let current = config::modified_at(&path);
         if current == last_seen {
             continue;
         }
@@ -205,10 +263,6 @@ async fn watch_config(runtime: Arc<Runtime>, path: PathBuf) {
             ),
         }
     }
-}
-
-fn modified_at(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 async fn shutdown() {
