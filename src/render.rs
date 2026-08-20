@@ -961,7 +961,28 @@ fn dot_node(size: f32, on: bool, ink: Ink) -> Node {
 /// cell is four numbers shouting at a room. Tied to the chrome that names them
 /// rather than fixed in pixels so that it scales with the panel: a reading reads as
 /// the content at a little under twice the label above it, at any panel size.
-const ROW_TYPE_CEILING: f32 = 1.8;
+const ROW_TYPE_CEILING: f32 = 2.6;
+
+/// How much of a cell's width the widest reading is grown to occupy.
+///
+/// Not all of it: a column set to the full width has its figures hard against the
+/// cell's rule, and the eye needs the margin to see the column as a block. Four
+/// fifths reads as filled.
+const COLUMN_TARGET: f32 = 0.80;
+
+/// How much wider than its widest row a column of readings is drawn.
+///
+/// A little slack so the figures do not sit hard against the glyphs naming them,
+/// and no more: the column is centred, so every pixel of width beyond this is a
+/// void down the middle of the cell rather than margin around it.
+const COLUMN_SLACK: f32 = 1.15;
+
+/// The most space between two readings, as a multiple of their type size.
+///
+/// Bounds the air rather than sharing out whatever the type ceiling left over. A
+/// tall cell has more height than four readings need, and distributing all of it
+/// put the readings so far apart that they stopped reading as one table.
+const ROW_GAP_CEILING: f32 = 1.1;
 
 /// A column of labelled rows filling a box, each row inked by its own trust.
 ///
@@ -973,54 +994,100 @@ fn rows_node(fonts: &Fonts, rows: &[Line], space: Space) -> Node {
         height,
         label_px,
     } = space;
-    // Every row plus every gap between them fills the box: a row's line box is about
-    // 1.2 of its size and the gaps are 0.28 of it, so `n` rows want `1.48n - 0.28`
-    // sizes' worth of height.
+    // Three things bound a reading's size, and the smallest wins.
+    //
+    // The height, because the rows are laid out down the box. The width, because a
+    // column that filled a third of a wide cell and centred itself left the rest as
+    // a margin nobody asked for — so the type grows until the widest row occupies
+    // `COLUMN_TARGET` of the width, which is what makes a cell look filled rather
+    // than furnished. And the ceiling, because past it a table stops being a table.
     let by_height = height / (rows.len().max(1) as f32 * 1.48 - 0.28);
-    let design = by_height.min(label_px * ROW_TYPE_CEILING).max(MIN_TYPE_PX);
+    let by_width = width_driven_size(fonts, rows, width);
+    let design = by_height
+        .min(by_width)
+        .min(label_px * ROW_TYPE_CEILING)
+        .max(MIN_TYPE_PX);
+    // Shaved against the real measurement at the size actually chosen: the estimate
+    // above is linear in the type size, which is exact for a text run and slightly
+    // out once a glyph's own margins are in the row.
     let row_px = rows_size(fonts, rows, width, design);
+
+    // The column is as wide as its widest row needs and no wider, then centred.
+    //
+    // A row is glyph-or-label at one end and figure at the other, and stretching
+    // that across the whole content box put a void between them: on a 950 pixel
+    // cell the eye had to cross half the panel to join a sofa to its temperature.
+    // Giving up the alignment instead — letting each row sit as wide as its own
+    // content — would have cost the thing that makes a column of readings
+    // scannable, which is that the figures line up. So the column keeps its right
+    // edge and loses the emptiness.
+    let widest = rows
+        .iter()
+        .map(|line| intrinsic_width(fonts, row_runs(line, row_px)))
+        .fold(0.0, f32::max);
+    let column = (widest * COLUMN_SLACK).clamp(1.0, width);
 
     let children = rows
         .iter()
         // Each line's own ink, not the cell's: one unreachable sensor mutes its own
         // line and leaves the readings around it black.
-        .map(|line| row_node(line, row_px, width))
+        .map(|line| row_node(line, row_px, column))
         .collect::<Vec<_>>();
 
-    // Spread down the box once the ceiling has taken the type below what the height
-    // affords, so a tall cell reads as a table with air in it rather than as a
-    // small block adrift in the middle of a large box. Centred when the rows
-    // genuinely fill the height, which is what a dense cell wants.
-    let filled = row_px >= by_height - 0.5;
+    // Down the axis, the gap is bounded rather than spread. Sharing out whatever
+    // the ceiling left over put a hundred and eighty pixels between two readings,
+    // which reads as four unrelated cells rather than one table; a bounded gap
+    // leaves the block centred with air around it, which is what air is for.
+    let gap = (row_px * 0.28).max(
+        ((height - row_px * rows.len() as f32) / (rows.len().max(2) - 1) as f32)
+            .min(row_px * ROW_GAP_CEILING),
+    );
+
     Node::container(children).with_style(
         Style::default()
             .with(StyleDeclaration::display(Display::Flex))
             .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-            .with(StyleDeclaration::justify_content(match filled {
-                true => JustifyContent::Center,
-                false => JustifyContent::SpaceEvenly,
-            }))
+            .with(StyleDeclaration::justify_content(JustifyContent::Center))
+            .with(StyleDeclaration::align_items(AlignItems::Center))
             .with(StyleDeclaration::height(Length::Px(height)))
             .with(StyleDeclaration::width(Length::Px(width)))
-            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(
-                row_px * 0.28,
-            )))),
+            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(gap)))),
     )
 }
 
-/// The one size every row in a column is set at, fitted to the box's width.
+/// The size at which the widest row would occupy [`COLUMN_TARGET`] of `width`.
 ///
-/// The height decides first, because a column of readings is laid out down the
-/// box; then the widest row decides, because it is the one that runs out of width.
-/// Both are needed and the second was missing: sized by height alone, three
-/// readings in a 322x302 cell were set at 74px, and `Office 21.3 °C` at 74px is
-/// half again as wide as the cell it was drawn in — it overprinted its
-/// neighbours.
+/// Measured at a reference size and scaled, because a row's advance is proportional
+/// to its type size: one measurement is exact rather than a search. The reference is
+/// large enough that a glyph's fixed margins do not dominate the ratio.
+///
+/// This is what stops a column of four short readings from sitting in the middle of
+/// a 950 pixel cell with a third of the panel blank on either side of it. Filling
+/// the space is not vanity: on a wall panel every pixel not spent on a reading is a
+/// pixel spent making the reading smaller than it could have been.
+fn width_driven_size(fonts: &Fonts, rows: &[Line], width: f32) -> f32 {
+    const REFERENCE: f32 = 100.0;
+    let widest = rows
+        .iter()
+        .map(|line| intrinsic_width(fonts, row_runs(line, REFERENCE)))
+        .fold(0.0, f32::max);
+    if widest <= 0.0 {
+        return REFERENCE;
+    }
+    REFERENCE * (width * COLUMN_TARGET) / widest
+}
+
+/// The one size every row is set at, shaved so the widest of them fits.
 ///
 /// One size for every row rather than one per row, and that is the point of a
 /// list: rows sized individually read as unrelated readings that happen to be
 /// stacked, where a shared size reads as a table. So the widest row decides for
 /// all of them.
+///
+/// A safety net rather than the sizing rule: [`rows_node`] has already chosen a
+/// design size the widest row should fit at, and this shaves it if the measurement
+/// disagrees. Without it, a reading long enough to overflow was drawn overflowing —
+/// `Office 21.3 °C` at 74px in a 322px cell overprinted its neighbours.
 fn rows_size(fonts: &Fonts, rows: &[Line], width: f32, design: f32) -> f32 {
     let widest = rows
         .iter()
@@ -3912,6 +3979,56 @@ row = 0
             );
         }
         render(device, &content)
+    }
+
+    #[test]
+    fn a_column_grows_to_fill_a_cell_wider_than_its_readings() {
+        // The complaint this pins: four short readings in a 950px cell were set at
+        // what the height and the ceiling allowed, came out 480px wide, and were
+        // centred — leaving a third of the panel blank on either side. Every pixel
+        // not spent on a reading is a pixel spent making the reading smaller than it
+        // could have been.
+        let rows: Vec<Line> = ["21.9", "22.3", "26.1", "53"]
+            .iter()
+            .map(|v| resolved_line("", serde_json::json!(*v), Some("\u{b0}C"), Ink::Current))
+            .collect();
+
+        for width in [400.0_f32, 950.0] {
+            let size = width_driven_size(&FONTS, &rows, width);
+            let widest = rows
+                .iter()
+                .map(|line| intrinsic_width(&FONTS, row_runs(line, size)))
+                .fold(0.0_f32, f32::max);
+            let filled = widest / width;
+            assert!(
+                (filled - COLUMN_TARGET).abs() < 0.06,
+                "at {width}px the widest row should occupy about {COLUMN_TARGET} of the \
+                 cell, got {filled:.2}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gap_between_readings_is_bounded_however_tall_the_cell() {
+        // Sharing out whatever the ceiling left over put 180px between two readings,
+        // which reads as four unrelated cells rather than one table.
+        let rows: Vec<Line> = ["1", "2", "3", "4"]
+            .iter()
+            .map(|v| resolved_line("", serde_json::json!(*v), None, Ink::Current))
+            .collect();
+        let row_px = 60.0_f32;
+        let height = 2000.0_f32;
+        let spread = (height - row_px * rows.len() as f32) / (rows.len() - 1) as f32;
+        let gap = (row_px * 0.28).max(spread.min(row_px * ROW_GAP_CEILING));
+
+        assert!(
+            spread > row_px * ROW_GAP_CEILING,
+            "the fixture has to be a cell with height to spare, or it proves nothing"
+        );
+        assert!(
+            gap <= row_px * ROW_GAP_CEILING + 0.01,
+            "the gap must stay bounded: got {gap}"
+        );
     }
 
     #[test]

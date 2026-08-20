@@ -15,8 +15,8 @@ use takumi::prelude::*;
 use time::{Month, OffsetDateTime, Weekday};
 
 use super::{
-    MIN_TYPE_PX, NUMERIC_FAMILY, RenderInputs, UI_FAMILY, fitted, muted, one_line, rule,
-    rule_width, text_node, text_style,
+    MIN_TYPE_PX, NUMERIC_FAMILY, RenderInputs, UI_FAMILY, fitted, ink, one_line, rule, rule_width,
+    text_node, text_style,
 };
 use crate::config::{Alert, Device, Edge, StatusBar, StatusField};
 use crate::telemetry::Telemetry;
@@ -202,9 +202,7 @@ fn alert_node(
         children.push(fitted(fonts, available, size, |size| {
             text_node(
                 label,
-                one_line(
-                    text_style(size, 700.0, UI_FAMILY).with(StyleDeclaration::color(super::ink())),
-                ),
+                one_line(text_style(size, 700.0, UI_FAMILY).with(StyleDeclaration::color(ink()))),
             )
         }));
     }
@@ -251,8 +249,14 @@ fn separator(edge: Edge) -> [StyleDeclaration; 3] {
     }
 }
 
-/// One field's run, set in the secondary grey at the largest size that fits the
-/// room it has.
+/// One field's run, at the largest size that fits the room it has.
+///
+/// Set in full ink rather than the secondary grey the rest of the dashboard's
+/// chrome uses. A cell's label sits next to its own reading and can afford to
+/// recede from it; the bar has nothing beside it to recede from, and a strip of
+/// mid-grey type at the very edge of the glass was the palest thing on the panel —
+/// on e-ink, read across a room, that is a line nobody can make out. The bar earns
+/// its ink by being the only place these facts appear.
 ///
 /// Held to one line, which is not a nicety: the strip is a fixed number of pixels
 /// thick, and a run that wrapped would be laid out taller than that and push the
@@ -261,7 +265,7 @@ fn field_node(fonts: &Fonts, text: &str, field: StatusField, available: f32, des
     fitted(fonts, available, design, |size| {
         text_node(
             text,
-            one_line(text_style(size, 400.0, face(field)).with(StyleDeclaration::color(muted()))),
+            one_line(text_style(size, 400.0, face(field)).with(StyleDeclaration::color(ink()))),
         )
     })
 }
