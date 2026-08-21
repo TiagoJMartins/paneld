@@ -802,13 +802,12 @@ fn sky_nodes(
 
     let beside = content_w > content_h;
     let gap = (content_w.min(content_h) * 0.06).clamp(2.0, 12.0);
-    // The glyph takes under half of a split width and rather less of a split height.
-    // Side by side the readings carry far more glyphs than the picture does, and their
-    // labels are what runs out of room first; stacked, the picture is one glance and
-    // the ruled lines under it are the cell, so it takes the smaller share.
+    // The glyph takes under half of a split width and half of a split height. Side
+    // by side the readings carry far more glyphs than the picture does, and their
+    // labels are what runs out of room first; stacked, the two are equals.
     let (glyph_w, glyph_h) = match beside {
         true => ((content_w - gap) * 0.40, content_h),
-        false => (content_w, (content_h - gap) * 0.38),
+        false => (content_w, (content_h - gap) * 0.50),
     };
     let (rows_w, rows_h) = match beside {
         true => (content_w - gap - glyph_w, content_h),
@@ -959,136 +958,123 @@ fn dot_node(size: f32, on: bool, ink: Ink) -> Node {
 /// A ceiling, and the only place in this module where a size is not simply the
 /// space available. A single `value` cell exists to be one number and should fill
 /// its box; a column of readings is a table, and a table set to fill a 700x1000
-/// cell is four numbers shouting at a room.
-///
-/// Low, and deliberately: this panel reads as a clipboard rather than as a
-/// display, so a line of it is set a little larger than the label naming the
-/// table and no larger. Tied to that chrome rather than fixed in pixels so it
-/// scales with the panel.
-const ROW_TYPE_CEILING: f32 = 1.45;
+/// cell is four numbers shouting at a room. Tied to the chrome that names them
+/// rather than fixed in pixels so that it scales with the panel: a reading reads as
+/// the content at a little under twice the label above it, at any panel size.
+const ROW_TYPE_CEILING: f32 = 2.6;
 
-/// The line box a run of the panel's faces occupies, as a multiple of its type size.
+/// How much of a cell's width the widest reading is grown to occupy.
 ///
-/// Measured off a rendered frame rather than taken from the font, because it is the
-/// engine's laid-out line that the rules have to agree with: `intrinsic_size` reports
-/// a box half again as tall as what a row is actually drawn in, and sizing the blank
-/// lines from that left the foot of every cell unruled.
-///
-/// Wrong here shows up as an uneven last pitch, which the ruled-page test asserts
-/// against, rather than as anything a reader would have to notice.
-const ROW_LINE: f32 = 1.29;
+/// Not all of it: a column set to the full width has its figures hard against the
+/// cell's rule, and the eye needs the margin to see the column as a block. Four
+/// fifths reads as filled.
+const COLUMN_TARGET: f32 = 0.80;
 
-/// The air under a line of a table, as a multiple of its type size.
+/// How much wider than its widest row a column of readings is drawn.
 ///
-/// Small: a table's lines belong to each other, and a lead that grows with the cell
-/// is how a list of four readings ends up reading as four unrelated cells. What a
-/// tall cell gets instead is more ruled lines, not further-apart ones.
-const ROW_LEAD: f32 = 0.55;
+/// A little slack so the figures do not sit hard against the glyphs naming them,
+/// and no more: the column is centred, so every pixel of width beyond this is a
+/// void down the middle of the cell rather than margin around it.
+const COLUMN_SLACK: f32 = 1.15;
 
-/// How far past its tightest pitch a table's lines may be spaced to fill a box.
+/// The most space between two readings, as a multiple of their type size.
 ///
-/// A little, so the last rule lands on the foot of a cell rather than a few pixels
-/// above it. Not much: a cell so tall that its lines would have to double their pitch
-/// to fill it is a cell holding a short table, and short tables sit at the top of the
-/// page like anything else written on ruled paper.
-const PITCH_SLACK: f32 = 1.2;
+/// Bounds the air rather than sharing out whatever the type ceiling left over. A
+/// tall cell has more height than four readings need, and distributing all of it
+/// put the readings so far apart that they stopped reading as one table.
+const ROW_GAP_CEILING: f32 = 1.1;
 
-/// The width of the rule under a line of a table, in pixels.
-///
-/// A hairline whatever the cell's own border is set to: a device that asked for a
-/// four-pixel frame around its cells asked about the frame, and four-pixel rules
-/// between readings would be a table drawn in fences.
-const TABLE_RULE: f32 = 1.0;
-
-/// A ruled table of labelled rows, each line inked by its own trust.
+/// A column of labelled rows filling a box, each row inked by its own trust.
 ///
 /// Shared by a `list` body and by a weather cell's readings, because they are one
-/// thing: `n` labelled values ruled and aligned to a box together.
-///
-/// Every line spans the full width, its name at the leading edge and its figure at
-/// the trailing one, over a hairline rule. The rule is what earns the density: it
-/// carries the eye from a name to a figure across a wide cell, which is the job the
-/// old centred block did by shrinking the column instead. What is left of the cell
-/// below the last reading is ruled and left blank, so a short table reads as a form
-/// nobody has finished filling in rather than as a hole.
+/// thing: `n` labelled values sized and aligned to a box together.
 fn rows_node(fonts: &Fonts, rows: &[Line], space: Space) -> Node {
     let Space {
         width,
         height,
         label_px,
     } = space;
-    // A publisher may push `rows: []`, and a table of nothing is nothing rather than
-    // a page of blank rules.
-    if rows.is_empty() {
-        return Node::container(Vec::new());
-    }
-    // The height, because the lines are laid out down the box, and the ceiling,
-    // because past it a table stops being a table.
-    let by_height = height / (rows.len() as f32 * 1.48 - 0.28);
-    let design = by_height.min(label_px * ROW_TYPE_CEILING).max(MIN_TYPE_PX);
+    // Three things bound a reading's size, and the smallest wins.
+    //
+    // The height, because the rows are laid out down the box. The width, because a
+    // column that filled a third of a wide cell and centred itself left the rest as
+    // a margin nobody asked for — so the type grows until the widest row occupies
+    // `COLUMN_TARGET` of the width, which is what makes a cell look filled rather
+    // than furnished. And the ceiling, because past it a table stops being a table.
+    let by_height = height / (rows.len().max(1) as f32 * 1.48 - 0.28);
+    let by_width = width_driven_size(fonts, rows, width);
+    let design = by_height
+        .min(by_width)
+        .min(label_px * ROW_TYPE_CEILING)
+        .max(MIN_TYPE_PX);
     // Shaved against the real measurement at the size actually chosen: the estimate
     // above is linear in the type size, which is exact for a text run and slightly
     // out once a glyph's own margins are in the row.
     let row_px = rows_size(fonts, rows, width, design);
 
-    // How many lines the box holds at the tightest pitch this type reads at, and then
-    // the pitch that divides the box evenly between exactly that many. Ruled paper
-    // whose last line stops short of the foot looks like a table that ran out rather
-    // than a page, and the remainder is only ever worth a pixel or two a line.
-    let line_h = row_px * ROW_LINE;
-    let tightest = line_h + (row_px * ROW_LEAD).max(1.0) + TABLE_RULE;
-    let ruled = (height / tightest).floor().max(1.0);
-    // Bounded for the cell too tall for its type to fill honestly — two readings on a
-    // half-panel cell rule two lines near the top rather than two bands adrift in it.
-    let pitch = (height / ruled).min(tightest * PITCH_SLACK);
-    let lead = (pitch - line_h - TABLE_RULE).max(1.0);
+    // The column is as wide as its widest row needs and no wider, then centred.
+    //
+    // A row is glyph-or-label at one end and figure at the other, and stretching
+    // that across the whole content box put a void between them: on a 950 pixel
+    // cell the eye had to cross half the panel to join a sofa to its temperature.
+    // Giving up the alignment instead — letting each row sit as wide as its own
+    // content — would have cost the thing that makes a column of readings
+    // scannable, which is that the figures line up. So the column keeps its right
+    // edge and loses the emptiness.
+    let widest = rows
+        .iter()
+        .map(|line| intrinsic_width(fonts, row_runs(line, row_px)))
+        .fold(0.0, f32::max);
+    let column = (widest * COLUMN_SLACK).clamp(1.0, width);
 
-    let mut children = rows
+    let children = rows
         .iter()
         // Each line's own ink, not the cell's: one unreachable sensor mutes its own
         // line and leaves the readings around it black.
-        .map(|line| row_node(line, row_px, width, lead))
+        .map(|line| row_node(line, row_px, column))
         .collect::<Vec<_>>();
 
-    // The rest of the page is ruled and left blank, because that is what a form does
-    // with a page it has not filled. Four readings in a cell tall enough for ten can
-    // be drawn three ways: set enormous, spread until they stop reading as one table,
-    // or written on the first four lines of something ruled all the way down. Only
-    // the last leaves a dense panel dense and its empty space deliberate.
-    children.extend((rows.len()..ruled as usize).map(|_| blank_row_node(line_h, width, lead)));
+    // Down the axis, the gap is bounded rather than spread. Sharing out whatever
+    // the ceiling left over put a hundred and eighty pixels between two readings,
+    // which reads as four unrelated cells rather than one table; a bounded gap
+    // leaves the block centred with air around it, which is what air is for.
+    let gap = (row_px * 0.28).max(
+        ((height - row_px * rows.len() as f32) / (rows.len().max(2) - 1) as f32)
+            .min(row_px * ROW_GAP_CEILING),
+    );
 
     Node::container(children).with_style(
         Style::default()
             .with(StyleDeclaration::display(Display::Flex))
             .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-            // Ruled from the top. A table starts at the top of the space it is given
-            // and ends where its readings run out; centring the block would put the
-            // first rule at a different height in every cell on the panel.
-            .with(StyleDeclaration::justify_content(JustifyContent::Start))
+            .with(StyleDeclaration::justify_content(JustifyContent::Center))
+            .with(StyleDeclaration::align_items(AlignItems::Center))
             .with(StyleDeclaration::height(Length::Px(height)))
-            .with(StyleDeclaration::width(Length::Px(width))),
+            .with(StyleDeclaration::width(Length::Px(width)))
+            .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(gap)))),
     )
 }
 
-/// A ruled line with nothing written on it, at the same pitch as a reading's.
+/// The size at which the widest row would occupy [`COLUMN_TARGET`] of `width`.
 ///
-/// Takes the measured height of a real line rather than deriving one, so a page of
-/// blank rules is evenly spaced with the readings above it. Nothing inside it, so
-/// unlike a line of type it cannot overflow the height it is given.
-fn blank_row_node(height: f32, width: f32, lead: f32) -> Node {
-    Node::container(Vec::new()).with_style(
-        Style::default()
-            .with(StyleDeclaration::display(Display::Flex))
-            .with(StyleDeclaration::width(Length::Px(width)))
-            .with(StyleDeclaration::height(Length::Px(height)))
-            .with(StyleDeclaration::flex_shrink(Some(FlexGrow(0.0))))
-            .with(StyleDeclaration::margin_bottom(Length::Px(lead)))
-            .with(StyleDeclaration::border_bottom_width(rule_width(
-                TABLE_RULE,
-            )))
-            .with(StyleDeclaration::border_bottom_style(BorderStyle::Solid))
-            .with(StyleDeclaration::border_bottom_color(rule())),
-    )
+/// Measured at a reference size and scaled, because a row's advance is proportional
+/// to its type size: one measurement is exact rather than a search. The reference is
+/// large enough that a glyph's fixed margins do not dominate the ratio.
+///
+/// This is what stops a column of four short readings from sitting in the middle of
+/// a 950 pixel cell with a third of the panel blank on either side of it. Filling
+/// the space is not vanity: on a wall panel every pixel not spent on a reading is a
+/// pixel spent making the reading smaller than it could have been.
+fn width_driven_size(fonts: &Fonts, rows: &[Line], width: f32) -> f32 {
+    const REFERENCE: f32 = 100.0;
+    let widest = rows
+        .iter()
+        .map(|line| intrinsic_width(fonts, row_runs(line, REFERENCE)))
+        .fold(0.0, f32::max);
+    if widest <= 0.0 {
+        return REFERENCE;
+    }
+    REFERENCE * (width * COLUMN_TARGET) / widest
 }
 
 /// The one size every row is set at, shaved so the widest of them fits.
@@ -1432,26 +1418,9 @@ fn paint_svg(markup: &str, colour: ColorInput) -> String {
     )
 }
 
-/// One line of a table: its name at the leading edge, its figure at the trailing
-/// one, with a hairline rule directly under it and `lead` of air below that.
-///
-/// The air is a margin and not padding, which is not a detail: with padding, this
-/// engine centres a row's children inside the *padded* box, so the name came out
-/// seven pixels below the figure it names. A margin leaves the row's own box the
-/// height of its type, which is what keeps a name and its figure on one baseline —
-/// and it puts the rule against the line rather than under the gap, which is where
-/// ruled paper puts it anyway.
-///
-/// The line is not given a box of fixed height for the same class of reason: a run
-/// taller than its box is drawn overflowing it rather than clipped to it, so a value
-/// long enough to be shrunk to the floor printed across the rule and into the
-/// reading below. Every line shares one type size, so every line is the same height,
-/// so a fixed margin is all an even pitch needs.
-///
-/// The rule is drawn in [`rule()`] and not in the reading's own ink: a muted sensor
-/// mutes its figure, and a table whose rules faded with it would read as a broken
-/// table rather than as a stale reading.
-fn row_node(line: &Line, size: f32, width: f32, lead: f32) -> Node {
+/// One line of a multi-reading widget: label on the left, value on the right,
+/// stretched across the box it is laid out in.
+fn row_node(line: &Line, size: f32, width: f32) -> Node {
     Node::container(row_runs_children(line, size)).with_style(
         Style::default()
             .with(StyleDeclaration::display(Display::Flex))
@@ -1463,13 +1432,7 @@ fn row_node(line: &Line, size: f32, width: f32, lead: f32) -> Node {
             .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
                 size * 0.5,
             ))))
-            .with(StyleDeclaration::width(Length::Px(width)))
-            .with(StyleDeclaration::margin_bottom(Length::Px(lead)))
-            .with(StyleDeclaration::border_bottom_width(rule_width(
-                TABLE_RULE,
-            )))
-            .with(StyleDeclaration::border_bottom_style(BorderStyle::Solid))
-            .with(StyleDeclaration::border_bottom_color(rule())),
+            .with(StyleDeclaration::width(Length::Px(width))),
     )
 }
 
@@ -3764,82 +3727,26 @@ mod tests {
         );
     }
 
-    /// The fraction of a rect's width carrying ink, row of pixels by row of pixels.
-    ///
-    /// The one measurement both probes below are derived from, so that "this row is a
-    /// rule" and "this row is part of a line of text" cannot disagree.
-    fn row_ink(levels: &[u8], width: u32, rect: (f32, f32, f32, f32)) -> Vec<f32> {
-        let (x, y, w, h) = rect;
-        let (x0, x1) = (x.max(0.0) as u32, (x + w).ceil() as u32);
-        let span = (x1 - x0).max(1) as f32;
-        (y.max(0.0) as u32..(y + h).ceil() as u32)
-            .map(|row| {
-                let inked = (x0..x1)
-                    .filter(|x| {
-                        let index = (row * width + x) as usize;
-                        index < levels.len() && levels[index] < PAPER
-                    })
-                    .count();
-                inked as f32 / span
-            })
-            .collect()
-    }
-
-    /// Which rows of a rect are a table's rule: ink clear across it, no thicker than
-    /// a hairline.
-    ///
-    /// A reading is a name at one end and a figure at the other, so it never spans
-    /// its line; a rule does, by definition. The thickness test is what keeps a run
-    /// of text that happens to fill its width from being mistaken for one — a line of
-    /// type is ten pixels tall and a rule is one.
-    fn rule_rows(ink: &[f32]) -> Vec<bool> {
-        const FULL: f32 = 0.9;
-        const HAIRLINE_ROWS: usize = 3;
-        let mut out = vec![false; ink.len()];
-        let mut run = 0;
-        for row in 0..=ink.len() {
-            let full = row < ink.len() && ink[row] > FULL;
-            if full {
-                run += 1;
-                continue;
-            }
-            if (1..=HAIRLINE_ROWS).contains(&run) {
-                out[row - run..row].fill(true);
-            }
-            run = 0;
-        }
-        out
-    }
-
     /// A band-counting probe: how many separate horizontal strips of ink lie inside
-    /// a rect, not counting the rules under them.
+    /// a rect.
     ///
     /// One band per line of text, so it counts *lines* — which is what tells a
     /// column of three readings apart from three readings where one of them wrapped
     /// onto a second line and printed over its neighbour.
     fn ink_bands(levels: &[u8], width: u32, rect: (f32, f32, f32, f32)) -> usize {
-        let ink = row_ink(levels, width, rect);
-        let rules = rule_rows(&ink);
+        let (x, y, w, h) = rect;
+        let (x0, x1) = (x.max(0.0) as u32, (x + w).ceil() as u32);
         let mut bands = 0;
         let mut inside = false;
-        for (row, fraction) in ink.iter().enumerate() {
-            if rules[row] {
-                inside = false;
-                continue;
-            }
-            let inked = *fraction > 0.0;
-            bands += usize::from(inked && !inside);
-            inside = inked;
+        for y in y.max(0.0) as u32..(y + h).ceil() as u32 {
+            let ink = (x0..x1).any(|x| {
+                let index = (y * width + x) as usize;
+                index < levels.len() && levels[index] < PAPER
+            });
+            bands += usize::from(ink && !inside);
+            inside = ink;
         }
         bands
-    }
-
-    /// Where a rect's rules are, as offsets from its top edge.
-    fn ruled(levels: &[u8], width: u32, rect: (f32, f32, f32, f32)) -> Vec<usize> {
-        let rules = rule_rows(&row_ink(levels, width, rect));
-        (0..rules.len())
-            .filter(|&row| rules[row] && (row == 0 || !rules[row - 1]))
-            .collect()
     }
 
     /// A panel whose only cell is a `list` of three readings, on a grid dense enough
@@ -3934,11 +3841,6 @@ mod tests {
         // satisfy. A value too long for the box even at [`MIN_TYPE_PX`] used to wrap,
         // and a wrapped line inside a one-line box prints over the reading beneath it,
         // so the count is what catches it.
-        //
-        // Counted across the whole content box, so the header's own line is in the
-        // total: four bands, being the label and its three readings. Pinning the whole
-        // cell rather than a guessed window below the header is what makes the number
-        // exact — a wrap anywhere in it, header included, is a fifth band.
         for values in [
             ["21.3", "19.1", "48"],
             // What a publisher sends when nobody configured `precision`.
@@ -3947,18 +3849,22 @@ mod tests {
             let (device, states) = listed_panel(values);
             let png = render_with(&device, &HashMap::new(), &states, &HashMap::new());
             let (width, _, levels) = greys(&png);
+
             let layout = Layout::for_device(&device);
-            let cell = content_box(&layout, &device.widgets[0]);
+            let (x, y, w, h) = layout.rect(&device.widgets[0]);
+            let inset = layout.inset() / 2.0;
+            // Below the header, so the label above the readings is not counted as one.
+            let body = (
+                x + inset,
+                y + inset + h * 0.25,
+                w - inset * 2.0,
+                h * 0.75 - inset * 2.0,
+            );
 
             assert_eq!(
-                ink_bands(&levels, width, cell),
-                4,
-                "a label and three readings are four lines, whatever their values \
-                 ({values:?})"
-            );
-            assert!(
-                ruled(&levels, width, cell).len() >= 3,
-                "and every reading is written on a ruled line ({values:?})"
+                ink_bands(&levels, width, body),
+                3,
+                "three readings must draw three lines, whatever their values ({values:?})"
             );
         }
     }
@@ -4075,139 +3981,53 @@ row = 0
         render(device, &content)
     }
 
-    /// A panel that is one wide cell holding a `list` of `n` readings.
-    ///
-    /// 800x600 on a 1x1 grid, so a line has about 770 pixels to be ruled across and
-    /// the cell has far more height than a short table needs — which is the shape
-    /// both the density and the pitch are worth asserting in.
-    fn ruled_panel(n: usize) -> (Device, HashMap<Reading, Reported>) {
-        const GRID: Grid = Grid { cols: 1, rows: 1 };
-        let mut list = widget("rooms", WidgetKind::List, 0, 0);
-        list.label = Some("Rooms".to_owned());
-        list.readings = (0..n)
-            .map(|i| crate::config::Reading {
-                precision: Some(1),
-                ..reading("Room", &format!("sensor.r{i}"), Some("\u{b0}C"))
-            })
-            .collect();
-        let device = Device {
-            dither: Dither::None,
-            width: 800,
-            height: 600,
-            grid: GRID,
-            chrome: Chrome::derived(800, 600, GRID),
-            ..panel(vec![list])
-        };
-        let states = (0..n)
-            .map(|i| {
-                (
-                    Reading::state(format!("sensor.r{i}")),
-                    Reported::Fresh(format!("2{i}.4")),
-                )
-            })
-            .collect();
-        (device, states)
-    }
-
-    /// A widget's content box: its cell less the chrome drawn around it, so a probe
-    /// sees what the body drew and not the frame the cell drew around it.
-    fn content_box(layout: &Layout, widget: &Widget) -> (f32, f32, f32, f32) {
-        let (x, y, w, h) = layout.rect(widget);
-        let inset = layout.inset() / 2.0;
-        (x + inset, y + inset, w - inset * 2.0, h - inset * 2.0)
-    }
-
     #[test]
-    fn a_table_rules_a_line_for_every_reading_and_then_the_rest_of_the_cell() {
-        // The clipboard, in one assertion. Every reading is written on a ruled line,
-        // and the lines carry on to the foot of the cell whether or not anything is
-        // written on them: that is what stops four readings in a cell tall enough for
-        // ten from being either enormous or adrift, and it is what a form looks like.
-        for readings in [2_usize, 4, 6] {
-            let (device, states) = ruled_panel(readings);
-            let png = render_with(&device, &HashMap::new(), &states, &HashMap::new());
-            let (width, _, levels) = greys(&png);
-            let layout = Layout::for_device(&device);
-            let box_ = content_box(&layout, &device.widgets[0]);
+    fn a_column_grows_to_fill_a_cell_wider_than_its_readings() {
+        // The complaint this pins: four short readings in a 950px cell were set at
+        // what the height and the ceiling allowed, came out 480px wide, and were
+        // centred — leaving a third of the panel blank on either side. Every pixel
+        // not spent on a reading is a pixel spent making the reading smaller than it
+        // could have been.
+        let rows: Vec<Line> = ["21.9", "22.3", "26.1", "53"]
+            .iter()
+            .map(|v| resolved_line("", serde_json::json!(*v), Some("\u{b0}C"), Ink::Current))
+            .collect();
 
-            let rules = ruled(&levels, width, box_);
-            let pitches: Vec<usize> = rules.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        for width in [400.0_f32, 950.0] {
+            let size = width_driven_size(&FONTS, &rows, width);
+            let widest = rows
+                .iter()
+                .map(|line| intrinsic_width(&FONTS, row_runs(line, size)))
+                .fold(0.0_f32, f32::max);
+            let filled = widest / width;
             assert!(
-                rules.len() > readings,
-                "{readings} readings should rule their own lines and more besides, got {}",
-                rules.len()
-            );
-            // One pitch throughout, written lines and blank ones alike, or they do not
-            // read as one page of ruled paper.
-            let (&tight, &loose) = (
-                pitches.iter().min().expect("more than one rule"),
-                pitches.iter().max().expect("more than one rule"),
-            );
-            assert!(
-                loose - tight <= 2,
-                "the pitch has to be even down the cell: {tight}..{loose} in {pitches:?}"
-            );
-            // And they reach the foot of the cell. Measured from the first rule, so the
-            // header above the table is not mistaken for a table that stopped early.
-            let foot = box_.3 as usize - rules[rules.len() - 1];
-            assert!(
-                foot <= loose + 2,
-                "the rules must run to the foot of the cell: last one is {foot}px short of it,                  pitch {loose}"
+                (filled - COLUMN_TARGET).abs() < 0.06,
+                "at {width}px the widest row should occupy about {COLUMN_TARGET} of the \
+                 cell, got {filled:.2}"
             );
         }
     }
 
     #[test]
-    fn a_ruled_line_spans_the_cell_instead_of_being_centred_in_it() {
-        // The old shape sized a column to its widest row and centred it, which on a
-        // wide cell drew a small block adrift in the middle. A table's name is at the
-        // leading edge and its figure at the trailing one — that is what makes a
-        // column of figures line up, and what fills the cell.
-        let (device, states) = ruled_panel(4);
-        let png = render_with(&device, &HashMap::new(), &states, &HashMap::new());
-        let (width, _, levels) = greys(&png);
-        let layout = Layout::for_device(&device);
-        let (x, y, w, h) = content_box(&layout, &device.widgets[0]);
-
-        let inked: Vec<u32> = (x as u32..(x + w) as u32)
-            .filter(|col| {
-                (y as u32..(y + h) as u32).any(|row| {
-                    let index = (row * width + col) as usize;
-                    index < levels.len() && levels[index] < PAPER
-                })
-            })
+    fn the_gap_between_readings_is_bounded_however_tall_the_cell() {
+        // Sharing out whatever the ceiling left over put 180px between two readings,
+        // which reads as four unrelated cells rather than one table.
+        let rows: Vec<Line> = ["1", "2", "3", "4"]
+            .iter()
+            .map(|v| resolved_line("", serde_json::json!(*v), None, Ink::Current))
             .collect();
-        let (first, last) = (
-            *inked.first().expect("the cell must have ink"),
-            *inked.last().expect("the cell must have ink"),
-        );
-        let span = (last - first) as f32 / w;
-        assert!(
-            span > 0.95,
-            "a ruled line has to reach both edges of its cell: ink spans {span:.2} of it, \
-             x {first}..{last} in a box {w} wide"
-        );
-    }
+        let row_px = 60.0_f32;
+        let height = 2000.0_f32;
+        let spread = (height - row_px * rows.len() as f32) / (rows.len() - 1) as f32;
+        let gap = (row_px * 0.28).max(spread.min(row_px * ROW_GAP_CEILING));
 
-    #[test]
-    fn a_tall_cell_rules_its_lines_at_one_pitch_rather_than_spreading_them() {
-        // Two readings in a 600px cell. Sharing out the spare height put the rules
-        // half a panel apart, which reads as two unrelated cells; a table's pitch is a
-        // property of its type, so the rules land at that pitch and the cell simply
-        // holds more of them.
-        let (device, states) = ruled_panel(2);
-        let png = render_with(&device, &HashMap::new(), &states, &HashMap::new());
-        let (width, _, levels) = greys(&png);
-        let layout = Layout::for_device(&device);
-        let box_ = content_box(&layout, &device.widgets[0]);
-
-        let rules = ruled(&levels, width, box_);
-        let pitch = (rules[1] - rules[0]) as f32;
         assert!(
-            pitch < box_.3 * 0.2,
-            "the pitch must come from the type and not from the cell: {pitch}px apart in a \
-             box {}px tall",
-            box_.3
+            spread > row_px * ROW_GAP_CEILING,
+            "the fixture has to be a cell with height to spare, or it proves nothing"
+        );
+        assert!(
+            gap <= row_px * ROW_GAP_CEILING + 0.01,
+            "the gap must stay bounded: got {gap}"
         );
     }
 
