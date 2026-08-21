@@ -17,14 +17,15 @@
 //!   makes that ordering painful.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
+
+use crate::jsonfile;
 
 /// Maximum number of distinct widget ids the store will hold.
 ///
@@ -186,7 +187,7 @@ impl ContentStore {
     /// would show nothing at all.
     pub fn load(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let records = read_records(&path);
+        let records = jsonfile::read(&path, "content store");
         Self {
             path,
             records: Mutex::new(records),
@@ -228,42 +229,8 @@ impl ContentStore {
     }
 
     /// Writes the whole store to its configured path, atomically.
-    ///
-    /// The temporary file is created in the *same* directory as the target: a
-    /// temp file elsewhere would make the rename a cross-device copy and lose
-    /// the atomicity this exists for.
     pub fn persist(&self) -> Result<()> {
-        let records = self.snapshot();
-        let json = serde_json::to_vec_pretty(&records).context("serialising content store")?;
-
-        let tmp = self.temp_path();
-        std::fs::write(&tmp, &json)
-            .with_context(|| format!("writing content store temp file {}", tmp.display()))?;
-
-        if let Err(err) = std::fs::rename(&tmp, &self.path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(err)
-                .with_context(|| format!("replacing content store {}", self.path.display()));
-        }
-        Ok(())
-    }
-
-    /// A per-call temporary path beside the target file, unique so that two
-    /// concurrent persists cannot write to the same scratch file.
-    fn temp_path(&self) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
-
-        let dir = match self.path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        let stem = self
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "content.json".to_owned());
-        dir.join(format!(".{stem}.tmp-{}-{nonce}", std::process::id()))
+        jsonfile::write(&self.path, &self.snapshot(), "content store")
     }
 
     /// A panicking handler must not wedge content updates for the rest of the
@@ -379,33 +346,6 @@ fn check_value_strings(field: &str, value: &Value) -> std::result::Result<(), Pu
             check_value_strings(field, item)
         }),
         _ => Ok(()),
-    }
-}
-
-fn read_records(path: &Path) -> HashMap<String, ContentRecord> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
-        Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "content store is unreadable; starting with an empty store"
-            );
-            return HashMap::new();
-        }
-    };
-
-    match serde_json::from_str(&text) {
-        Ok(records) => records,
-        Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "content store is corrupt; starting with an empty store"
-            );
-            HashMap::new()
-        }
     }
 }
 

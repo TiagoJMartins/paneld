@@ -125,6 +125,8 @@ mod tests {
         Telemetry {
             battery_percent: Some(88.0),
             battery_millivolts: Some(4_010.0),
+            charging: Some(false),
+            usb_connected: Some(false),
             rssi: Some(-52),
             firmware_version: Some("1.2.3".to_owned()),
             width: Some(1404),

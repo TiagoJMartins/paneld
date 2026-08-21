@@ -22,6 +22,12 @@ public_base_url = "http://192.168.0.50:4444"
 # until every publisher happens to fire again.
 content_path = "paneld-content.json"
 
+# Where each panel's battery history is persisted, so a redeploy does not cost
+# the samples the charge rate and ETA on `GET /api/battery` are measured from. A
+# panel reports whole percentages every refresh, so a discharge takes hours per
+# step and an emptied history means no rate for the rest of the day.
+battery_path = "paneld-battery.json"
+
 # Where fetched widget icons are cached. A cache, not a store: every entry is
 # re-fetchable, so losing the directory costs one round trip per icon. It exists so
 # that rendering never touches the network, which is what keeps a frame reproducible

@@ -109,6 +109,15 @@ pub struct Server {
     /// process working directory.
     #[serde(default = "default_content_path")]
     pub content_path: String,
+    /// Where the battery history is persisted. Relative paths resolve against
+    /// the process working directory.
+    ///
+    /// A separate file from the content store because the two have nothing to do
+    /// with each other: one is what publishers pushed, the other is what panels
+    /// reported about themselves, and an operator clearing one should not lose
+    /// the other.
+    #[serde(default = "default_battery_path")]
+    pub battery_path: String,
     /// Where fetched widget icons are cached. Relative paths resolve against the
     /// process working directory.
     ///
@@ -122,6 +131,10 @@ pub struct Server {
 
 fn default_content_path() -> String {
     "paneld-content.json".to_owned()
+}
+
+fn default_battery_path() -> String {
+    "paneld-battery.json".to_owned()
 }
 
 fn default_icon_cache_path() -> String {
@@ -2977,6 +2990,22 @@ entity = "sensor.office_temperature"
         assert_eq!(
             parse(&text).unwrap().server.content_path,
             "/var/lib/paneld/content.json"
+        );
+    }
+
+    #[test]
+    fn battery_path_has_a_default_and_is_overridable() {
+        assert_eq!(
+            parse(BASE).unwrap().server.battery_path,
+            "paneld-battery.json"
+        );
+        let text = BASE.replace(
+            "public_base_url =",
+            "battery_path = \"/var/lib/paneld/battery.json\"\npublic_base_url =",
+        );
+        assert_eq!(
+            parse(&text).unwrap().server.battery_path,
+            "/var/lib/paneld/battery.json"
         );
     }
 

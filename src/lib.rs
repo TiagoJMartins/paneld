@@ -10,6 +10,11 @@
 //! - [`frame`] holds the frame currently served for each device, plus exactly one
 //!   generation back, because a device may be mid-download of the frame it
 //!   replaced.
+//! - [`battery`] keeps each device's reported percentages, run-length encoded
+//!   and persisted, and reads a charge rate and ETA off them for
+//!   `GET /api/battery`.
+//! - [`jsonfile`] loads and atomically replaces the file a store is persisted
+//!   to, for the two stores that outlive the process.
 //! - [`schedule`] decides which devices are due for a rebuild at a given instant.
 //! - [`renderer`] is the single background task that owns all rendering.
 //! - [`http`] is the router. A device poll is a pure read of [`frame`]: it never
@@ -17,12 +22,14 @@
 //!   dashboard is.
 
 pub mod app;
+pub mod battery;
 pub mod config;
 pub mod content;
 pub mod frame;
 pub mod ha;
 pub mod http;
 pub mod icon;
+pub mod jsonfile;
 pub mod render;
 pub mod renderer;
 pub mod schedule;

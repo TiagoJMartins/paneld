@@ -543,6 +543,138 @@ async fn a_poll_missing_a_header_does_not_erase_the_previously_reported_value() 
 }
 
 #[tokio::test]
+async fn the_battery_endpoint_reports_the_history_behind_the_reading() {
+    // Every level the device reported, not just the last one: this is the
+    // surface a wrong rate is diagnosed from, so the samples have to be here.
+    let harness = Harness::start(ONE_DEVICE).await;
+    for percent in ["74", "74", "73"] {
+        harness
+            .poll_with("kindle", &[("percent-charged", percent)])
+            .await;
+    }
+
+    let (status, battery) = harness.get("/api/battery").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let kindle = &battery["kindle"];
+    assert_eq!(kindle["percent"], json!(73.0), "{battery}");
+    assert!(kindle["reported_at"].is_string(), "{battery}");
+
+    let readings = kindle["readings"].as_array().expect("readings is an array");
+    assert_eq!(
+        readings.len(),
+        2,
+        "the repeated 74 extends one reading rather than adding another: {battery}"
+    );
+    assert_eq!(readings[0]["percent"], json!(74.0));
+    assert_eq!(readings[0]["polls"], json!(2));
+    assert_eq!(readings[1]["percent"], json!(73.0));
+}
+
+#[tokio::test]
+async fn the_battery_endpoint_withholds_a_rate_it_cannot_measure_yet() {
+    // One crossing gives a direction and nothing more. A number here instead of
+    // a null would be quantisation noise dressed up as an estimate.
+    let harness = Harness::start(ONE_DEVICE).await;
+    for percent in ["74", "73"] {
+        harness
+            .poll_with("kindle", &[("percent-charged", percent)])
+            .await;
+    }
+
+    let trend = &harness.get("/api/battery").await.1["kindle"]["trend"];
+    assert_eq!(trend["direction"], json!("discharging"), "{trend}");
+    assert_eq!(trend["steps"], json!(1), "{trend}");
+    assert!(trend["percent_per_hour"].is_null(), "{trend}");
+    assert!(trend["eta_at"].is_null(), "{trend}");
+    assert!(trend["eta_seconds"].is_null(), "{trend}");
+}
+
+#[tokio::test]
+async fn a_reported_charging_state_reaches_the_battery_endpoint() {
+    let harness = Harness::start(ONE_DEVICE).await;
+    harness
+        .poll_with(
+            "kindle",
+            &[
+                ("percent-charged", "80"),
+                ("battery-charging", "1"),
+                ("usb-connected", "true"),
+            ],
+        )
+        .await;
+
+    let battery = harness.get("/api/battery").await.1;
+    let kindle = &battery["kindle"];
+    assert_eq!(kindle["power"]["charging"], json!(true), "{battery}");
+    assert_eq!(kindle["power"]["usb_connected"], json!(true), "{battery}");
+    assert_eq!(
+        kindle["trend"]["direction"],
+        json!("charging"),
+        "the device said so, before any level has moved: {battery}"
+    );
+}
+
+#[tokio::test]
+async fn a_device_that_reported_no_battery_level_is_absent_rather_than_empty() {
+    // The history is persisted, so a device that never reports a level must not
+    // earn an entry in the file. `/api/status` is where a poll from it shows up.
+    let harness = Harness::start(ONE_DEVICE).await;
+    harness.poll("kindle").await;
+
+    let battery = harness.get("/api/battery").await.1;
+    assert_eq!(battery, json!({}), "{battery}");
+
+    let status = harness.status().await;
+    assert!(status["kindle"]["last_poll_at"].is_string(), "{status}");
+}
+
+#[tokio::test]
+async fn the_battery_history_survives_a_restart() {
+    // The whole reason it is on disk: a redeploy must not cost the samples the
+    // rate is measured from, or every deploy blinds the estimate for hours.
+    let harness = Harness::start(ONE_DEVICE).await;
+    for percent in ["74", "73"] {
+        harness
+            .poll_with("kindle", &[("percent-charged", percent)])
+            .await;
+    }
+
+    let restarted = harness.restart(ONE_DEVICE).await;
+    let battery = restarted.get("/api/battery").await.1;
+    let kindle = &battery["kindle"];
+    assert_eq!(kindle["percent"], json!(73.0), "{battery}");
+    assert_eq!(
+        kindle["readings"].as_array().map(Vec::len),
+        Some(2),
+        "both levels came back: {battery}"
+    );
+    assert_eq!(
+        kindle["trend"]["direction"],
+        json!("discharging"),
+        "{battery}"
+    );
+}
+
+#[tokio::test]
+async fn the_status_endpoint_does_not_carry_the_battery_history() {
+    // `/api/status` is a small response an operator polls; the history grows with
+    // every level change and lives on its own endpoint.
+    let harness = Harness::start(ONE_DEVICE).await;
+    harness
+        .poll_with("kindle", &[("percent-charged", "74")])
+        .await;
+
+    let status = harness.status().await;
+    assert!(status["kindle"]["battery"].is_null(), "{status}");
+    assert_eq!(
+        status["kindle"]["telemetry"]["battery_percent"],
+        json!(74.0),
+        "the reading itself is still there: {status}"
+    );
+}
+
+#[tokio::test]
 async fn a_poll_records_last_poll_at_as_an_rfc_3339_timestamp() {
     // The only way an operator can see a panel that has stopped polling.
     let harness = Harness::start(ONE_DEVICE).await;

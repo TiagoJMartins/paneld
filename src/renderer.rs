@@ -178,17 +178,23 @@ mod tests {
     use super::*;
     use crate::config;
 
-    fn runtime(toml: &str) -> (Arc<Runtime>, Receiver<String>) {
-        let mut parsed = config::parse(toml).expect("fixture config should be valid");
-        // Keep the persistence file out of the working directory.
-        parsed.server.content_path = std::env::temp_dir()
+    /// A path in the temp directory, unique per test, so no test writes a store
+    /// into the working directory or reads another test's.
+    fn temp_path(label: &str) -> String {
+        std::env::temp_dir()
             .join(format!(
-                "paneld-renderer-{}-{:?}.json",
+                "paneld-renderer-{label}-{}-{:?}.json",
                 std::process::id(),
                 std::thread::current().id()
             ))
             .to_string_lossy()
-            .into_owned();
+            .into_owned()
+    }
+
+    fn runtime(toml: &str) -> (Arc<Runtime>, Receiver<String>) {
+        let mut parsed = config::parse(toml).expect("fixture config should be valid");
+        parsed.server.content_path = temp_path("content");
+        parsed.server.battery_path = temp_path("battery");
         Runtime::with_home_assistant(parsed, None).expect("runtime should build")
     }
 

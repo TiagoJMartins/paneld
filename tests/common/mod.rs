@@ -122,6 +122,7 @@ impl Harness {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(battery_path(&path));
         Self::start_at(toml, path).await
     }
 
@@ -134,6 +135,7 @@ impl Harness {
     async fn start_at(toml: &str, content_path: PathBuf) -> Self {
         let mut parsed = config::parse(toml).expect("fixture config should be valid");
         parsed.server.content_path = content_path.to_string_lossy().into_owned();
+        parsed.server.battery_path = battery_path(&content_path).to_string_lossy().into_owned();
 
         let (runtime, wake) =
             Runtime::with_home_assistant(parsed, None).expect("runtime should build");
@@ -295,7 +297,14 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.content_path);
+        let _ = std::fs::remove_file(battery_path(&self.content_path));
     }
+}
+
+/// The battery history file beside a test's content file, so the two stores stay
+/// per-test and a restart of the same harness reloads both.
+fn battery_path(content_path: &std::path::Path) -> PathBuf {
+    content_path.with_extension("battery.json")
 }
 
 /// Reads width and height straight out of the PNG IHDR chunk.

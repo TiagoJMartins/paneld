@@ -75,6 +75,7 @@ fn routes(runtime: Arc<Runtime>) -> Router {
             put(put_content).get(get_content),
         )
         .route("/api/status", get(status))
+        .route("/api/battery", get(battery))
         .with_state(runtime)
 }
 
@@ -216,6 +217,7 @@ async fn display(
         return placeholder_response(&runtime, &config, &device_id, &telemetry);
     };
 
+    runtime.record_battery(&device.id, &telemetry, now);
     runtime.status.record_poll(&device.id, telemetry, now);
 
     // Dispatched before the frame is read, so a client that can only decorate its
@@ -674,6 +676,17 @@ async fn get_content(
 /// `GET /api/status` — per-device operational state.
 async fn status(State(runtime): State<Arc<Runtime>>) -> Response {
     (StatusCode::OK, Json(runtime.status.snapshot())).into_response()
+}
+
+/// `GET /api/battery` — per-device battery history, and the charge rate and ETA
+/// read off it.
+///
+/// A debug surface, deliberately separate from `/api/status`: the reading a
+/// dashboard wants is one number, and this is every sample behind it plus the
+/// arithmetic, which is what makes a wrong ETA diagnosable rather than merely
+/// wrong.
+async fn battery(State(runtime): State<Arc<Runtime>>) -> Response {
+    (StatusCode::OK, Json(runtime.battery.reports())).into_response()
 }
 
 fn find_device<'a>(config: &'a Config, device_id: &str) -> Option<&'a Device> {

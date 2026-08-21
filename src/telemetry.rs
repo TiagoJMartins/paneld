@@ -7,10 +7,26 @@
 //! us the others.
 //!
 //! Know the ceiling before building on this. The KOReader client in service
-//! sends battery as an integer percentage only — no voltage — hardcodes `rssi`
-//! to `"0"` as an unfinished TODO, and sends no firmware version and no model.
-//! Battery percentage is the only genuinely available statistic from the panel
-//! in service, so nothing downstream may depend on richer data.
+//! sends battery as an integer percentage only — no voltage, no charging state —
+//! hardcodes `rssi` to `"0"` as an unfinished TODO, and sends no firmware
+//! version and no model. Battery percentage is the only genuinely available
+//! statistic from that panel, so nothing downstream may depend on richer data.
+//!
+//! Charging state is the exception worth knowing about, because the two families
+//! diverge on it rather than merely spelling it differently:
+//!
+//! - The TRMNL ESP32 firmware sends `battery-charging` as `1`/`0` (the charger
+//!   IC's own view, omitted entirely on boards that cannot read it) and
+//!   `usb-connected` as `true`/`false` (VBUS present). Both are omitted rather
+//!   than sent as false when unknown, which is why both are `Option<bool>` here:
+//!   "not reported" and "not charging" are different answers.
+//! - No KOReader client sends either today. A fork can: KOReader exposes
+//!   `powerd:isCharging()` and `powerd:isCharged()` on Kindle hardware, so
+//!   `battery-charging: true` is one header away. That is the spelling to use.
+//!
+//! `battery-charging: 0` does not mean unplugged — the firmware's own enum reads
+//! "charge complete, disabled, or no battery" — so only `usb-connected`
+//! distinguishes plugged-and-full from running on the cell.
 
 use axum::http::HeaderMap;
 use serde::Serialize;
@@ -28,6 +44,12 @@ const VOLTS_CEILING: f64 = 100.0;
 pub struct Telemetry {
     pub battery_percent: Option<f64>,
     pub battery_millivolts: Option<f64>,
+    /// Whether the charger reports it is actively filling the cell. `None` when
+    /// the device did not say, which is every client but recent TRMNL firmware.
+    pub charging: Option<bool>,
+    /// Whether USB power is present. Plugged in and full reads as
+    /// `usb_connected: true` with `charging: false`.
+    pub usb_connected: Option<bool>,
     pub rssi: Option<i64>,
     pub firmware_version: Option<String>,
     pub width: Option<u32>,
@@ -42,6 +64,8 @@ impl Telemetry {
         Self {
             battery_percent: number(headers, &["percent-charged", "battery-percent"]),
             battery_millivolts: number(headers, &["battery-voltage"]).map(normalise_voltage),
+            charging: flag(headers, &["battery-charging"]),
+            usb_connected: flag(headers, &["usb-connected"]),
             rssi: number(headers, &["rssi"]),
             // `user-agent` is a poor firmware version, but on clients that send
             // no `fw-version` it is the only build identifier available.
@@ -61,6 +85,8 @@ impl Telemetry {
     pub fn merge_from(&mut self, incoming: Telemetry) {
         overwrite(&mut self.battery_percent, incoming.battery_percent);
         overwrite(&mut self.battery_millivolts, incoming.battery_millivolts);
+        overwrite(&mut self.charging, incoming.charging);
+        overwrite(&mut self.usb_connected, incoming.usb_connected);
         overwrite(&mut self.rssi, incoming.rssi);
         overwrite(&mut self.firmware_version, incoming.firmware_version);
         overwrite(&mut self.width, incoming.width);
@@ -116,6 +142,21 @@ fn number<T: std::str::FromStr>(headers: &HeaderMap, names: &[&str]) -> Option<T
         }
     }
     None
+}
+
+/// The first of `names` present with a value that reads as a boolean.
+///
+/// Both value families are accepted for every one of these headers because the
+/// firmware itself is inconsistent: the same function that sends
+/// `battery-charging` as `1`/`0` sends `usb-connected` as `true`/`false`. A
+/// value in neither family reads as `None` — an unknown state, not a false one.
+fn flag(headers: &HeaderMap, names: &[&str]) -> Option<bool> {
+    let value = text(headers, names)?.to_ascii_lowercase();
+    match value.as_str() {
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +324,55 @@ mod tests {
         assert_eq!(telemetry.battery_millivolts, None);
         assert_eq!(telemetry.firmware_version, None);
         assert_eq!(telemetry.model, None);
+    }
+
+    #[test]
+    fn reads_the_firmware_charging_headers_in_the_spellings_it_sends() {
+        // The same firmware function sends one as 1/0 and the other as
+        // true/false, so this pair is exactly what arrives on the wire.
+        let telemetry = read(&[("battery-charging", "1"), ("usb-connected", "true")]);
+        assert_eq!(telemetry.charging, Some(true));
+        assert_eq!(telemetry.usb_connected, Some(true));
+
+        let telemetry = read(&[("battery-charging", "0"), ("usb-connected", "false")]);
+        assert_eq!(telemetry.charging, Some(false));
+        assert_eq!(telemetry.usb_connected, Some(false));
+    }
+
+    #[test]
+    fn either_value_family_reads_for_either_charging_header() {
+        // A KOReader fork sends `tostring(powerd:isCharging())`, which is
+        // "true"/"false" — under the header name the firmware spells 1/0.
+        assert_eq!(read(&[("battery-charging", "TRUE")]).charging, Some(true));
+        assert_eq!(read(&[("battery-charging", "yes")]).charging, Some(true));
+        assert_eq!(read(&[("usb-connected", "1")]).usb_connected, Some(true));
+        assert_eq!(read(&[("usb-connected", "No")]).usb_connected, Some(false));
+    }
+
+    #[test]
+    fn an_absent_or_unreadable_charging_header_is_unknown_and_never_false() {
+        // The firmware omits both headers on a board that cannot read the
+        // charger. Reading that as "not charging" would report a panel on mains
+        // as running down, and vice versa.
+        assert_eq!(read(&[("percent-charged", "50")]).charging, None);
+        assert_eq!(read(&[("battery-charging", "")]).charging, None);
+        assert_eq!(read(&[("battery-charging", "maybe")]).charging, None);
+        assert_eq!(read(&[("usb-connected", "2")]).usb_connected, None);
+    }
+
+    #[test]
+    fn a_poll_that_omits_the_charging_headers_keeps_the_last_known_state() {
+        let mut stored = read(&[("battery-charging", "1"), ("usb-connected", "true")]);
+
+        stored.merge_from(read(&[("percent-charged", "91")]));
+
+        assert_eq!(stored.charging, Some(true));
+        assert_eq!(stored.usb_connected, Some(true));
+
+        stored.merge_from(read(&[("battery-charging", "0")]));
+
+        assert_eq!(stored.charging, Some(false), "a fresh reading wins");
+        assert_eq!(stored.usb_connected, Some(true));
     }
 
     #[test]

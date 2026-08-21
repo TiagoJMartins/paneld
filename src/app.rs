@@ -11,6 +11,7 @@ use takumi::prelude::Fonts;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
+use crate::battery::{BatteryStore, Power};
 use crate::config::{Config, Device};
 use crate::content::ContentStore;
 use crate::frame::{Frame, FrameStore};
@@ -19,6 +20,7 @@ use crate::icon;
 use crate::render::{self, RenderInputs};
 use crate::status::StatusStore;
 use crate::tap::{self, Taps};
+use crate::telemetry::Telemetry;
 
 /// How many device ids the render loop's wake channel can hold before a sender
 /// gives up.
@@ -46,6 +48,7 @@ pub struct Runtime {
     /// previous configuration in effect.
     config: RwLock<Arc<Config>>,
     pub content: ContentStore,
+    pub battery: BatteryStore,
     pub frames: FrameStore,
     pub status: StatusStore,
     fonts: Fonts,
@@ -88,6 +91,7 @@ impl Runtime {
         ha: Option<Box<dyn HaClient>>,
     ) -> Result<(Arc<Self>, mpsc::Receiver<String>)> {
         let content = ContentStore::load(config.server.content_path.clone());
+        let battery = BatteryStore::load(config.server.battery_path.clone());
         let (wake_tx, wake_rx) = mpsc::channel(WAKE_CHANNEL_CAPACITY);
 
         // A cache directory that cannot be created is logged once here rather than
@@ -107,6 +111,7 @@ impl Runtime {
         let runtime = Arc::new(Self {
             config: RwLock::new(Arc::new(config)),
             content,
+            battery,
             frames: FrameStore::new(),
             status: StatusStore::new(),
             fonts: render::fonts().context("loading the embedded fonts")?,
@@ -127,6 +132,30 @@ impl Runtime {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Folds a poll's battery reading into the persisted history.
+    ///
+    /// A failed write is logged rather than failing the poll. The reading is in
+    /// the store either way, and a panel that stopped polling because a disk
+    /// filled is a far worse outcome than a gap in the history.
+    pub fn record_battery(&self, device_id: &str, telemetry: &Telemetry, now: OffsetDateTime) {
+        let Some(percent) = telemetry.battery_percent else {
+            return;
+        };
+        let power = Power {
+            charging: telemetry.charging,
+            usb_connected: telemetry.usb_connected,
+        };
+        self.battery.record(device_id, percent, power, now);
+
+        if let Err(error) = self.battery.persist() {
+            tracing::warn!(
+                device = %device_id,
+                error = format!("{error:#}"),
+                "the battery history could not be written; it survives only in memory"
+            );
+        }
     }
 
     /// Re-reads the configuration file and swaps it in if it is valid.
@@ -470,16 +499,23 @@ grid = { cols = 1, rows = 1 }
         }
     }
 
-    fn runtime(toml: &str) -> Arc<Runtime> {
-        let mut config = crate::config::parse(toml).unwrap();
-        config.server.content_path = std::env::temp_dir()
+    /// A path in the temp directory, unique per test, so no test writes a store
+    /// into the working directory or reads another test's.
+    fn temp_path(label: &str) -> String {
+        std::env::temp_dir()
             .join(format!(
-                "paneld-reload-content-{}-{:?}.json",
+                "paneld-reload-{label}-{}-{:?}.json",
                 std::process::id(),
                 std::thread::current().id()
             ))
             .to_string_lossy()
-            .into_owned();
+            .into_owned()
+    }
+
+    fn runtime(toml: &str) -> Arc<Runtime> {
+        let mut config = crate::config::parse(toml).unwrap();
+        config.server.content_path = temp_path("content");
+        config.server.battery_path = temp_path("battery");
         Runtime::with_home_assistant(config, None).unwrap().0
     }
 
