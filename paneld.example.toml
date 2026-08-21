@@ -81,6 +81,42 @@ render_interval = 300
 grid = { cols = 4, rows = 3 }
 
 # ---------------------------------------------------------------------------
+# Row fit
+# ---------------------------------------------------------------------------
+#
+# `grid` takes a third key. `fit` decides how tall the rows come out; the columns
+# are always equal, because a panel has one width forever and there is nothing for
+# a column to be responsive to.
+#
+#   stretch  the default. Equal rows, together filling the grid area, so no pixel
+#            of the frame goes unused.
+#   content  each row as tall as the tallest thing placed on it, sized from the
+#            type scale rather than from the frame.
+#
+# Both cost something, and the choice is worth making on purpose. `stretch` spends
+# every pixel, and to spend them it inflates what is in the cell: one short reading
+# in a tall track either shouts or floats, because the track was sized by the frame
+# and the reading was then grown to meet it. `content` keeps a reading the size the
+# type scale says it is and leaves what is left as margin at the foot of the grid —
+# the same dashboard on a 758-pixel panel and on a 480-pixel one, at the price of
+# the space it declines to fill.
+#
+# One thing changes under `content`. A cell's chrome is then sized from the panel's
+# short side alone — `chrome_scale` times that side, times `type_scale`, and never
+# below `min_type` — and never from the cell it sits in. It has to be, because the
+# row's height is worked out from the type, and type derived from the row's height
+# would be a cell sized by the chrome that is also sizing the chrome. There is no
+# number that satisfies both.
+#
+# So `type_scale` bites differently in the two modes, which is worth knowing before
+# reaching for it. Under `stretch` the chrome is capped by the track it landed in as
+# well — a ninth or so of the cell's height — and on a short track that cap is what
+# decides the size, not anything in this table. Under `content` there is no cap: the
+# number written here is the number drawn.
+#
+# grid = { cols = 4, rows = 3, fit = "content" }
+
+# ---------------------------------------------------------------------------
 # Spacing
 # ---------------------------------------------------------------------------
 #
@@ -114,6 +150,93 @@ grid = { cols = 4, rows = 3 }
 # gap = 10
 # padding = 8
 # border = 1
+
+# ---------------------------------------------------------------------------
+# Style
+# ---------------------------------------------------------------------------
+#
+# Every size and grey the renderer used to hold as a constant, said here instead.
+# The defaults *are* those constants — the values this panel shipped with — so
+# writing the table down changes nothing on the glass until a key is set, and
+# setting one key leaves the other fourteen where they were.
+#
+# Two levels. `[device.style]` is inherited by every widget on the device; a
+# widget's own `style` overrides it key by key, so a cell that wants smaller type
+# says that one number beside its other keys and nothing else:
+#
+#   style = { type_scale = 0.8 }
+#
+# A group's style is what its children inherit, which is how a subdivided cell is
+# restyled as one thing rather than child by child.
+#
+#   type_scale        1.0       multiplier over every size derived from the chrome.
+#                               "Everything is a bit too big" is the note a panel on
+#                               a wall produces most often, and this is that note as
+#                               one number.
+#   chrome_scale      0.030     a cell's label and unit type, as a fraction of the
+#                               panel's short side. Every other size on the cell is
+#                               derived from it, so this moves the whole dashboard
+#                               and `type_scale` is the gentler way to say it.
+#   min_type          12.0      the smallest type anything shrinks to, in pixels. A
+#                               floor on legibility rather than taste, so
+#                               `type_scale` leaves it alone: a cell that has run
+#                               out of room stops here instead of drawing a figure
+#                               nobody can read from a sofa.
+#   reading_ceiling   2.6       how many times the chrome's size a figure may be
+#                               set at. Lower it and a lone reading in a tall cell
+#                               stays a reading instead of becoming a poster.
+#   unit_scale        0.55      the `°C` beside the figure, as a fraction of the
+#                               figure. The unit is confirmation rather than
+#                               information, so it reads smaller than what it
+#                               qualifies.
+#   glyph_share       0.50      a picture's share of a cell it shares with
+#                               readings, stacked. Side by side it takes four
+#                               fifths of this, because there it is the labels that
+#                               run out of room first.
+#   row_rule          false     a hairline under every reading of a multi-reading
+#                               cell.
+#   row_fill          false     carry those rules on to the foot of the cell,
+#                               ruling the lines no reading was written on. A form
+#                               rather than a list; it means nothing on its own,
+#                               without `row_rule`.
+#   row_width         "content" "content" sizes each row to what it says and
+#                               centres it, keeping a name and its figure close
+#                               enough to read as one thing. "full" gives the row
+#                               the whole cell — name at the leading edge, figure
+#                               at the trailing one — which is a table, at the cost
+#                               of the distance between the two.
+#   ink               0         the grey a confirmed reading is drawn in: 0 is
+#                               black, 255 is paper.
+#   muted             102       a label, and a reading nothing has confirmed
+#                               lately.
+#   rule              170       a cell's frame, a bar's edge, a table's lines.
+#   bar_type_scale    0.5       the status bar's type, as a fraction of the bar's
+#                               own thickness, so a thicker bar says the same thing
+#                               larger.
+#   bar_gap_scale     1.4       the space between two things in the bar, as a
+#                               fraction of its type size.
+#   bar_margin_scale  0.6       the margin at each end of the bar, in the same
+#                               fraction.
+#
+# The one bound worth knowing is on the greys: `ink` must be darker than `muted`,
+# which must be darker than `rule`. A held reading has to read lighter than a live
+# one and a rule lighter again, so greys in any other order leave the panel saying
+# the opposite of what it means, and the combination is rejected at load. Every
+# other key is bounded only where a value cannot draw a frame at all — a scale of
+# zero divides the layout by nothing — because taste is the whole point of the
+# table.
+#
+# Four keys turn a list of readings into a ruled table: the figures pulled back
+# towards the size of their labels, a line under each row, those lines carried to
+# the foot of the cell, and every row given the cell's full width so the name sits
+# at one edge and the figure at the other. That was briefly the built-in look, and
+# it is now a choice.
+#
+# [device.style]
+# reading_ceiling = 1.45
+# row_rule = true
+# row_fill = true
+# row_width = "full"
 
 # ---------------------------------------------------------------------------
 # Status bar
@@ -455,6 +578,37 @@ label = "Notes"
 # label = "Dryer"
 # icon_on = "mdi-tumble-dryer"
 # state_text = false
+
+# ---------------------------------------------------------------------------
+# The leftover height
+# ---------------------------------------------------------------------------
+#
+# Under `grid.fit = "content"` the rows take only the height their content asked
+# for, and whatever is left over sits as margin at the foot of the grid. One widget
+# on a device may take that remainder instead, which is what `fill` says:
+#
+# [[device.widget]]
+# id = "shopping"
+# kind = "text"
+# col = 0
+# row = 2
+# col_span = 4
+# label = "Shopping"
+# fill = true
+#
+# One widget, and a second is an error rather than a race won by document order.
+# Two cells asking for the leftover is a rule for splitting it between them, and a
+# rule for splitting the slack between rows is exactly what `fit = "stretch"`
+# already is — so asking for it twice is asking for stretching back.
+#
+# `fill` under `fit = "stretch"` is rejected for the other half of that reason:
+# stretched rows have already divided the frame between them, so there is no
+# remainder to hand anyone and the key reads as a request that cannot be one. It is
+# rejected on a group's child too, whose sub-grid is carved out of a single cell and
+# has none of the frame to give away.
+#
+# The cell that grows is usually the one whose content has no natural size — a
+# `text` cell fed by a push, or a `list` that gains a row when someone adds one.
 
 # ---------------------------------------------------------------------------
 # Tap actions

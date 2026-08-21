@@ -15,30 +15,11 @@ use takumi::prelude::*;
 use time::{Month, OffsetDateTime, Weekday};
 
 use super::{
-    MIN_TYPE_PX, NUMERIC_FAMILY, RenderInputs, UI_FAMILY, fitted, ink, one_line, rule, rule_width,
-    text_node, text_style,
+    NUMERIC_FAMILY, RenderInputs, UI_FAMILY, fitted, ink, one_line, rule, rule_width, text_node,
+    text_style,
 };
 use crate::config::{Alert, Device, Edge, StatusBar, StatusField};
 use crate::telemetry::Telemetry;
-
-/// The type size a bar's thickness affords, as a fraction of it.
-///
-/// Half, so that a line of text sits inside the strip with as much air above and
-/// below it as the glyphs are tall. Derived from the thickness rather than fixed
-/// because the thickness is the only thing an author configures about a bar's
-/// proportions, and a constant here would ignore them.
-const TYPE_SCALE: f32 = 0.5;
-
-/// The margin at each end of the strip, as a fraction of the type size.
-const MARGIN_SCALE: f32 = 0.6;
-
-/// The space between two things in the bar, as a fraction of the type size.
-///
-/// Fixed spacing rather than an even spread across the strip, because the fields
-/// are a row of chrome and not a set of columns: spread evenly, adding a field
-/// moved every other field, and a bar showing two things put one of them in the
-/// middle of the panel where it read as a caption for the cell above it.
-const GAP_SCALE: f32 = 1.4;
 
 /// What a field with nothing to report says.
 ///
@@ -59,10 +40,12 @@ pub fn node(fonts: &Fonts, device: &Device, bar: &StatusBar, inputs: &RenderInpu
         return Node::container(Vec::new());
     };
 
+    let style = &device.style;
+    let greys = super::Greys::of(style);
     let horizontal = matches!(bar.edge, Edge::Top | Edge::Bottom);
-    let size = (bar.thickness as f32 * TYPE_SCALE).max(MIN_TYPE_PX);
-    let margin = size * MARGIN_SCALE;
-    let gap = size * GAP_SCALE;
+    let size = (bar.thickness as f32 * style.bar_type_scale).max(style.min_type);
+    let margin = size * style.bar_margin_scale;
+    let gap = size * style.bar_gap_scale;
     // The axis the fields are spread along, and the one the strip is thick in.
     // Parenthesised: `as` binds tighter than the `if`, so the cast has to be told
     // it applies to whichever arm was taken rather than to the last one.
@@ -90,6 +73,7 @@ pub fn node(fonts: &Fonts, device: &Device, bar: &StatusBar, inputs: &RenderInpu
                 field,
                 available,
                 size,
+                greys,
             )
         })
         .collect::<Vec<_>>();
@@ -102,7 +86,7 @@ pub fn node(fonts: &Fonts, device: &Device, bar: &StatusBar, inputs: &RenderInpu
         .alerts
         .iter()
         .filter(|alert| is_raised(alert, inputs))
-        .map(|alert| alert_node(fonts, alert, inputs, available, size))
+        .map(|alert| alert_node(fonts, alert, inputs, available, size, greys))
         .collect::<Vec<_>>();
 
     let direction = if horizontal {
@@ -142,7 +126,7 @@ pub fn node(fonts: &Fonts, device: &Device, bar: &StatusBar, inputs: &RenderInpu
             .with(StyleDeclaration::padding_top(Length::Px(margin)))
             .with(StyleDeclaration::padding_bottom(Length::Px(margin)))
     };
-    for declaration in separator(bar.edge) {
+    for declaration in separator(bar.edge, greys) {
         style = style.with(declaration);
     }
 
@@ -186,6 +170,7 @@ fn alert_node(
     inputs: &RenderInputs<'_>,
     available: f32,
     size: f32,
+    greys: super::Greys,
 ) -> Node {
     let mut children = Vec::new();
     if let Some(icon) = alert
@@ -196,13 +181,15 @@ fn alert_node(
         // Drawn in full ink, not the bar's grey: the rest of the strip is chrome
         // that is always there, and this is the one thing on it that means
         // something happened.
-        children.push(super::icon_node(icon, size, super::Ink::Current));
+        children.push(super::icon_node(icon, size, super::Ink::Current, greys));
     }
     if let Some(label) = &alert.label {
         children.push(fitted(fonts, available, size, |size| {
             text_node(
                 label,
-                one_line(text_style(size, 700.0, UI_FAMILY).with(StyleDeclaration::color(ink()))),
+                one_line(
+                    text_style(size, 700.0, UI_FAMILY).with(StyleDeclaration::color(ink(greys))),
+                ),
             )
         }));
     }
@@ -224,27 +211,27 @@ fn alert_node(
 /// That side and no other: the bar's remaining three sides are the frame's own
 /// edges, and a line drawn along those reads as a border around the whole panel
 /// rather than as a strip set apart from the grid.
-fn separator(edge: Edge) -> [StyleDeclaration; 3] {
+fn separator(edge: Edge, greys: super::Greys) -> [StyleDeclaration; 3] {
     match edge {
         Edge::Top => [
             StyleDeclaration::border_bottom_width(rule_width(1.0)),
             StyleDeclaration::border_bottom_style(BorderStyle::Solid),
-            StyleDeclaration::border_bottom_color(rule()),
+            StyleDeclaration::border_bottom_color(rule(greys)),
         ],
         Edge::Bottom => [
             StyleDeclaration::border_top_width(rule_width(1.0)),
             StyleDeclaration::border_top_style(BorderStyle::Solid),
-            StyleDeclaration::border_top_color(rule()),
+            StyleDeclaration::border_top_color(rule(greys)),
         ],
         Edge::Left => [
             StyleDeclaration::border_right_width(rule_width(1.0)),
             StyleDeclaration::border_right_style(BorderStyle::Solid),
-            StyleDeclaration::border_right_color(rule()),
+            StyleDeclaration::border_right_color(rule(greys)),
         ],
         Edge::Right => [
             StyleDeclaration::border_left_width(rule_width(1.0)),
             StyleDeclaration::border_left_style(BorderStyle::Solid),
-            StyleDeclaration::border_left_color(rule()),
+            StyleDeclaration::border_left_color(rule(greys)),
         ],
     }
 }
@@ -261,11 +248,20 @@ fn separator(edge: Edge) -> [StyleDeclaration; 3] {
 /// Held to one line, which is not a nicety: the strip is a fixed number of pixels
 /// thick, and a run that wrapped would be laid out taller than that and push the
 /// bar out of the shape the grid was shrunk to sit beside.
-fn field_node(fonts: &Fonts, text: &str, field: StatusField, available: f32, design: f32) -> Node {
+fn field_node(
+    fonts: &Fonts,
+    text: &str,
+    field: StatusField,
+    available: f32,
+    design: f32,
+    greys: super::Greys,
+) -> Node {
     fitted(fonts, available, design, |size| {
         text_node(
             text,
-            one_line(text_style(size, 400.0, face(field)).with(StyleDeclaration::color(ink()))),
+            one_line(
+                text_style(size, 400.0, face(field)).with(StyleDeclaration::color(ink(greys))),
+            ),
         )
     })
 }

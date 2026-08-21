@@ -222,7 +222,7 @@ impl Taps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ServiceCall, WidgetKind};
+    use crate::config::{ServiceCall, Style, WidgetKind};
     use crate::ha::Reading;
 
     /// A [`HaClient`] that records every service call and answers however the test
@@ -291,6 +291,8 @@ mod tests {
             icon_off: None,
             readings: Vec::new(),
             group: None,
+            fill: false,
+            style: Style::default(),
             tap,
         }
     }

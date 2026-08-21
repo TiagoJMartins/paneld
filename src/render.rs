@@ -12,6 +12,7 @@
 mod encode;
 mod grid;
 mod icon;
+mod natural;
 mod status_bar;
 
 pub use encode::{frame_hash, quantise_and_encode};
@@ -23,7 +24,7 @@ use anyhow::{Context, Result, anyhow};
 use takumi::prelude::*;
 use time::OffsetDateTime;
 
-use crate::config::{Device, Dither, Edge, Palette, Widget, WidgetKind};
+use crate::config::{Device, Dither, Edge, Fit, Palette, Widget, WidgetKind};
 use crate::content::{ContentRecord, Row};
 use crate::ha::{Reading, Reported};
 use crate::icon::Icon;
@@ -43,14 +44,6 @@ const INTER_REGULAR: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf")
 const INTER_BOLD: &[u8] = include_bytes!("../assets/fonts/Inter-Bold.ttf");
 const MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf");
 const MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Bold.ttf");
-
-/// A unit's size relative to the figure it belongs to.
-///
-/// Slightly smaller, not much: the unit is part of the reading, and shrinking it
-/// to caption size makes `23.4 °C` read as a number with a footnote. Big enough
-/// to be read at the same glance, small enough that the number is still the thing
-/// the eye lands on.
-const UNIT_SCALE: f32 = 0.55;
 
 /// Everything one frame is rendered from.
 ///
@@ -195,7 +188,7 @@ pub fn render_placeholder(
                 14.0 * scale,
             ))))
             .with(StyleDeclaration::background_color(paper()))
-            .with(StyleDeclaration::color(ink()))
+            .with(StyleDeclaration::color(ink(Greys::of(&Default::default()))))
             .with(StyleDeclaration::text_align(TextAlign::Center))
             .with(StyleDeclaration::font_family(family(UI_FAMILY))),
     );
@@ -238,7 +231,7 @@ fn dashboard_node(fonts: &Fonts, inputs: &RenderInputs<'_>) -> Node {
         .with(StyleDeclaration::width(Length::Px(device.width as f32)))
         .with(StyleDeclaration::height(Length::Px(device.height as f32)))
         .with(StyleDeclaration::background_color(paper()))
-        .with(StyleDeclaration::color(ink()))
+        .with(StyleDeclaration::color(ink(Greys::of(&device.style))))
         .with(StyleDeclaration::font_family(family(UI_FAMILY)));
 
     let grid = grid_node(fonts, inputs);
@@ -306,9 +299,17 @@ fn grid_node(fonts: &Fonts, inputs: &RenderInputs<'_>) -> Node {
             .with(StyleDeclaration::grid_template_columns(Some(equal_tracks(
                 grid.cols,
             ))))
-            .with(StyleDeclaration::grid_template_rows(Some(equal_tracks(
-                grid.rows,
+            // The row tracks come from the layout rather than being restated here,
+            // and that is the whole of `fit = "content"` on the render side: the
+            // layout is what the tap hit test resolves against, so a track it did not
+            // compute is a cell a finger cannot land on.
+            .with(StyleDeclaration::grid_template_rows(Some(pixel_tracks(
+                layout.row_tracks(),
             ))))
+            // A content-fitted grid whose tracks do not fill the area leaves the
+            // remainder at the bottom rather than sharing it out. That is the point of
+            // it: a cell is as tall as what is in it, and the slack is margin.
+            .with(StyleDeclaration::align_content(JustifyContent::Start))
             .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
                 gutter,
             ))))
@@ -332,6 +333,21 @@ fn equal_tracks(n: u32) -> GridTemplateComponents {
         .collect()
 }
 
+/// Tracks at exactly the pixel heights the layout computed.
+///
+/// Stated in pixels rather than as fractions even under `fit = "stretch"`, where
+/// they are all equal: the layout has already divided the area, and having the grid
+/// divide it a second time is how a rounding difference between the two puts a cell
+/// half a pixel from where a tap resolves it.
+fn pixel_tracks(heights: &[f32]) -> GridTemplateComponents {
+    heights
+        .iter()
+        .map(|&h| {
+            GridTemplateComponent::Single(GridTrackSize::Fixed(GridLength::Unit(Length::Px(h))))
+        })
+        .collect()
+}
+
 /// One widget's cell, placed explicitly on the grid.
 ///
 /// Recursive, and terminating without a depth guard of any kind: a group's
@@ -350,8 +366,6 @@ fn cell_node(
     // box here as `cell * span` measured a 2x2 ten pixels short of where
     // `Layout::rect` places it — the exact disagreement `rect` exists to prevent.
     let (_, _, span_w, span_h) = layout.rect(widget);
-    // The panel's short side, which is what a viewing distance is a fraction of.
-    let device_short_side = inputs.device.width.min(inputs.device.height) as f32;
     let padding = layout.padding();
     let border = layout.border();
     // Padding on both sides, plus a rule on each. Read from the layout rather than
@@ -360,6 +374,8 @@ fn cell_node(
     let chrome = layout.inset();
     // What a cell's contents actually have to fit inside.
     let content_w = (span_w - chrome).max(1.0);
+    let style = &widget.style;
+    let greys = Greys::of(style);
     // Chrome is sized to the *panel*, bounded by what a cell can hold — never to
     // the span, and never to the cell alone.
     //
@@ -371,9 +387,16 @@ fn cell_node(
     // that competes with content is not chrome. A label's job is to name a cell at
     // a glance and then get out of the way, and the size that does that is a
     // property of how far away the glass is — which is the frame, not the grid.
-    let label_px = (device_short_side * CHROME_SCALE)
-        .min(layout.cell().1 * 0.11)
-        .max(MIN_TYPE_PX);
+    //
+    // Under `fit = "content"` the cell bound is dropped rather than tightened: a
+    // track there is as tall as its content, its content is sized from the chrome,
+    // and the chrome cannot be sized from the track without the three of them
+    // chasing each other. The panel alone decides it.
+    let chrome_px = natural::chrome_type(inputs.device, *style);
+    let label_px = match inputs.device.grid.fit {
+        Fit::Content => chrome_px,
+        Fit::Stretch => chrome_px.min(layout.cell().1 * 0.11).max(style.min_type),
+    };
     let gap = (span_h * 0.03).clamp(2.0, 8.0);
 
     let mut children = Vec::new();
@@ -410,6 +433,7 @@ fn cell_node(
                 width: content_w,
                 height: content_h,
                 label_px,
+                style: &widget.style,
             },
         ))
         .with_style(
@@ -450,10 +474,10 @@ fn cell_node(
             .with(StyleDeclaration::border_right_style(BorderStyle::Solid))
             .with(StyleDeclaration::border_bottom_style(BorderStyle::Solid))
             .with(StyleDeclaration::border_left_style(BorderStyle::Solid))
-            .with(StyleDeclaration::border_top_color(rule()))
-            .with(StyleDeclaration::border_right_color(rule()))
-            .with(StyleDeclaration::border_bottom_color(rule()))
-            .with(StyleDeclaration::border_left_color(rule()));
+            .with(StyleDeclaration::border_top_color(rule(greys)))
+            .with(StyleDeclaration::border_right_color(rule(greys)))
+            .with(StyleDeclaration::border_bottom_color(rule(greys)))
+            .with(StyleDeclaration::border_left_color(rule(greys)));
     }
 
     Node::container(children).with_style(
@@ -551,7 +575,12 @@ fn header_node(
 
     let mut left = Vec::new();
     if let Some(icon) = icon {
-        left.push(icon_node(icon, label_px * 1.15, cell.ink));
+        left.push(icon_node(
+            icon,
+            label_px * 1.15,
+            cell.ink,
+            Greys::of(&widget.style),
+        ));
     }
     if let Some(label) = &widget.label {
         left.push(fitted(fonts, label_w, label_px, |size| {
@@ -559,7 +588,7 @@ fn header_node(
                 label,
                 one_line(
                     text_style(size, 700.0, UI_FAMILY)
-                        .with(StyleDeclaration::color(muted()))
+                        .with(StyleDeclaration::color(muted(Greys::of(&widget.style))))
                         .with(StyleDeclaration::letter_spacing(Length::Px(size * 0.06)))
                         .with(StyleDeclaration::text_transform(TextTransform::Uppercase)),
                 ),
@@ -590,6 +619,7 @@ fn header_node(
             },
             mark_w,
             Ink::Held,
+            Greys::of(&widget.style),
         ));
     }
 
@@ -625,21 +655,29 @@ fn line(coordinate: u32) -> GridPlacement {
 /// capped — is measured against the chrome that names it. Passing them separately
 /// was six arguments deep by the time a weather cell had split its box in two.
 #[derive(Debug, Clone, Copy)]
-struct Space {
+struct Space<'a> {
     width: f32,
     height: f32,
     /// The cell's label size: chrome, and the yardstick a reading is held to.
     label_px: f32,
+    /// Every size and grey this cell is drawn with, already resolved from the
+    /// device's style and the widget's own.
+    style: &'a crate::config::Style,
 }
 
-impl Space {
-    /// The same chrome, over a smaller box.
+impl<'a> Space<'a> {
+    /// The same chrome and style, over a smaller box.
     fn sized(&self, width: f32, height: f32) -> Self {
         Self {
             width,
             height,
             label_px: self.label_px,
+            style: self.style,
         }
+    }
+
+    fn greys(&self) -> Greys {
+        Greys::of(self.style)
     }
 }
 
@@ -657,7 +695,9 @@ fn body_nodes(fonts: &Fonts, body: &Body, ink: Ink, space: Space) -> Vec<Node> {
         width: content_w,
         height: content_h,
         label_px,
+        style,
     } = space;
+    let greys = space.greys();
     match body {
         Body::Figure { text, unit } => {
             // The design size *is* the box's height: a run set at that size overflows
@@ -665,7 +705,7 @@ fn body_nodes(fonts: &Fonts, body: &Body, ink: Ink, space: Space) -> Vec<Node> {
             // whichever limit actually binds. Fitting width alone, as this did, left
             // the height unused — which on a nearly square cell is most of the cell.
             vec![fitted_box(fonts, content_w, content_h, content_h, |size| {
-                figure_node(text, unit.as_deref(), ink, size)
+                figure_node(text, unit.as_deref(), ink, size, style, greys)
             })]
         }
 
@@ -676,16 +716,16 @@ fn body_nodes(fonts: &Fonts, body: &Body, ink: Ink, space: Space) -> Vec<Node> {
         } => sky_nodes(fonts, svg, condition.as_deref(), rows, ink, space),
 
         Body::Beacon { on, icon, text } => {
-            beacon_nodes(fonts, *on, icon.as_ref(), *text, ink, content_w, content_h)
+            beacon_nodes(fonts, *on, icon.as_ref(), *text, ink, space)
         }
 
         Body::Prose(text) => {
-            let prose_px = (content_h * 0.14).max(MIN_TYPE_PX);
+            let prose_px = (content_h * 0.14).max(style.min_type);
             let lines = (content_h / (prose_px * 1.35)).floor();
             vec![text_node(
                 text,
                 text_style(prose_px, 400.0, UI_FAMILY)
-                    .with(StyleDeclaration::color(ink.colour()))
+                    .with(StyleDeclaration::color(ink.colour(greys)))
                     .with(StyleDeclaration::line_height(LineHeight::Unitless(1.3)))
                     // The width the run wraps at, stated rather than inherited. A
                     // bare text node is block-level, so left alone it takes its
@@ -728,13 +768,13 @@ fn body_nodes(fonts: &Fonts, body: &Body, ink: Ink, space: Space) -> Vec<Node> {
             Node::container(vec![fitted(
                 fonts,
                 content_w,
-                (label_px * 1.1).max(MIN_TYPE_PX),
+                (label_px * 1.1).max(style.min_type),
                 |size| {
                     text_node(
                         reason,
                         one_line(
                             text_style(size, 400.0, UI_FAMILY)
-                                .with(StyleDeclaration::color(muted())),
+                                .with(StyleDeclaration::color(muted(greys))),
                         ),
                     )
                 },
@@ -789,7 +829,7 @@ fn sky_nodes(
                 content_w,
                 content_h,
                 content_h,
-                |size| sky_node(svg, condition, ink, size),
+                |size| sky_node(svg, condition, ink, size, space.greys()),
             )])
             .with_style(
                 Style::default()
@@ -802,12 +842,15 @@ fn sky_nodes(
 
     let beside = content_w > content_h;
     let gap = (content_w.min(content_h) * 0.06).clamp(2.0, 12.0);
-    // The glyph takes under half of a split width and half of a split height. Side
-    // by side the readings carry far more glyphs than the picture does, and their
-    // labels are what runs out of room first; stacked, the two are equals.
+    // `glyph_share` of a split height, and four fifths of that share when the two sit
+    // side by side instead: there the readings carry far more glyphs than the picture
+    // does and their labels are what runs out of room first, where stacked the two are
+    // equals. One key rather than two, because an author moving the picture's weight
+    // means it in both orientations.
+    let share = space.style.glyph_share;
     let (glyph_w, glyph_h) = match beside {
-        true => ((content_w - gap) * 0.40, content_h),
-        false => (content_w, (content_h - gap) * 0.50),
+        true => ((content_w - gap) * share * 0.8, content_h),
+        false => (content_w, (content_h - gap) * share),
     };
     let (rows_w, rows_h) = match beside {
         true => (content_w - gap - glyph_w, content_h),
@@ -815,7 +858,7 @@ fn sky_nodes(
     };
 
     let glyph = Node::container(vec![fitted_box(fonts, glyph_w, glyph_h, glyph_h, |size| {
-        sky_node(svg, condition, ink, size)
+        sky_node(svg, condition, ink, size, space.greys())
     })])
     .with_style(
         Style::default()
@@ -864,9 +907,10 @@ fn beacon_nodes(
     icon: Option<&Icon>,
     text: bool,
     ink: Ink,
-    content_w: f32,
-    content_h: f32,
+    space: Space<'_>,
 ) -> Vec<Node> {
+    let (content_w, content_h) = (space.width, space.height);
+    let greys = space.greys();
     // The indicator is the reading, so it takes the height it is given, bounded by
     // whatever width the caption leaves it. With no caption it is bounded by the box
     // itself, just short of it so that it never touches the cell's rule.
@@ -879,8 +923,8 @@ fn beacon_nodes(
     let indicator = match icon {
         // At the dot's size and in the dot's place, so configuring an icon is a
         // change of picture rather than a change of layout.
-        Some(icon) => icon_node(icon, size, ink),
-        None => dot_node(size, on, ink),
+        Some(icon) => icon_node(icon, size, ink, greys),
+        None => dot_node(size, on, ink, greys),
     };
     let mut children = vec![indicator];
     if text {
@@ -893,7 +937,7 @@ fn beacon_nodes(
                     if on { "ON" } else { "OFF" },
                     one_line(
                         text_style(px, 700.0, UI_FAMILY)
-                            .with(StyleDeclaration::color(ink.colour())),
+                            .with(StyleDeclaration::color(ink.colour(greys))),
                     ),
                 )
             },
@@ -917,7 +961,7 @@ fn beacon_nodes(
 ///
 /// Drawn as a shape rather than a glyph so the indicator does not depend on the
 /// embedded faces covering any particular symbol.
-fn dot_node(size: f32, on: bool, ink: Ink) -> Node {
+fn dot_node(size: f32, on: bool, ink: Ink, greys: Greys) -> Node {
     Node::container(Vec::new()).with_style(
         Style::default()
             .with(StyleDeclaration::width(Length::Px(size)))
@@ -927,7 +971,7 @@ fn dot_node(size: f32, on: bool, ink: Ink) -> Node {
             .with(StyleDeclaration::border_bottom_right_radius(radius(size)))
             .with(StyleDeclaration::border_bottom_left_radius(radius(size)))
             .with(StyleDeclaration::background_color(match on {
-                true => ink.colour(),
+                true => ink.colour(greys),
                 false => paper(),
             }))
             .with(StyleDeclaration::border_top_width(LineWidth::Length(
@@ -946,22 +990,12 @@ fn dot_node(size: f32, on: bool, ink: Ink) -> Node {
             .with(StyleDeclaration::border_right_style(BorderStyle::Solid))
             .with(StyleDeclaration::border_bottom_style(BorderStyle::Solid))
             .with(StyleDeclaration::border_left_style(BorderStyle::Solid))
-            .with(StyleDeclaration::border_top_color(ink.colour()))
-            .with(StyleDeclaration::border_right_color(ink.colour()))
-            .with(StyleDeclaration::border_bottom_color(ink.colour()))
-            .with(StyleDeclaration::border_left_color(ink.colour())),
+            .with(StyleDeclaration::border_top_color(ink.colour(greys)))
+            .with(StyleDeclaration::border_right_color(ink.colour(greys)))
+            .with(StyleDeclaration::border_bottom_color(ink.colour(greys)))
+            .with(StyleDeclaration::border_left_color(ink.colour(greys))),
     )
 }
-
-/// How much larger than a cell's own chrome a reading may be set.
-///
-/// A ceiling, and the only place in this module where a size is not simply the
-/// space available. A single `value` cell exists to be one number and should fill
-/// its box; a column of readings is a table, and a table set to fill a 700x1000
-/// cell is four numbers shouting at a room. Tied to the chrome that names them
-/// rather than fixed in pixels so that it scales with the panel: a reading reads as
-/// the content at a little under twice the label above it, at any panel size.
-const ROW_TYPE_CEILING: f32 = 2.6;
 
 /// How much of a cell's width the widest reading is grown to occupy.
 ///
@@ -988,12 +1022,21 @@ const ROW_GAP_CEILING: f32 = 1.1;
 ///
 /// Shared by a `list` body and by a weather cell's readings, because they are one
 /// thing: `n` labelled values sized and aligned to a box together.
+///
+/// Three keys of a cell's [`crate::config::Style`] decide whether that column reads
+/// as a block of figures or as a ruled table: `row_width` puts a line's name and its
+/// figure at opposite edges of the cell instead of close together, `row_rule` draws a
+/// hairline under each one, and `row_fill` carries those rules on to the foot of the
+/// cell so a short table reads as a form rather than as a hole. All three default
+/// off, which is the block.
 fn rows_node(fonts: &Fonts, rows: &[Line], space: Space) -> Node {
     let Space {
         width,
         height,
         label_px,
+        style,
     } = space;
+    let greys = space.greys();
     // Three things bound a reading's size, and the smallest wins.
     //
     // The height, because the rows are laid out down the box. The width, because a
@@ -1002,15 +1045,15 @@ fn rows_node(fonts: &Fonts, rows: &[Line], space: Space) -> Node {
     // `COLUMN_TARGET` of the width, which is what makes a cell look filled rather
     // than furnished. And the ceiling, because past it a table stops being a table.
     let by_height = height / (rows.len().max(1) as f32 * 1.48 - 0.28);
-    let by_width = width_driven_size(fonts, rows, width);
+    let by_width = width_driven_size(fonts, rows, width, greys);
     let design = by_height
         .min(by_width)
-        .min(label_px * ROW_TYPE_CEILING)
-        .max(MIN_TYPE_PX);
+        .min(label_px * style.reading_ceiling)
+        .max(style.min_type);
     // Shaved against the real measurement at the size actually chosen: the estimate
     // above is linear in the type size, which is exact for a text run and slightly
     // out once a glyph's own margins are in the row.
-    let row_px = rows_size(fonts, rows, width, design);
+    let row_px = rows_size(fonts, rows, width, design, greys);
 
     // The column is as wide as its widest row needs and no wider, then centred.
     //
@@ -1021,18 +1064,20 @@ fn rows_node(fonts: &Fonts, rows: &[Line], space: Space) -> Node {
     // content — would have cost the thing that makes a column of readings
     // scannable, which is that the figures line up. So the column keeps its right
     // edge and loses the emptiness.
-    let widest = rows
-        .iter()
-        .map(|line| intrinsic_width(fonts, row_runs(line, row_px)))
-        .fold(0.0, f32::max);
-    let column = (widest * COLUMN_SLACK).clamp(1.0, width);
-
-    let children = rows
-        .iter()
-        // Each line's own ink, not the cell's: one unreachable sensor mutes its own
-        // line and leaves the readings around it black.
-        .map(|line| row_node(line, row_px, column))
-        .collect::<Vec<_>>();
+    //
+    // `row_width = "full"` is the other trade, for an author who wants the table:
+    // the rules then reach both edges of the cell and the eye crosses the gap on
+    // one of them instead of on nothing.
+    let column = match style.row_width {
+        crate::config::RowWidth::Full => width,
+        crate::config::RowWidth::Content => {
+            let widest = rows
+                .iter()
+                .map(|line| intrinsic_width(fonts, row_runs(line, row_px, greys)))
+                .fold(0.0, f32::max);
+            (widest * COLUMN_SLACK).clamp(1.0, width)
+        }
+    };
 
     // Down the axis, the gap is bounded rather than spread. Sharing out whatever
     // the ceiling left over put a hundred and eighty pixels between two readings,
@@ -1043,15 +1088,63 @@ fn rows_node(fonts: &Fonts, rows: &[Line], space: Space) -> Node {
             .min(row_px * ROW_GAP_CEILING),
     );
 
+    let mut children = rows
+        .iter()
+        // Each line's own ink, not the cell's: one unreachable sensor mutes its own
+        // line and leaves the readings around it black.
+        .map(|line| row_node(line, row_px, column, style, greys))
+        .collect::<Vec<_>>();
+
+    // The rest of the page, ruled and left blank. Only offered with the rules on,
+    // because without them it would draw nothing at all: the blank lines *are* their
+    // rules.
+    if style.row_rule && style.row_fill {
+        let pitch = row_px * ROW_LINE + gap;
+        let ruled = (height / pitch).floor() as usize;
+        children
+            .extend((rows.len()..ruled).map(|_| blank_row_node(row_px * ROW_LINE, column, greys)));
+    }
+
     Node::container(children).with_style(
         Style::default()
             .with(StyleDeclaration::display(Display::Flex))
             .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-            .with(StyleDeclaration::justify_content(JustifyContent::Center))
+            // Ruled from the top when the rules are on, because a form starts at the
+            // top of its page; centred otherwise, because a block of figures with air
+            // above and below it is a block, and air is what tells the eye so.
+            .with(StyleDeclaration::justify_content(match style.row_rule {
+                true => JustifyContent::Start,
+                false => JustifyContent::Center,
+            }))
             .with(StyleDeclaration::align_items(AlignItems::Center))
             .with(StyleDeclaration::height(Length::Px(height)))
             .with(StyleDeclaration::width(Length::Px(width)))
             .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(gap)))),
+    )
+}
+
+/// The line box a run of the panel's faces occupies, as a multiple of its size.
+///
+/// Measured off a rendered frame rather than taken from the font, because it is the
+/// engine's laid-out line that a blank ruled line has to agree with. Only reached
+/// with `row_fill` on, and being wrong there costs an uneven last pitch rather than
+/// anything a reader would notice.
+const ROW_LINE: f32 = 1.29;
+
+/// A ruled line with nothing written on it, at a real line's height.
+///
+/// Nothing inside it, so unlike a line of type it cannot overflow the height it is
+/// given — which is why this one may be handed a fixed height and a reading may not.
+fn blank_row_node(height: f32, width: f32, greys: Greys) -> Node {
+    Node::container(Vec::new()).with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::width(Length::Px(width)))
+            .with(StyleDeclaration::height(Length::Px(height)))
+            .with(StyleDeclaration::flex_shrink(Some(FlexGrow(0.0))))
+            .with(StyleDeclaration::border_bottom_width(rule_width(1.0)))
+            .with(StyleDeclaration::border_bottom_style(BorderStyle::Solid))
+            .with(StyleDeclaration::border_bottom_color(rule(greys))),
     )
 }
 
@@ -1065,11 +1158,11 @@ fn rows_node(fonts: &Fonts, rows: &[Line], space: Space) -> Node {
 /// a 950 pixel cell with a third of the panel blank on either side of it. Filling
 /// the space is not vanity: on a wall panel every pixel not spent on a reading is a
 /// pixel spent making the reading smaller than it could have been.
-fn width_driven_size(fonts: &Fonts, rows: &[Line], width: f32) -> f32 {
+fn width_driven_size(fonts: &Fonts, rows: &[Line], width: f32, greys: Greys) -> f32 {
     const REFERENCE: f32 = 100.0;
     let widest = rows
         .iter()
-        .map(|line| intrinsic_width(fonts, row_runs(line, REFERENCE)))
+        .map(|line| intrinsic_width(fonts, row_runs(line, REFERENCE, greys)))
         .fold(0.0, f32::max);
     if widest <= 0.0 {
         return REFERENCE;
@@ -1088,10 +1181,10 @@ fn width_driven_size(fonts: &Fonts, rows: &[Line], width: f32) -> f32 {
 /// design size the widest row should fit at, and this shaves it if the measurement
 /// disagrees. Without it, a reading long enough to overflow was drawn overflowing —
 /// `Office 21.3 °C` at 74px in a 322px cell overprinted its neighbours.
-fn rows_size(fonts: &Fonts, rows: &[Line], width: f32, design: f32) -> f32 {
+fn rows_size(fonts: &Fonts, rows: &[Line], width: f32, design: f32, greys: Greys) -> f32 {
     let widest = rows
         .iter()
-        .map(|line| intrinsic_width(fonts, row_runs(line, design)))
+        .map(|line| intrinsic_width(fonts, row_runs(line, design, greys)))
         .fold(0.0, f32::max);
     fit_size(widest, width, design)
 }
@@ -1105,11 +1198,19 @@ fn rows_size(fonts: &Fonts, rows: &[Line], width: f32, design: f32) -> f32 {
 ///
 /// Takes its size rather than choosing one: [`fitted`] decides that, so the unit
 /// is measured into the fit rather than estimated around it.
-fn figure_node(text: &str, unit: Option<&str>, ink: Ink, size: f32) -> Node {
+fn figure_node(
+    text: &str,
+    unit: Option<&str>,
+    ink: Ink,
+    size: f32,
+    style: &crate::config::Style,
+    greys: Greys,
+) -> Node {
     let mut children = vec![text_node(
         text,
         one_line(
-            text_style(size, 700.0, NUMERIC_FAMILY).with(StyleDeclaration::color(ink.colour())),
+            text_style(size, 700.0, NUMERIC_FAMILY)
+                .with(StyleDeclaration::color(ink.colour(greys))),
         ),
     )];
     if let Some(unit) = unit {
@@ -1124,15 +1225,15 @@ fn figure_node(text: &str, unit: Option<&str>, ink: Ink, size: f32) -> Node {
             Node::container(vec![text_node(
                 unit,
                 one_line(
-                    text_style(size * UNIT_SCALE, 400.0, UI_FAMILY)
-                        .with(StyleDeclaration::color(ink.colour())),
+                    text_style(size * style.unit_scale, 400.0, UI_FAMILY)
+                        .with(StyleDeclaration::color(ink.colour(greys))),
                 ),
             )])
             .with_style(
                 Style::default()
                     .with(StyleDeclaration::display(Display::Flex))
                     .with(StyleDeclaration::padding_bottom(Length::Px(
-                        size * (1.0 - UNIT_SCALE) * UNIT_BASELINE_LIFT,
+                        size * (1.0 - style.unit_scale) * UNIT_BASELINE_LIFT,
                     ))),
             ),
         );
@@ -1160,7 +1261,7 @@ fn figure_node(text: &str, unit: Option<&str>, ink: Ink, size: f32) -> Node {
 /// *is* the block: it is returned bare rather than wrapped in a one-child column, so
 /// [`fitted_box`] fits the picture to the whole box instead of to a box with a
 /// caption's worth of height and a row gap still reserved inside it.
-fn sky_node(svg: &str, condition: Option<&str>, ink: Ink, size: f32) -> Node {
+fn sky_node(svg: &str, condition: Option<&str>, ink: Ink, size: f32, greys: Greys) -> Node {
     let glyph = icon_node(
         &Icon::Svg {
             markup: svg.to_owned(),
@@ -1168,6 +1269,7 @@ fn sky_node(svg: &str, condition: Option<&str>, ink: Ink, size: f32) -> Node {
         },
         size,
         ink,
+        greys,
     );
     let Some(condition) = condition else {
         return glyph;
@@ -1179,7 +1281,7 @@ fn sky_node(svg: &str, condition: Option<&str>, ink: Ink, size: f32) -> Node {
             condition,
             one_line(
                 text_style(caption_px, 400.0, UI_FAMILY)
-                    .with(StyleDeclaration::color(ink.colour())),
+                    .with(StyleDeclaration::color(ink.colour(greys))),
             ),
         ),
     ])
@@ -1226,14 +1328,6 @@ const UNIT_BASELINE_LIFT: f32 = 0.279;
 /// than one that overflows. A value long enough to hit this is a config or
 /// publisher problem, and it should look like one.
 const MIN_TYPE_PX: f32 = 12.0;
-
-/// A cell's chrome type, as a fraction of the panel's short side.
-///
-/// A label is read at the same distance as everything else on the glass, so its
-/// size belongs to the panel and not to whichever cell it happens to name. Set so
-/// that on the 1072-pixel side of the panel in service a label lands near 32px —
-/// legible across a room, and a clear third of the reading it introduces.
-const CHROME_SCALE: f32 = 0.030;
 
 /// Builds a run at the largest size, up to `design`, at which it fits `available`
 /// pixels wide.
@@ -1352,12 +1446,12 @@ fn grey_ink(level: u8) -> ColorInput {
 ///
 /// A held cell always wins over an icon's own grey. The muting is what the corner
 /// mark means, and an icon that stayed its configured colour would undercut it.
-fn icon_node(icon: &Icon, size: f32, ink: Ink) -> Node {
+fn icon_node(icon: &Icon, size: f32, ink: Ink, greys: Greys) -> Node {
     let data = match icon {
         Icon::Svg { markup, ink: own } => {
             let colour = match (ink, own) {
                 (Ink::Current, Some(grey)) => grey_ink(*grey),
-                _ => ink.colour(),
+                _ => ink.colour(greys),
             };
             ImageData {
                 src: ImageSourceInput::Url(paint_svg(markup, colour).into()),
@@ -1420,20 +1514,35 @@ fn paint_svg(markup: &str, colour: ColorInput) -> String {
 
 /// One line of a multi-reading widget: label on the left, value on the right,
 /// stretched across the box it is laid out in.
-fn row_node(line: &Line, size: f32, width: f32) -> Node {
-    Node::container(row_runs_children(line, size)).with_style(
-        Style::default()
-            .with(StyleDeclaration::display(Display::Flex))
-            .with(StyleDeclaration::flex_direction(FlexDirection::Row))
-            .with(StyleDeclaration::justify_content(
-                JustifyContent::SpaceBetween,
-            ))
-            .with(StyleDeclaration::align_items(AlignItems::Center))
-            .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
-                size * 0.5,
-            ))))
-            .with(StyleDeclaration::width(Length::Px(width))),
-    )
+///
+/// With `row_rule` on it carries a hairline beneath it, drawn in the rule grey and
+/// not in the reading's own: a muted sensor mutes its figure, and a table whose
+/// rules faded with it would read as a broken table rather than as a stale reading.
+fn row_node(
+    line: &Line,
+    size: f32,
+    width: f32,
+    style: &crate::config::Style,
+    greys: Greys,
+) -> Node {
+    let mut declarations = Style::default()
+        .with(StyleDeclaration::display(Display::Flex))
+        .with(StyleDeclaration::flex_direction(FlexDirection::Row))
+        .with(StyleDeclaration::justify_content(
+            JustifyContent::SpaceBetween,
+        ))
+        .with(StyleDeclaration::align_items(AlignItems::Center))
+        .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
+            size * 0.5,
+        ))))
+        .with(StyleDeclaration::width(Length::Px(width)));
+    if style.row_rule {
+        declarations = declarations
+            .with(StyleDeclaration::border_bottom_width(rule_width(1.0)))
+            .with(StyleDeclaration::border_bottom_style(BorderStyle::Solid))
+            .with(StyleDeclaration::border_bottom_color(rule(greys)));
+    }
+    Node::container(row_runs_children(line, size, greys)).with_style(declarations)
 }
 
 /// The same row, sized to its own runs instead of to its box.
@@ -1443,8 +1552,8 @@ fn row_node(line: &Line, size: f32, width: f32) -> Node {
 /// the fit that decides a column's type size has to be taken on a content-sized
 /// copy. The gap between label and value is kept, because it is width the row
 /// genuinely needs.
-fn row_runs(line: &Line, size: f32) -> Node {
-    Node::container(row_runs_children(line, size)).with_style(
+fn row_runs(line: &Line, size: f32, greys: Greys) -> Node {
+    Node::container(row_runs_children(line, size, greys)).with_style(
         Style::default()
             .with(StyleDeclaration::display(Display::Flex))
             .with(StyleDeclaration::flex_direction(FlexDirection::Row))
@@ -1468,7 +1577,7 @@ fn row_runs(line: &Line, size: f32) -> Node {
 /// `21.299999237060547` into a cell a few characters wide. That case is what
 /// [`one_line`]'s ellipsis is for: a run that wrapped inside a one-line box printed
 /// over the reading beneath it.
-fn row_runs_children(line: &Line, size: f32) -> Vec<Node> {
+fn row_runs_children(line: &Line, size: f32, greys: Greys) -> Vec<Node> {
     let row = &line.row;
     let ink = line.ink;
     let label = row.label.clone().or_else(|| row.id.clone());
@@ -1487,12 +1596,14 @@ fn row_runs_children(line: &Line, size: f32) -> Vec<Node> {
         // A shade larger than the type it stands beside. A glyph at the same
         // nominal size as a run of digits reads smaller than they do, because the
         // digits fill their line box and a silhouette sits inside its own margins.
-        naming.push(icon_node(icon, size * 1.15, ink));
+        naming.push(icon_node(icon, size * 1.15, ink, greys));
     }
     if let Some(label) = &label {
         naming.push(text_node(
             label,
-            one_line(text_style(size, 400.0, UI_FAMILY).with(StyleDeclaration::color(muted()))),
+            one_line(
+                text_style(size, 400.0, UI_FAMILY).with(StyleDeclaration::color(muted(greys))),
+            ),
         ));
     }
 
@@ -1509,7 +1620,8 @@ fn row_runs_children(line: &Line, size: f32) -> Vec<Node> {
         text_node(
             &value,
             one_line(
-                text_style(size, 700.0, NUMERIC_FAMILY).with(StyleDeclaration::color(ink.colour())),
+                text_style(size, 700.0, NUMERIC_FAMILY)
+                    .with(StyleDeclaration::color(ink.colour(greys))),
             ),
         ),
     ]
@@ -1570,19 +1682,40 @@ fn paper() -> ColorInput {
     ColorInput::Value(Color([255, 255, 255, 255]))
 }
 
-fn ink() -> ColorInput {
-    ColorInput::Value(Color([0, 0, 0, 255]))
+/// The three greys a frame is drawn in, lifted out of a [`crate::config::Style`].
+///
+/// A small copy rather than a borrow of the whole style, because these travel with
+/// an [`Ink`] into functions that have no business knowing a cell's type scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Greys {
+    ink: u8,
+    muted: u8,
+    rule: u8,
+}
+
+impl Greys {
+    fn of(style: &crate::config::Style) -> Self {
+        Self {
+            ink: style.ink,
+            muted: style.muted,
+            rule: style.rule,
+        }
+    }
+}
+
+fn ink(greys: Greys) -> ColorInput {
+    grey_ink(greys.ink)
 }
 
 /// Secondary text. Mid grey reads as secondary on a 16-level panel and still
 /// resolves to something legible when quantised to fewer levels.
-fn muted() -> ColorInput {
-    ColorInput::Value(Color([102, 102, 102, 255]))
+fn muted(greys: Greys) -> ColorInput {
+    grey_ink(greys.muted)
 }
 
 /// Cell rules, light enough not to compete with the content.
-fn rule() -> ColorInput {
-    ColorInput::Value(Color([170, 170, 170, 255]))
+fn rule(greys: Greys) -> ColorInput {
+    grey_ink(greys.rule)
 }
 
 /// What a cell shows, resolved from configuration plus whatever data exists.
@@ -1610,10 +1743,10 @@ enum Ink {
 }
 
 impl Ink {
-    fn colour(self) -> ColorInput {
+    fn colour(self, greys: Greys) -> ColorInput {
         match self {
-            Self::Current => ink(),
-            Self::Held => muted(),
+            Self::Current => ink(greys),
+            Self::Held => muted(greys),
         }
     }
 }
@@ -2039,8 +2172,23 @@ mod tests {
     /// expensive part and it is immutable once built.
     static FONTS: LazyLock<Fonts> = LazyLock::new(|| fonts().expect("embedded fonts must load"));
 
+    /// The shipped look, which is what almost every test here is about: the point of
+    /// the style table is that a configuration saying nothing renders what it always
+    /// did, so the fixtures assert against the defaults.
+    static STYLE: crate::config::Style = crate::config::Style::SHIPPED;
+
+    const GREYS: Greys = Greys {
+        ink: 0,
+        muted: 102,
+        rule: 170,
+    };
+
     fn device(widgets: Vec<Widget>) -> Device {
-        const GRID: Grid = Grid { cols: 2, rows: 2 };
+        const GRID: Grid = Grid {
+            cols: 2,
+            rows: 2,
+            fit: Fit::Stretch,
+        };
         Device {
             id: "kindle".to_owned(),
             width: 400,
@@ -2051,6 +2199,7 @@ mod tests {
             render_interval: 300,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             grid: GRID,
+            style: crate::config::Style::default(),
             chrome: Chrome::derived(400, 300, GRID),
             status_bar: None,
             widgets,
@@ -2078,8 +2227,229 @@ mod tests {
             icon_off: None,
             readings: Vec::new(),
             group: None,
+            fill: false,
+            style: crate::config::Style::default(),
             tap: None,
         }
+    }
+
+    /// A panel exercising every part of the style table at once: a bar, a figure with
+    /// a unit, a weather cell with its glyph and its readings, and a list.
+    ///
+    /// One fixture rather than one per key, because the property being asserted is
+    /// about the table as a whole — that no key on it is decorative.
+    fn styled_panel(
+        style: crate::config::Style,
+    ) -> (
+        Device,
+        HashMap<String, ContentRecord>,
+        HashMap<Reading, Reported>,
+    ) {
+        const GRID: Grid = Grid {
+            cols: 3,
+            rows: 1,
+            fit: Fit::Stretch,
+        };
+        let mut figure = widget("figure", WidgetKind::Value, 0, 0);
+        figure.unit = Some("\u{b0}C".to_owned());
+        figure.style = style;
+
+        let mut sky = ha_widget("sky", "weather.home", WidgetKind::Weather);
+        sky.col = 1;
+        sky.readings = vec![reading("Temp", "weather.home", Some("\u{b0}C"))];
+        sky.readings[0].attribute = Some("temperature".to_owned());
+        sky.style = style;
+
+        let mut list = widget("rooms", WidgetKind::List, 2, 0);
+        list.readings = ["Office", "Hall"]
+            .iter()
+            .map(|label| reading(label, "sensor.room", Some("\u{b0}C")))
+            .collect();
+        list.style = style;
+
+        let device = Device {
+            grid: GRID,
+            chrome: Chrome::derived(400, 300, GRID),
+            style,
+            status_bar: Some(crate::config::StatusBar {
+                edge: Edge::Bottom,
+                thickness: 40,
+                fields: vec![
+                    crate::config::StatusField::Date,
+                    crate::config::StatusField::Battery,
+                ],
+                alerts: Vec::new(),
+                timezone: crate::config::Timezone::utc(),
+            }),
+            ..device(vec![figure, sky, list])
+        };
+        let states = HashMap::from([
+            (
+                Reading::state("weather.home"),
+                Reported::Fresh("partlycloudy".to_owned()),
+            ),
+            (
+                Reading::attribute("weather.home", "temperature"),
+                Reported::Fresh("19.5".to_owned()),
+            ),
+            (
+                Reading::state("sensor.room"),
+                Reported::Fresh("21.4".to_owned()),
+            ),
+        ]);
+        // The figure cell needs a figure: with nothing pushed it renders `no data`,
+        // and an absence has no unit for `unit_scale` to move.
+        let content = HashMap::from([(
+            "figure".to_owned(),
+            record(serde_json::json!("21.4"), now()),
+        )]);
+        (device, content, states)
+    }
+
+    #[test]
+    fn every_style_key_moves_the_frame() {
+        // The contract that makes the table worth having, and the one a config surface
+        // fails quietly: a key that parses, validates, and is then ignored by the
+        // renderer reads to its author as "this panel does not care what I asked for".
+        // So every key is turned, once, and the frame has to change.
+        let shipped = crate::config::Style::SHIPPED;
+        let (device, content, states) = styled_panel(shipped);
+        let baseline = frame_hash(&render_with(&device, &content, &states, &HashMap::new()));
+
+        let turned: [(&str, crate::config::Style); 15] = [
+            (
+                "type_scale",
+                crate::config::Style {
+                    type_scale: 1.6,
+                    ..shipped
+                },
+            ),
+            (
+                "chrome_scale",
+                crate::config::Style {
+                    chrome_scale: 0.06,
+                    ..shipped
+                },
+            ),
+            (
+                "min_type",
+                crate::config::Style {
+                    min_type: 40.0,
+                    ..shipped
+                },
+            ),
+            (
+                "reading_ceiling",
+                crate::config::Style {
+                    reading_ceiling: 1.2,
+                    ..shipped
+                },
+            ),
+            (
+                "unit_scale",
+                crate::config::Style {
+                    unit_scale: 0.9,
+                    ..shipped
+                },
+            ),
+            (
+                "glyph_share",
+                crate::config::Style {
+                    glyph_share: 0.8,
+                    ..shipped
+                },
+            ),
+            (
+                "row_rule",
+                crate::config::Style {
+                    row_rule: true,
+                    ..shipped
+                },
+            ),
+            (
+                "row_fill",
+                crate::config::Style {
+                    row_rule: true,
+                    row_fill: true,
+                    ..shipped
+                },
+            ),
+            (
+                "row_width",
+                crate::config::Style {
+                    row_width: crate::config::RowWidth::Full,
+                    ..shipped
+                },
+            ),
+            ("ink", crate::config::Style { ink: 60, ..shipped }),
+            (
+                "muted",
+                crate::config::Style {
+                    muted: 150,
+                    ..shipped
+                },
+            ),
+            (
+                "rule",
+                crate::config::Style {
+                    rule: 200,
+                    ..shipped
+                },
+            ),
+            (
+                "bar_type_scale",
+                crate::config::Style {
+                    bar_type_scale: 0.8,
+                    ..shipped
+                },
+            ),
+            (
+                "bar_gap_scale",
+                crate::config::Style {
+                    bar_gap_scale: 3.0,
+                    ..shipped
+                },
+            ),
+            (
+                "bar_margin_scale",
+                crate::config::Style {
+                    bar_margin_scale: 4.0,
+                    ..shipped
+                },
+            ),
+        ];
+
+        for (key, style) in turned {
+            let (device, content, states) = styled_panel(style);
+            let frame = frame_hash(&render_with(&device, &content, &states, &HashMap::new()));
+            assert_ne!(
+                frame, baseline,
+                "turning style.{key} left the frame byte-identical, so the renderer is \
+                 ignoring it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_style_saying_nothing_is_the_look_that_shipped() {
+        // The other half of the promise, and the reason the defaults are a named
+        // constant rather than scattered literals: a dashboard that never mentions
+        // style must render what it rendered before the table existed. Asserted
+        // against `Style::default()` rather than against a stored hash, because a
+        // stored hash would also pass if both sides drifted together.
+        let (device, content, states) = styled_panel(crate::config::Style::default());
+        let (shipped, shipped_content, shipped_states) =
+            styled_panel(crate::config::Style::SHIPPED);
+
+        assert_eq!(
+            frame_hash(&render_with(&device, &content, &states, &HashMap::new())),
+            frame_hash(&render_with(
+                &shipped,
+                &shipped_content,
+                &shipped_states,
+                &HashMap::new()
+            )),
+        );
     }
 
     /// An `ha_entity` widget reading `entity`'s own state.
@@ -2697,7 +3067,11 @@ mod tests {
     /// the cell, so a device that overrides the dimensions and the grid but keeps the
     /// 400x300 spacing is testing a dashboard no configuration can produce.
     fn panel(widgets: Vec<Widget>) -> Device {
-        const GRID: Grid = Grid { cols: 4, rows: 3 };
+        const GRID: Grid = Grid {
+            cols: 4,
+            rows: 3,
+            fit: Fit::Stretch,
+        };
         Device {
             width: 1448,
             height: 1072,
@@ -2765,7 +3139,7 @@ mod tests {
         // the lowest inked row under `°` is the degree sign's bottom, nowhere near
         // the baseline, and the `p` of `hPa` has a descender below it.
         for size in [40.0, 60.0, 100.0, 143.0, 168.0] {
-            let node = figure_node("88", Some("88"), Ink::Current, size);
+            let node = figure_node("88", Some("88"), Ink::Current, size, &STYLE, GREYS);
             let (value, unit) = baselines(node, 1_400, 500);
             let delta = unit as i64 - value as i64;
             assert!(
@@ -2784,7 +3158,7 @@ mod tests {
         // two `color` attributes on one element — malformed XML that usvg rejects
         // outright, so every icon on the dashboard drew nothing and no test noticed.
         let fetched = r#"<svg fill="currentColor" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h8v8z"/></svg>"#;
-        let painted = paint_svg(fetched, muted());
+        let painted = paint_svg(fetched, muted(GREYS));
         assert_eq!(
             painted.matches("color=").count(),
             1,
@@ -2801,6 +3175,7 @@ mod tests {
             },
             48.0,
             Ink::Current,
+            GREYS,
         );
         let raster = rasterise(&FONTS, node, 48, 48).expect("should rasterise");
         let inked = raster
@@ -2863,7 +3238,10 @@ mod tests {
     /// font metrics rather than estimated from a character count.
     fn figure_px_for(text: &str, unit: Option<&str>) -> f32 {
         const DESIGN: f32 = 96.0;
-        let intrinsic = intrinsic_width(&FONTS, figure_node(text, unit, Ink::Current, DESIGN));
+        let intrinsic = intrinsic_width(
+            &FONTS,
+            figure_node(text, unit, Ink::Current, DESIGN, &STYLE, GREYS),
+        );
         assert!(intrinsic > 0.0, "measuring {text:?} must produce a width");
         fit_size(intrinsic, 200.0, DESIGN)
     }
@@ -2963,7 +3341,11 @@ mod tests {
                 widgets.push(w);
             }
         }
-        const GRID: Grid = Grid { cols: 4, rows: 3 };
+        const GRID: Grid = Grid {
+            cols: 4,
+            rows: 3,
+            fit: Fit::Stretch,
+        };
         let device = Device {
             width: 1024,
             height: 758,
@@ -3134,7 +3516,11 @@ mod tests {
         let mut group = widget("indoors", WidgetKind::Group, 0, 0);
         group.label = title.map(str::to_owned);
         group.group = Some(Group {
-            grid: Grid { cols: 2, rows: 1 },
+            grid: Grid {
+                cols: 2,
+                rows: 1,
+                fit: Fit::Stretch,
+            },
             widgets: vec![
                 widget("left", WidgetKind::Value, 0, 0),
                 widget("right", WidgetKind::Value, 1, 0),
@@ -3720,6 +4106,7 @@ mod tests {
                     width: 200.0,
                     height: 200.0,
                     label_px: 14.0,
+                    style: &STYLE,
                 },
             )
             .is_empty(),
@@ -3757,7 +4144,11 @@ mod tests {
     /// `precision` set overflows even at [`MIN_TYPE_PX`], which is the case worth
     /// having a fixture for.
     fn listed_panel(values: [&str; 3]) -> (Device, HashMap<Reading, Reported>) {
-        const GRID: Grid = Grid { cols: 4, rows: 3 };
+        const GRID: Grid = Grid {
+            cols: 4,
+            rows: 3,
+            fit: Fit::Stretch,
+        };
         let mut list = widget("climate", WidgetKind::List, 0, 0);
         list.label = Some("Climate".to_owned());
         // No `precision`, deliberately: rounding is what keeps a reading short, and
@@ -3818,8 +4209,8 @@ mod tests {
 
         let tall = 302.0;
         let by_height = tall / (3.0 * 1.48 - 0.28);
-        let wide = rows_size(&FONTS, &rows, 900.0, by_height);
-        let narrow = rows_size(&FONTS, &rows, 322.0, by_height);
+        let wide = rows_size(&FONTS, &rows, 900.0, by_height, GREYS);
+        let narrow = rows_size(&FONTS, &rows, 322.0, by_height, GREYS);
 
         assert!(
             (wide - by_height).abs() < 1.0,
@@ -3879,7 +4270,11 @@ mod tests {
         // wraps its text in a box and was never affected.
         let mut group = widget("utility", WidgetKind::Group, 0, 0);
         group.group = Some(Group {
-            grid: Grid { cols: 2, rows: 2 },
+            grid: Grid {
+                cols: 2,
+                rows: 2,
+                fit: Fit::Stretch,
+            },
             widgets: vec![
                 widget("prose", WidgetKind::Text, 0, 0),
                 widget("absent", WidgetKind::Value, 1, 0),
@@ -3994,10 +4389,10 @@ row = 0
             .collect();
 
         for width in [400.0_f32, 950.0] {
-            let size = width_driven_size(&FONTS, &rows, width);
+            let size = width_driven_size(&FONTS, &rows, width, GREYS);
             let widest = rows
                 .iter()
-                .map(|line| intrinsic_width(&FONTS, row_runs(line, size)))
+                .map(|line| intrinsic_width(&FONTS, row_runs(line, size, GREYS)))
                 .fold(0.0_f32, f32::max);
             let filled = widest / width;
             assert!(
@@ -4061,16 +4456,28 @@ row = 0
         // so both must set their labels the same.
         let dense = panel(vec![widget("a", WidgetKind::Value, 0, 0)]);
         let sparse = Device {
-            grid: Grid { cols: 2, rows: 1 },
-            chrome: Chrome::derived(1448, 1072, Grid { cols: 2, rows: 1 }),
+            grid: Grid {
+                cols: 2,
+                rows: 1,
+                fit: Fit::Stretch,
+            },
+            chrome: Chrome::derived(
+                1448,
+                1072,
+                Grid {
+                    cols: 2,
+                    rows: 1,
+                    fit: Fit::Stretch,
+                },
+            ),
             ..panel(vec![widget("a", WidgetKind::Value, 0, 0)])
         };
 
         let label_px = |device: &Device| {
             let layout = Layout::for_device(device);
-            (device.width.min(device.height) as f32 * CHROME_SCALE)
+            (device.width.min(device.height) as f32 * STYLE.chrome_scale * STYLE.type_scale)
                 .min(layout.cell().1 * 0.11)
-                .max(MIN_TYPE_PX)
+                .max(STYLE.min_type)
         };
 
         assert_eq!(
@@ -4095,12 +4502,20 @@ row = 0
             .collect();
 
         let label_px = 32.0;
-        let tall = rows_size(&FONTS, &rows, 691.0, {
-            let by_height = 991.0_f32 / (4.0 * 1.48 - 0.28);
-            by_height.min(label_px * ROW_TYPE_CEILING).max(MIN_TYPE_PX)
-        });
+        let tall = rows_size(
+            &FONTS,
+            &rows,
+            691.0,
+            {
+                let by_height = 991.0_f32 / (4.0 * 1.48 - 0.28);
+                by_height
+                    .min(label_px * STYLE.reading_ceiling)
+                    .max(STYLE.min_type)
+            },
+            GREYS,
+        );
         assert!(
-            tall <= label_px * ROW_TYPE_CEILING + 0.5,
+            tall <= label_px * STYLE.reading_ceiling + 0.5,
             "a tall cell must not set its rows past the ceiling: got {tall}"
         );
         assert!(

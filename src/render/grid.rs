@@ -10,7 +10,8 @@
 //! rejects an unrenderable cell, this module, and the renderer all measure a cell
 //! by one copy of the arithmetic. This module only places what those two decided.
 
-use crate::config::{self, Chrome, Device, Group, Widget};
+use super::natural;
+use crate::config::{self, Chrome, Device, Fit, Group, Widget};
 
 /// The dashboard's pixel geometry, read once from a device and used both to lay
 /// the frame out and to decide what a finger landed on.
@@ -23,7 +24,7 @@ use crate::config::{self, Chrome, Device, Group, Widget};
 /// *is* a grid inside one cell and its children have to be placed and hit exactly
 /// like any other cell. [`Self::sub_layout`] is the whole difference between the
 /// two, and it differs only in where the tracks start.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Layout {
     /// The top-left of the track area, in frame pixels. Not the origin of the
     /// frame: a status bar takes an edge, and a group's tracks start inside its
@@ -38,7 +39,16 @@ pub struct Layout {
     padding: f32,
     border: f32,
     cell_w: f32,
+    /// The shortest row track, which under [`Fit::Stretch`] is the height every
+    /// track has. Under [`Fit::Content`] deliberately the shortest of unequal
+    /// tracks: a caller sizing chrome against "a cell" must not be handed a height
+    /// that overflows the tightest track its cell could have landed in.
     cell_h: f32,
+    /// How the row tracks were sized, and so whether [`Self::rect`] multiplies out
+    /// one track height or walks a list of them.
+    fit: Fit,
+    /// Every row track's height, top to bottom, in pixels. One entry per row.
+    tracks: Vec<f32>,
 }
 
 impl Layout {
@@ -49,10 +59,19 @@ impl Layout {
     /// this module having to know which edge it took; the spacing is the device's
     /// already-resolved [`Chrome`], so an author who spelt out a gap gets it here
     /// unaltered.
+    ///
+    /// The row tracks are the one thing not simply read off. Under [`Fit::Content`]
+    /// each is sized from what the widgets on it want, which is what
+    /// [`super::natural`] answers; under [`Fit::Stretch`] every track is the cell
+    /// height the shared arithmetic already gave.
     pub fn for_device(device: &Device) -> Self {
         let (area_x, area_y, area_w, area_h) = device.grid_area();
         let chrome = device.chrome;
         let (cell_w, cell_h) = config::cell_size(area_w, area_h, device.grid, chrome);
+        let tracks = match device.grid.fit {
+            Fit::Stretch => vec![cell_h; device.grid.rows.max(1) as usize],
+            Fit::Content => content_tracks(device, cell_w, cell_h),
+        };
 
         Self {
             origin: (area_x as f32, area_y as f32),
@@ -61,7 +80,9 @@ impl Layout {
             padding: chrome.padding,
             border: chrome.border,
             cell_w,
-            cell_h,
+            cell_h: shortest(&tracks),
+            fit: device.grid.fit,
+            tracks,
         }
     }
 
@@ -86,16 +107,34 @@ impl Layout {
         self.chrome().inset()
     }
 
-    /// One grid cell's size, in pixels.
+    /// One grid cell's size, in pixels: a column's width, and the shortest row
+    /// track.
+    ///
+    /// The shortest rather than the tallest or an average, because a caller sizes
+    /// chrome against this: type fitted to a track taller than the one its cell
+    /// landed in overflows that cell. Under [`Fit::Stretch`] every track is that
+    /// height anyway, so the choice only shows itself on a content-fit grid.
     pub fn cell(&self) -> (f32, f32) {
         (self.cell_w, self.cell_h)
+    }
+
+    /// Every row track's height, top to bottom, in pixels: one entry per row of the
+    /// grid this layout describes.
+    ///
+    /// Read by the renderer, which writes them into the grid's row template. A
+    /// content-fit dashboard has to be *drawn* on the tracks this module placed it
+    /// on — equal tracks in the template against unequal ones here would put every
+    /// cell somewhere the tap hit test does not look.
+    pub fn row_tracks(&self) -> &[f32] {
+        &self.tracks
     }
 
     /// The rect a widget occupies, as (x, y, w, h) in frame pixels.
     ///
     /// The exact inverse of the layout rather than an approximation of it: the
-    /// tracks begin one margin in from the track area's origin, each is
-    /// [`Self::cell`] across, and one gutter separates each from the next.
+    /// tracks begin one margin in from the track area's origin, a column is
+    /// [`Self::cell`] across, a row is as tall as its own track, and one gutter
+    /// separates each track from the next.
     ///
     /// A spanning widget swallows the gutters it spans over, because those gaps
     /// fall *inside* such a cell rather than beside it — so a two-column widget is
@@ -107,15 +146,43 @@ impl Layout {
     pub fn rect(&self, widget: &Widget) -> (f32, f32, f32, f32) {
         let (origin_x, origin_y) = self.origin;
         let x = origin_x + self.margin + widget.col as f32 * (self.cell_w + self.gutter);
-        let y = origin_y + self.margin + widget.row as f32 * (self.cell_h + self.gutter);
         // `saturating_sub` rather than `- 1`: a span of zero is a config error, and
         // an arithmetic panic inside a request handler is a worse way to report one
         // than a degenerate rect that nothing hits.
         let w = self.cell_w * widget.col_span as f32
             + self.gutter * widget.col_span.saturating_sub(1) as f32;
-        let h = self.cell_h * widget.row_span as f32
-            + self.gutter * widget.row_span.saturating_sub(1) as f32;
-        (x, y, w, h)
+        let (top, h) = self.rows(widget.row, widget.row_span);
+        (x, origin_y + self.margin + top, w, h)
+    }
+
+    /// How far row `row`'s top edge sits below the first track's, and how tall
+    /// `span` tracks from there are — the gutters they swallow included.
+    ///
+    /// Equal tracks multiply out where unequal ones are summed, and that branch is
+    /// not an optimisation. `k` copies of a float added together is not always the
+    /// same float as `k` times one of them, and every frame this dashboard has ever
+    /// drawn was placed by the multiplication: a cell moved by a ten-thousandth of a
+    /// pixel is enough to resize a fitted run, and so to change the bytes of a frame
+    /// on a grid where nothing was meant to change at all.
+    fn rows(&self, row: u32, span: u32) -> (f32, f32) {
+        let gutters = self.gutter * span.saturating_sub(1) as f32;
+        match self.fit {
+            Fit::Stretch => (
+                row as f32 * (self.cell_h + self.gutter),
+                self.cell_h * span as f32 + gutters,
+            ),
+            // Clamped rather than indexed, for the reason the width above saturates:
+            // a widget placed off its grid is a config error validation rejects, and
+            // a rect nothing hits reports one better than a panic in a handler.
+            Fit::Content => {
+                let start = (row as usize).min(self.tracks.len());
+                let end = start.saturating_add(span as usize).min(self.tracks.len());
+                (
+                    self.tracks[..start].iter().sum::<f32>() + row as f32 * self.gutter,
+                    self.tracks[start..end].iter().sum::<f32>() + gutters,
+                )
+            }
+        }
     }
 
     /// The geometry of a group's sub-grid, or `None` when `group` is not a group.
@@ -192,6 +259,12 @@ impl Layout {
             border: chrome.border,
             cell_w,
             cell_h,
+            // A group's sub-grid stretches whatever the device's grid does, because
+            // the renderer fills a group's content box with equal tracks. Sizing
+            // these to their children instead would place the children where nothing
+            // draws them, and a finger on one child would fire another's action.
+            fit: Fit::Stretch,
+            tracks: vec![cell_h; group.grid.rows.max(1) as usize],
         }
     }
 
@@ -212,10 +285,83 @@ impl Layout {
     }
 }
 
+/// The row tracks of a content-fit grid, top to bottom, in pixels.
+///
+/// Three passes, and their order is the whole design. Each track starts at the floor
+/// a cell has to clear to render at all and is raised to what the widgets on it
+/// want. Then, if those widgets want more of the frame than there is, every track is
+/// scaled down together — a dashboard that is uniformly a little tight can still be
+/// read, where one whose last row is drawn past the bottom of the glass cannot. Only
+/// if height is left over does anything get it, and then only the one widget that
+/// asked.
+fn content_tracks(device: &Device, cell_w: f32, cell_h: f32) -> Vec<f32> {
+    let rows = device.grid.rows.max(1) as usize;
+    let mut tracks = vec![config::MIN_CELL as f32; rows];
+    natural::raise_tracks(device, &device.widgets, cell_w, &mut tracks);
+
+    // What the tracks have to share: the grid area less its own margin and the gaps
+    // between tracks. Read back off the stretched cell rather than restated here, so
+    // that both fits partition exactly the same height.
+    let capacity = cell_h * rows as f32;
+    let wanted = tracks.iter().sum::<f32>();
+    if wanted > capacity {
+        // Proportionally, rather than shaved off the tallest: every track on an
+        // over-subscribed grid is one somebody asked for, and taking the whole
+        // overflow out of the largest leaves a dashboard with one unreadable cell
+        // instead of one that is slightly tight throughout. This can push a track
+        // under [`config::MIN_CELL`], and that is the honest outcome — the
+        // alternative is a row drawn off the frame.
+        let scale = capacity / wanted;
+        for track in &mut tracks {
+            *track *= scale;
+        }
+        return tracks;
+    }
+
+    give_leftover(device, capacity - wanted, &mut tracks);
+    tracks
+}
+
+/// Gives the height the content-sized tracks left over to the widget that asked.
+///
+/// At most one can ask: validation rejects a second, and rejects a `fill` on a
+/// group's child. So the leftover goes to the one that did, split evenly across the
+/// tracks it covers. A dashboard where nobody asked simply ends short of the frame's
+/// bottom margin, and that unused strip is the point of `fit = "content"` rather than
+/// an oversight in it — the alternative is inflating whichever cell happens to be
+/// last until the frame is full, which is what stretching already does to all of
+/// them.
+fn give_leftover(device: &Device, leftover: f32, tracks: &mut [f32]) {
+    let Some(widget) = device.widgets.iter().find(|widget| widget.fill) else {
+        return;
+    };
+    let start = (widget.row as usize).min(tracks.len());
+    let end = start
+        .saturating_add(widget.row_span.max(1) as usize)
+        .min(tracks.len());
+    let covered = &mut tracks[start..end];
+    let share = leftover / covered.len().max(1) as f32;
+    for track in covered {
+        *track += share;
+    }
+}
+
+/// The shortest of a grid's row tracks, which is the height anything sized against
+/// "a cell" has to survive.
+///
+/// Exactly the track height on a stretched grid, to the bit, because the minimum of
+/// `n` copies of a float is that float. Never asked of an empty grid: every layout
+/// has at least one row by construction.
+fn shortest(tracks: &[f32]) -> f32 {
+    tracks.iter().copied().fold(f32::INFINITY, f32::min)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Dither, Edge, Grid, Palette, StatusBar, Timezone, WidgetKind};
+    use crate::config::{
+        Dither, Edge, Grid, Palette, Reading, StatusBar, Style, Timezone, WidgetKind,
+    };
 
     /// A widget occupying one or more cells, with everything a hit test does not
     /// look at left empty.
@@ -240,12 +386,18 @@ mod tests {
             icon_off: None,
             readings: Vec::new(),
             group: None,
+            fill: false,
+            style: Style::default(),
             tap: None,
         }
     }
 
     fn device_sized(cols: u32, rows: u32, width: u32, height: u32, widgets: Vec<Widget>) -> Device {
-        let grid = Grid { cols, rows };
+        let grid = Grid {
+            cols,
+            rows,
+            fit: Fit::Stretch,
+        };
         Device {
             id: "kindle".to_owned(),
             width,
@@ -256,6 +408,7 @@ mod tests {
             render_interval: 300,
             max_frame_bytes: 0,
             grid,
+            style: Style::default(),
             chrome: Chrome::derived(width, height, grid),
             status_bar: None,
             widgets,
@@ -273,6 +426,33 @@ mod tests {
         Device {
             chrome,
             ..device(cols, rows, widgets)
+        }
+    }
+
+    /// The same panel with its rows sized to their content, which is all
+    /// `fit = "content"` changes about a device.
+    fn content_device(cols: u32, rows: u32, widgets: Vec<Widget>) -> Device {
+        let mut device = device(cols, rows, widgets);
+        device.grid.fit = Fit::Content;
+        device
+    }
+
+    /// A cell of `count` readings, which is how a fixture asks for a taller track
+    /// than the cell beside it: a column of readings is charged per reading.
+    fn listing(id: &str, col: u32, row: u32, row_span: u32, count: usize) -> Widget {
+        Widget {
+            kind: WidgetKind::List,
+            readings: (0..count)
+                .map(|index| Reading {
+                    label: Some(format!("reading {index}")),
+                    icon: None,
+                    entity: format!("sensor.reading_{index}"),
+                    attribute: None,
+                    unit: None,
+                    precision: None,
+                })
+                .collect(),
+            ..widget(id, col, row, 1, row_span)
         }
     }
 
@@ -316,7 +496,11 @@ mod tests {
         let mut host = widget("group", 0, 0, 2, 2);
         host.kind = WidgetKind::Group;
         host.group = Some(Group {
-            grid: Grid { cols: 2, rows: 1 },
+            grid: Grid {
+                cols: 2,
+                rows: 1,
+                fit: Fit::Stretch,
+            },
             widgets: vec![widget("left", 0, 0, 1, 1), widget("right", 1, 0, 1, 1)],
         });
         device(4, 3, vec![host, widget("plain", 3, 0, 1, 1)])
@@ -786,6 +970,166 @@ mod tests {
                 Some("group"),
                 "{what} is still inside the group, so it must resolve to the group"
             );
+        }
+    }
+
+    /// The whole point of `fit = "content"`: a row of four readings and a row
+    /// holding one figure are not the same height, and are no longer drawn as
+    /// though they were.
+    #[test]
+    fn a_content_fit_grid_sizes_each_row_to_what_it_holds() {
+        let panel = content_device(
+            1,
+            2,
+            vec![listing("many", 0, 0, 1, 4), widget("one", 0, 1, 1, 1)],
+        );
+        let layout = Layout::for_device(&panel);
+        let tracks = layout.row_tracks().to_vec();
+
+        assert_eq!(tracks.len(), 2, "one track per row of the grid");
+        assert!(
+            tracks[0] > tracks[1],
+            "four readings want more height than one figure, but the tracks are \
+             {tracks:?}"
+        );
+
+        // The rects follow those tracks rather than an average of them, with one
+        // gutter between the two.
+        let (_, first_y, _, first_h) = layout.rect(&panel.widgets[0]);
+        let (_, second_y, _, second_h) = layout.rect(&panel.widgets[1]);
+        assert!(close(first_h, tracks[0]) && close(second_h, tracks[1]));
+        assert!(
+            close(second_y - (first_y + first_h), layout.gutter()),
+            "one gutter between two tracks, no more and no less"
+        );
+
+        // The same widgets on a stretched grid are still given equal tracks, which
+        // is the geometry every other test in this module pins.
+        let stretched = Layout::for_device(&device(1, 2, panel.widgets.clone()));
+        assert!(
+            close(stretched.row_tracks()[0], stretched.row_tracks()[1])
+                && close(stretched.row_tracks()[0], stretched.cell().1),
+            "a stretched grid's tracks are equal, and each is the cell height"
+        );
+    }
+
+    /// An over-subscribed grid is scaled to fit rather than allowed to run off the
+    /// glass. A dashboard that is uniformly a little tight can still be read; one
+    /// whose last row is drawn past the bottom of the frame cannot be.
+    #[test]
+    fn content_tracks_never_sum_past_the_grid_area() {
+        // Eight rows of eight readings on a panel with room for nothing like that
+        // much: every track asks for several times its share.
+        let widgets = (0..8u32)
+            .map(|row| listing(&format!("row{row}"), 0, row, 1, 8))
+            .collect::<Vec<_>>();
+        let panel = content_device(1, 8, widgets);
+        let layout = Layout::for_device(&panel);
+        let tracks = layout.row_tracks();
+        let gutter = layout.gutter();
+        let (_, _, _, area_h) = panel.grid_area();
+
+        let capacity = area_h as f32 - gutter * (tracks.len() + 1) as f32;
+        let wanted = tracks.iter().sum::<f32>();
+        assert!(
+            wanted <= capacity + 0.01,
+            "eight over-subscribed tracks sum to {wanted}, past the {capacity} the \
+             grid area has to give"
+        );
+
+        let last = panel.widgets.last().expect("the fixture places eight rows");
+        let (_, y, _, h) = layout.rect(last);
+        assert!(
+            y + h <= panel.height as f32 - gutter + 0.01,
+            "the last row ends at {}, past the frame's own bottom margin at {}",
+            y + h,
+            panel.height as f32 - gutter
+        );
+    }
+
+    /// A `fill` widget takes the height the content left over, and without one that
+    /// height stays where it is: unused, at the foot of the grid. A dashboard that
+    /// silently inflated its last row to fill the frame would be stretching under
+    /// another name.
+    #[test]
+    fn the_leftover_goes_to_the_filling_widget_or_to_nobody() {
+        let widgets = vec![widget("top", 0, 0, 1, 1), widget("bottom", 0, 1, 1, 1)];
+        let bare = content_device(1, 2, widgets.clone());
+        let unclaimed = Layout::for_device(&bare);
+        let tracks = unclaimed.row_tracks().to_vec();
+        let gutter = unclaimed.gutter();
+        let (_, _, _, area_h) = bare.grid_area();
+        let leftover = area_h as f32 - gutter * 3.0 - tracks.iter().sum::<f32>();
+        assert!(
+            leftover > 1.0,
+            "two figures on a 1072 pixel panel must leave something over, not \
+             {leftover}"
+        );
+
+        let (_, y, _, h) = unclaimed.rect(&bare.widgets[1]);
+        assert!(
+            close(bare.height as f32 - gutter - (y + h), leftover),
+            "an unclaimed leftover stays as margin at the foot of the grid"
+        );
+
+        let mut filling = widgets;
+        filling[0].fill = true;
+        let panel = content_device(1, 2, filling);
+        let layout = Layout::for_device(&panel);
+        let filled = layout.row_tracks();
+        assert!(
+            close(filled[0], tracks[0] + leftover) && close(filled[1], tracks[1]),
+            "the whole leftover goes to the row the filling widget covers: {filled:?} \
+             against {tracks:?} plus {leftover}"
+        );
+
+        let (_, y, _, h) = layout.rect(&panel.widgets[1]);
+        assert!(
+            close(y + h, panel.height as f32 - gutter),
+            "with the leftover claimed, the last row ends on the frame's own bottom \
+             margin"
+        );
+    }
+
+    /// The agreement `rect` exists for, on a grid where no two tracks are the same
+    /// height: every widget's own rect resolves to that widget, edges included. A
+    /// cumulative sum is exactly where an off-by-one-track error hides, and such an
+    /// error is a finger on one reading firing another cell's action.
+    #[test]
+    fn rect_and_hit_agree_on_a_content_fit_grid() {
+        let panel = content_device(
+            2,
+            3,
+            vec![
+                listing("many", 0, 0, 1, 4),
+                widget("figure", 1, 0, 1, 1),
+                listing("tall", 0, 1, 2, 2),
+                listing("mid", 1, 1, 1, 3),
+                widget("corner", 1, 2, 1, 1),
+            ],
+        );
+        let layout = Layout::for_device(&panel);
+        let tracks = layout.row_tracks();
+        assert!(
+            tracks[0] > tracks[1] && tracks[1] > tracks[2],
+            "the fixture must give all three rows different heights or it proves \
+             nothing: {tracks:?}"
+        );
+
+        for widget in &panel.widgets {
+            let (x, y, w, h) = layout.rect(widget);
+            for (what, at_y) in [
+                ("its own centre", y + h / 2.0),
+                ("its top edge", y),
+                ("the pixel inside its bottom edge", y + h - 0.01),
+            ] {
+                assert_eq!(
+                    hit_id(&panel, &layout, x + w / 2.0, at_y).as_deref(),
+                    Some(widget.id.as_str()),
+                    "{what} must resolve to `{}`",
+                    widget.id
+                );
+            }
         }
     }
 }

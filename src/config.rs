@@ -170,6 +170,9 @@ pub struct Device {
     pub grid: Grid,
     /// The dashboard's spacing and rules, resolved to pixels.
     pub chrome: Chrome,
+    /// Every size, weight and grey a cell is drawn with. Inherited by every widget
+    /// on this device, and overridable by each of them.
+    pub style: Style,
     /// A strip along one edge, outside the widget grid. `None` gives the grid the
     /// whole frame.
     pub status_bar: Option<StatusBar>,
@@ -499,6 +502,123 @@ pub enum StatusField {
 pub struct Grid {
     pub cols: u32,
     pub rows: u32,
+    /// How the row tracks are sized. Columns are always equal: a panel has one
+    /// width forever, so there is nothing for a column to be responsive to, and
+    /// stretching a cell horizontally costs a reading nothing.
+    #[serde(default)]
+    pub fit: Fit,
+}
+
+/// How a grid's row tracks are sized.
+///
+/// The default stretches them, which is what a dashboard meant to be read from
+/// across a room wants: no pixel of the frame goes unused. It is also what makes a
+/// cell holding four short readings either shout or float, because the content is
+/// then inflated to fill whatever track it landed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum Fit {
+    /// Equal tracks, together filling the grid area.
+    #[default]
+    #[serde(rename = "stretch")]
+    Stretch,
+    /// Each track as tall as the tallest thing placed on it, sized from the type
+    /// scale rather than from the frame. What is left over stays as margin at the
+    /// end of the grid, unless some widget asked to `fill`.
+    #[serde(rename = "content")]
+    Content,
+}
+
+/// A cell's look: every size, weight and grey that used to be a constant in the
+/// renderer.
+///
+/// Resolved per widget from the device's `[device.style]` and the widget's own
+/// `style`, so the renderer reads concrete numbers and never merges anything. The
+/// defaults are not neutral placeholders: they are the values this panel shipped
+/// with, so a configuration that says nothing about style renders the frame it
+/// rendered before this table existed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Style {
+    /// Multiplier over every type size derived from the chrome. One knob for
+    /// "everything is too big" or "too small", which is the note that arrives most.
+    pub type_scale: f32,
+    /// A cell's chrome type, as a fraction of the panel's short side.
+    pub chrome_scale: f32,
+    /// Smallest type to shrink to, in pixels. A floor on legibility, so not scaled.
+    pub min_type: f32,
+    /// How much larger than the chrome naming it a reading may be set.
+    pub reading_ceiling: f32,
+    /// A unit's size beside the figure it belongs to.
+    pub unit_scale: f32,
+    /// A picture's share of a cell it shares with readings, stacked. Side by side it
+    /// takes four fifths of this, because there the readings' labels are what runs
+    /// out of room first.
+    pub glyph_share: f32,
+    /// Draw a hairline under every reading in a multi-reading cell.
+    pub row_rule: bool,
+    /// Carry those rules on to the foot of the cell, ruling the lines no reading was
+    /// written on. A form rather than a list; only means anything with `row_rule`.
+    pub row_fill: bool,
+    /// Whether a row is as wide as its own content or as wide as the cell.
+    pub row_width: RowWidth,
+    /// Grey level a confirmed reading is drawn in, 0 (black) to 255 (paper).
+    pub ink: u8,
+    /// Grey level for a label, and for a reading that could not be confirmed.
+    pub muted: u8,
+    /// Grey level for a rule: a cell's frame, a bar's edge, a table's lines.
+    pub rule: u8,
+    /// A status bar's type, as a fraction of the bar's thickness.
+    pub bar_type_scale: f32,
+    /// The space between two things in a bar, as a fraction of its type size.
+    pub bar_gap_scale: f32,
+    /// The margin at each end of a bar, as a fraction of its type size.
+    pub bar_margin_scale: f32,
+}
+
+impl Style {
+    /// The look this panel shipped with, and the default every field falls back to.
+    ///
+    /// A `const` and not only a `Default` impl, because it is also the thing the
+    /// renderer's tests assert against: the whole promise of the style table is that
+    /// a configuration which says nothing about style renders the frame it rendered
+    /// before the table existed, and a test can only hold that promise if it can
+    /// name these values without constructing them.
+    pub const SHIPPED: Self = Self {
+        type_scale: 1.0,
+        chrome_scale: 0.030,
+        min_type: 12.0,
+        reading_ceiling: 2.6,
+        unit_scale: 0.55,
+        glyph_share: 0.50,
+        row_rule: false,
+        row_fill: false,
+        row_width: RowWidth::Content,
+        ink: 0,
+        muted: 102,
+        rule: 170,
+        bar_type_scale: 0.5,
+        bar_gap_scale: 1.4,
+        bar_margin_scale: 0.6,
+    };
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Self::SHIPPED
+    }
+}
+
+/// How wide a line of a multi-reading cell is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum RowWidth {
+    /// As wide as the widest row needs, then centred. Keeps a name and its figure
+    /// close enough to read as one thing on a wide cell.
+    #[default]
+    #[serde(rename = "content")]
+    Content,
+    /// The whole cell: name at the leading edge, figure at the trailing one. A
+    /// table, at the cost of the distance between the two.
+    #[serde(rename = "full")]
+    Full,
 }
 
 /// One widget, placed explicitly on the grid rather than inferred from document
@@ -554,6 +674,13 @@ pub struct Widget {
     pub icon_on: Option<String>,
     /// A `beacon`'s indicator while it reads off, drawn in place of the dot.
     pub icon_off: Option<String>,
+    /// Whether this widget takes the grid's leftover height under
+    /// [`Fit::Content`]. At most one widget per device may, which validation
+    /// checks: two of them would be a slack-splitting rule, and splitting slack is
+    /// what `Fit::Stretch` already does.
+    pub fill: bool,
+    /// This cell's look, resolved from the device's style and its own.
+    pub style: Style,
     /// What a `list` cell is made of, and what a `weather` cell hangs off its
     /// condition. Empty for every other kind.
     pub readings: Vec<Reading>,
@@ -1062,6 +1189,7 @@ fn validate_device(
         precision,
         grid,
         chrome,
+        style,
         status_bar,
         dashboard,
         widgets,
@@ -1161,9 +1289,11 @@ fn validate_device(
         cell_h - chrome.inset()
     );
 
+    let style = validate_style(style.as_ref(), Style::default(), &format!("device `{id}`"))?;
+
     let widgets = raw_widgets
         .into_iter()
-        .map(|widget| validate_widget(widget, &id, precision, has_home_assistant))
+        .map(|widget| validate_widget(widget, &id, precision, style, has_home_assistant))
         .collect::<Result<Vec<_>>>();
     // A dashboard's errors are reported against the device that adopted it: the
     // author's next move is to fix the dashboard, but the panel that went blank is
@@ -1176,6 +1306,7 @@ fn validate_device(
     };
 
     validate_placement(&id, None, grid, &widgets)?;
+    validate_fill(&id, grid, &widgets)?;
     validate_ids(&id, &widgets)?;
     validate_group_geometry(&id, chrome, cell_w, cell_h, &widgets)?;
 
@@ -1189,6 +1320,7 @@ fn validate_device(
         render_interval,
         max_frame_bytes,
         grid,
+        style,
         chrome,
         status_bar,
         widgets,
@@ -1208,6 +1340,107 @@ fn validate_grid(grid: Grid, what: &str) -> Result<()> {
         "{what} has grid {}x{}, above the {MAX_TRACKS} track ceiling",
         grid.cols,
         grid.rows
+    );
+    Ok(())
+}
+
+/// Resolves a style by laying whatever the author said over what it inherits.
+///
+/// Every bound here is a legibility or arithmetic guard rather than taste: taste is
+/// the whole point of the table, so the only values rejected are those that cannot
+/// draw a frame at all. A scale of zero divides the layout by nothing; a glyph share
+/// of one leaves its readings no box.
+fn validate_style(raw: Option<&RawStyle>, inherit: Style, what: &str) -> Result<Style> {
+    let Some(raw) = raw else {
+        return Ok(inherit);
+    };
+    let style = Style {
+        type_scale: raw.type_scale.unwrap_or(inherit.type_scale),
+        chrome_scale: raw.chrome_scale.unwrap_or(inherit.chrome_scale),
+        min_type: raw.min_type.unwrap_or(inherit.min_type),
+        reading_ceiling: raw.reading_ceiling.unwrap_or(inherit.reading_ceiling),
+        unit_scale: raw.unit_scale.unwrap_or(inherit.unit_scale),
+        glyph_share: raw.glyph_share.unwrap_or(inherit.glyph_share),
+        row_rule: raw.row_rule.unwrap_or(inherit.row_rule),
+        row_fill: raw.row_fill.unwrap_or(inherit.row_fill),
+        row_width: raw.row_width.unwrap_or(inherit.row_width),
+        ink: raw.ink.unwrap_or(inherit.ink),
+        muted: raw.muted.unwrap_or(inherit.muted),
+        rule: raw.rule.unwrap_or(inherit.rule),
+        bar_type_scale: raw.bar_type_scale.unwrap_or(inherit.bar_type_scale),
+        bar_gap_scale: raw.bar_gap_scale.unwrap_or(inherit.bar_gap_scale),
+        bar_margin_scale: raw.bar_margin_scale.unwrap_or(inherit.bar_margin_scale),
+    };
+
+    for (name, value, bounds) in [
+        ("type_scale", style.type_scale, 0.05..=20.0),
+        ("chrome_scale", style.chrome_scale, 0.002..=0.5),
+        ("min_type", style.min_type, 1.0..=512.0),
+        ("reading_ceiling", style.reading_ceiling, 0.25..=32.0),
+        ("unit_scale", style.unit_scale, 0.05..=4.0),
+        ("glyph_share", style.glyph_share, 0.02..=0.98),
+        ("bar_type_scale", style.bar_type_scale, 0.05..=1.0),
+        ("bar_gap_scale", style.bar_gap_scale, 0.0..=16.0),
+        ("bar_margin_scale", style.bar_margin_scale, 0.0..=16.0),
+    ] {
+        ensure!(
+            value.is_finite() && bounds.contains(&value),
+            "{what} has style.{name} {value}, outside {}..={}",
+            bounds.start(),
+            bounds.end()
+        );
+    }
+
+    ensure!(
+        style.ink < style.muted && style.muted < style.rule,
+        "{what} has style greys ink {}, muted {} and rule {}, which do not darken in \
+         that order; a held reading must read lighter than a live one and a rule \
+         lighter again, or the panel says the opposite of what it means",
+        style.ink,
+        style.muted,
+        style.rule
+    );
+
+    Ok(style)
+}
+
+/// Rejects a `fill` that has nothing to do, or two that would have to share.
+///
+/// Both cases are configuration that reads as a request and is not one. Under
+/// `fit = "stretch"` every track already takes an equal share of the frame, so
+/// there is no leftover for a `fill` to be given; and two widgets asking for the
+/// remainder is a rule for splitting it, which is what stretching already is.
+fn validate_fill(device_id: &str, grid: Grid, widgets: &[Widget]) -> Result<()> {
+    for widget in widgets.iter().flat_map(Widget::iter) {
+        ensure!(
+            !(widget.fill && !widgets.iter().any(|top| top.id == widget.id)),
+            "widget `{}` on device `{device_id}` sets `fill` inside a group; a group's \
+             sub-grid has no leftover of the frame to give away",
+            widget.id
+        );
+    }
+
+    let filling = widgets
+        .iter()
+        .filter(|widget| widget.fill)
+        .collect::<Vec<_>>();
+    let [first, rest @ ..] = filling.as_slice() else {
+        return Ok(());
+    };
+    ensure!(
+        grid.fit == Fit::Content,
+        "widget `{}` on device `{device_id}` sets `fill`, but the grid stretches its \
+         rows; there is no leftover height to give it. Set `grid.fit = \"content\"`, or \
+         drop the `fill`",
+        first.id
+    );
+    ensure!(
+        rest.is_empty(),
+        "widgets `{}` and `{}` on device `{device_id}` both set `fill`; only one can \
+         take what is left over, and splitting it between them is what \
+         `fit = \"stretch\"` does",
+        first.id,
+        rest[0].id
     );
     Ok(())
 }
@@ -1474,6 +1707,7 @@ fn validate_widget(
     raw: RawWidget,
     device_id: &str,
     device_precision: Option<u8>,
+    inherited_style: Style,
     has_home_assistant: bool,
 ) -> Result<Widget> {
     let RawWidget {
@@ -1495,10 +1729,18 @@ fn validate_widget(
         icon_on,
         icon_off,
         readings,
+        fill,
+        style,
         grid,
         widgets,
         tap,
     } = raw;
+
+    let style = validate_style(
+        style.as_ref(),
+        inherited_style,
+        &format!("widget `{id}` on device `{device_id}`"),
+    )?;
 
     let precision = precision.or(device_precision);
     if let Some(precision) = precision {
@@ -1581,7 +1823,12 @@ fn validate_widget(
 
             let children = widgets
                 .into_iter()
-                .map(|child| validate_widget(child, device_id, precision, has_home_assistant))
+                // The group's own resolved style, not the device's: a group is a
+                // cell, so styling it styles what is inside it, and a child may
+                // still override on its own account.
+                .map(|child| {
+                    validate_widget(child, device_id, precision, style, has_home_assistant)
+                })
                 .collect::<Result<Vec<_>>>()?;
             for child in &children {
                 ensure!(
@@ -1654,6 +1901,8 @@ fn validate_widget(
         icon_off,
         readings,
         group,
+        fill,
+        style,
         tap,
     })
 }
@@ -1853,6 +2102,7 @@ struct RawDevice {
     /// Required unless `dashboard` names one to adopt.
     grid: Option<Grid>,
     chrome: Option<RawChrome>,
+    style: Option<RawStyle>,
     status_bar: Option<RawStatusBar>,
     /// A [`RawDashboard`] to adopt instead of declaring a grid and widgets.
     dashboard: Option<String>,
@@ -1868,6 +2118,31 @@ struct RawChrome {
     gap: Option<u32>,
     padding: Option<u32>,
     border: Option<u32>,
+}
+
+/// A style as the file may leave it: every field absent inherits.
+///
+/// One shape for both levels — a device's `[device.style]` and a widget's own
+/// `style` — because "what may be said about a cell's look" is the same question
+/// in both places, and two shapes would drift.
+#[derive(Deserialize, Clone, Copy, Default)]
+#[serde(deny_unknown_fields)]
+struct RawStyle {
+    type_scale: Option<f32>,
+    chrome_scale: Option<f32>,
+    min_type: Option<f32>,
+    reading_ceiling: Option<f32>,
+    unit_scale: Option<f32>,
+    glyph_share: Option<f32>,
+    row_rule: Option<bool>,
+    row_fill: Option<bool>,
+    row_width: Option<RowWidth>,
+    ink: Option<u8>,
+    muted: Option<u8>,
+    rule: Option<u8>,
+    bar_type_scale: Option<f32>,
+    bar_gap_scale: Option<f32>,
+    bar_margin_scale: Option<f32>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1922,6 +2197,10 @@ struct RawWidget {
     icon_off: Option<String>,
     #[serde(default, rename = "reading")]
     readings: Vec<RawReading>,
+    /// Give this widget the grid's leftover height, under `fit = "content"`.
+    #[serde(default)]
+    fill: bool,
+    style: Option<RawStyle>,
     /// A group's sub-grid.
     grid: Option<Grid>,
     /// A group's children.
@@ -1987,6 +2266,104 @@ dither = "atkinson"
 refresh_rate = 300
 grid = { cols = 4, rows = 3 }
 "#;
+
+    #[test]
+    fn a_widget_inherits_its_device_style_and_overrides_one_key_of_it() {
+        // The resolution rule, in the shape an author writes it: say it once on the
+        // device, say the exception on the cell. What the renderer then reads is a
+        // concrete style per widget, never a pair it has to merge itself.
+        let text = format!(
+            "{BASE}
+[device.style]
+type_scale = 0.8
+muted = 120
+
+[[device.widget]]
+id = \"quiet\"
+kind = \"text\"
+col = 0
+row = 0
+
+[[device.widget]]
+id = \"loud\"
+kind = \"text\"
+col = 1
+row = 0
+style = {{ type_scale = 1.5 }}
+"
+        );
+        let device = &parse(&text).unwrap().devices[0];
+
+        assert_eq!(device.style.type_scale, 0.8);
+        assert_eq!(device.widgets[0].style.type_scale, 0.8);
+        assert_eq!(device.widgets[1].style.type_scale, 1.5);
+        // And the override is per key: `loud` said nothing about the greys, so it
+        // still reads the device's.
+        assert_eq!(device.widgets[1].style.muted, 120);
+        // Everything neither of them mentioned is the shipped value.
+        assert_eq!(
+            device.widgets[1].style.reading_ceiling,
+            Style::SHIPPED.reading_ceiling
+        );
+    }
+
+    #[test]
+    fn a_group_styles_what_is_inside_it() {
+        // A group is a cell, so styling it styles its children — otherwise an author
+        // would have to repeat the same table on every child to make one block of the
+        // dashboard quieter than the rest.
+        let text = format!(
+            "{BASE}
+[[device.widget]]
+id = \"block\"
+kind = \"group\"
+col = 0
+row = 0
+grid = {{ cols = 1, rows = 2 }}
+style = {{ reading_ceiling = 1.1, rule = 220 }}
+
+[[device.widget.widget]]
+id = \"first\"
+kind = \"text\"
+col = 0
+row = 0
+
+[[device.widget.widget]]
+id = \"second\"
+kind = \"text\"
+col = 0
+row = 1
+style = {{ reading_ceiling = 3.0 }}
+"
+        );
+        let device = &parse(&text).unwrap().devices[0];
+        let group = device.widgets[0].group.as_ref().unwrap();
+
+        assert_eq!(group.widgets[0].style.reading_ceiling, 1.1);
+        assert_eq!(group.widgets[0].style.rule, 220);
+        // A child may still disagree with its group, and keeps the rest of it.
+        assert_eq!(group.widgets[1].style.reading_ceiling, 3.0);
+        assert_eq!(group.widgets[1].style.rule, 220);
+    }
+
+    #[test]
+    fn rejects_greys_that_do_not_darken_in_order() {
+        let text = format!("{BASE}\n[device.style]\nink = 200\nmuted = 100\n");
+        let message = err(&text);
+        assert!(message.contains("do not darken"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_style_scale_that_cannot_draw() {
+        for (key, value) in [("type_scale", "0.0"), ("glyph_share", "1.0")] {
+            let text = format!("{BASE}\n[device.style]\n{key} = {value}\n");
+            let message = err(&text);
+            assert!(
+                message.contains(&format!("style.{key}")),
+                "{key} = {value} should be rejected by name: {message}"
+            );
+        }
+    }
 
     /// A dashboard declared once, for the devices that adopt it.
     const DASHBOARD: &str = r#"
@@ -2092,7 +2469,14 @@ row = 0
         assert_eq!(device.id, "kindle");
         assert_eq!(device.palette, Palette::Gray16);
         assert_eq!(device.dither, Dither::Atkinson);
-        assert_eq!(device.grid, Grid { cols: 4, rows: 3 });
+        assert_eq!(
+            device.grid,
+            Grid {
+                cols: 4,
+                rows: 3,
+                fit: Fit::Stretch
+            }
+        );
     }
 
     #[test]
@@ -2687,7 +3071,14 @@ entity = "sensor.office_temperature"
         );
         let config = parse(&text).unwrap();
         assert_eq!(config.devices.len(), 2);
-        assert_eq!(config.devices[0].grid, Grid { cols: 2, rows: 2 });
+        assert_eq!(
+            config.devices[0].grid,
+            Grid {
+                cols: 2,
+                rows: 2,
+                fit: Fit::Stretch
+            }
+        );
         assert_eq!(
             config.devices[0].widgets, config.devices[1].widgets,
             "a dashboard is adopted whole, so both devices hold the same cells"
@@ -2786,7 +3177,15 @@ entity = "sensor.office_temperature"
 
     #[test]
     fn a_partial_chrome_leaves_the_rest_derived() {
-        let derived = Chrome::derived(1024, 758, Grid { cols: 4, rows: 3 });
+        let derived = Chrome::derived(
+            1024,
+            758,
+            Grid {
+                cols: 4,
+                rows: 3,
+                fit: Fit::Stretch,
+            },
+        );
         let chrome = parse(&with_device_line("chrome = { gap = 2 }"))
             .unwrap()
             .devices[0]
@@ -2855,7 +3254,11 @@ entity = "sensor.office_temperature"
             padding: 8.0,
             border: 1.0,
         };
-        let grid = Grid { cols: 2, rows: 1 };
+        let grid = Grid {
+            cols: 2,
+            rows: 1,
+            fit: Fit::Stretch,
+        };
         assert_eq!(cell_size(200, 100, grid, chrome), (85.0, 80.0));
         assert_eq!(sub_cell_size(200.0, 100.0, grid, chrome), (95.0, 100.0));
     }
@@ -3281,7 +3684,14 @@ attribute = "temperature"
             "a group is one cell of the outer grid"
         );
         let group = device.widgets[0].group.as_ref().unwrap();
-        assert_eq!(group.grid, Grid { cols: 2, rows: 1 });
+        assert_eq!(
+            group.grid,
+            Grid {
+                cols: 2,
+                rows: 1,
+                fit: Fit::Stretch
+            }
+        );
         let ids: Vec<&str> = device.all_widgets().map(|w| w.id.as_str()).collect();
         assert_eq!(
             ids,
