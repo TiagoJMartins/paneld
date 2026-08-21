@@ -362,9 +362,17 @@ label = "Notes"
 # Several readings as labelled rows in one cell. A `list` *is* its readings, so one
 # with none is rejected — there would be nothing to draw.
 #
+# Rows are drawn as a **ruled table**: each one spans the cell with its name at the
+# leading edge and its figure at the trailing one, over a hairline rule, at a pitch
+# that comes from the type rather than from the cell. Whatever is left of the cell
+# below the last reading is ruled and left blank, the way a form is: four readings in
+# a cell tall enough for ten are written on the first four lines rather than being set
+# enormous or spread until they stop reading as one table. That is what makes a dense
+# panel dense — and why a `list` on a tall cell is cheap, not wasteful.
+#
 # A list is not a special case of a `group`, and it is worth knowing which of the
 # two you want. A list is **one presentation of n values**: they are laid out and
-# sized together, so the rows share a type size and the labels line up down the
+# sized together, so the rows share a type size and the figures line up down the
 # cell, and adding a fourth reading makes all four a little smaller. A group is **n
 # independent widgets** that happen to share one slot of the outer grid, each with
 # its own kind, its own frame and its own tap. Three temperatures are a list; a
