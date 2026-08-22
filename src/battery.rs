@@ -36,6 +36,15 @@
 //!   discharging at a third of its real rate for the first hours after being
 //!   unplugged. So it is excluded from the measurement, and a trend needs two
 //!   crossings before it has a rate at all.
+//! - A **lone opposing reading is a bounce, not a turnover.** A level sitting on
+//!   a quantisation boundary reads either side of it depending on load, so one
+//!   poll reports 64% in the middle of a fall through 63%. Ending the trend
+//!   there throws away every crossing before it: measured on the panel in
+//!   service, one such sample cut a 16-hour window down to 5. A reading the
+//!   level came straight back from is stepped over instead. A reversal it does
+//!   not come back from still ends the trend, and a reversal at the newest poll
+//!   is nobody's business to interpret yet - it stands alone, which is one step,
+//!   which is no rate.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -310,6 +319,10 @@ impl History {
     /// changed. The second is the sharper signal and the reason [`Power`] is part
     /// of a reading: a charger going in is a new regime from that poll, not from
     /// whenever the level next happens to move.
+    ///
+    /// Turning over is not the same as moving the other way once. A lone reading
+    /// the level came straight back from is a quantisation bounce and the trend
+    /// continues through it; see the module note.
     fn trend_start(&self) -> Option<usize> {
         let power = self.readings.back()?.power;
         let last = self.readings.len().checked_sub(2)?;
@@ -318,11 +331,47 @@ impl History {
         }
         let rising = self.step(last) > 0.0;
 
+        // A newest step that reverses the one before it is a turnover nobody has
+        // confirmed: at this resolution it is equally a level bouncing off a
+        // boundary, and only the next crossing says which. It stands alone until
+        // then - one step, so no rate - and the tolerance below is held back,
+        // because `rising` came from that very step and would read the trend it
+        // interrupted as the bounce.
+        if last > 0 && (self.step(last - 1) > 0.0) != rising {
+            return Some(last);
+        }
+
         let mut start = last;
-        while start > 0
-            && self.readings[start - 1].power == power
-            && (self.step(start - 1) > 0.0) == rising
-        {
+        while start > 0 && self.readings[start - 1].power == power {
+            if (self.step(start - 1) > 0.0) == rising {
+                start -= 1;
+                continue;
+            }
+            // The step into `start` opposes the trend, so `start` is where the
+            // level turned - unless it is a spike the level came straight back
+            // from. Two things have to hold, and the second is not optional.
+            //
+            // It came back: measured across `start` rather than step by step, a
+            // bounce nets out to nothing (63, 64, 63) or to the trend's own
+            // direction, while a level that really turned nets against it. The
+            // size of the excursion decides that, with no threshold to pick.
+            //
+            // And it is a spike: the step into `start` must itself reverse the
+            // step before it. Where those two go the same way, `start` is not an
+            // excursion at all - it is the last reading of the trend that came
+            // before, and 60, 59, 58, 59, 60 is a charge starting at a bottom,
+            // not a bounce. Absorbing that would anchor the rate on a `since`
+            // from before the charge, which is the error the module note opens
+            // with. Two readings back must also be under this power state, or
+            // absorbing would step across a charger.
+            let net = self.readings[start + 1].percent - self.readings[start - 1].percent;
+            let came_back = if rising { net >= 0.0 } else { net <= 0.0 };
+            let spike = start >= 2
+                && self.readings[start - 2].power == power
+                && (self.step(start - 2) > 0.0) != (self.step(start - 1) > 0.0);
+            if !(came_back && spike) {
+                break;
+            }
             start -= 1;
         }
         Some(start)
@@ -632,6 +681,164 @@ mod tests {
             trend.steps, 3,
             "only the crossings since the level turned over belong to this trend"
         );
+    }
+
+    #[test]
+    fn a_bounce_the_level_came_back_from_does_not_end_the_discharge() {
+        // The shape measured on the panel in service: a fall through 63% where
+        // one poll read 64%. Ending the trend there left 11 crossings of 28 and
+        // measured the rate over 5.7 hours of a 16-hour discharge.
+        let mut history = History::default();
+        let mut minute = 0;
+        for percent in [68.0, 67.0, 66.0, 65.0, 64.0, 63.0, 64.0, 63.0, 62.0, 61.0] {
+            history.record(percent, SILENT, at(minute));
+            minute += 60;
+        }
+
+        let trend = history.report().trend;
+        assert_eq!(trend.direction, Direction::Discharging);
+        assert_eq!(
+            trend.steps, 9,
+            "the bounce is stepped over, not treated as a turnover: {trend:?}"
+        );
+        // 67% down to 61% over the eight hours between those crossings. The two
+        // hours the level spent either side of the bounce are real time at that
+        // level, so the measured slope is a little shallower than the 1% an hour
+        // the rest of the fall ran at - and a little shallower is the whole cost
+        // of a bounce now.
+        assert_eq!(trend.percent_per_hour, Some(-0.75));
+        assert_eq!(
+            trend.observed_hours,
+            Some(8.0),
+            "the window the old behaviour cut to two hours"
+        );
+    }
+
+    #[test]
+    fn a_reversal_the_level_did_not_come_back_from_still_ends_the_trend() {
+        // Falling, then five points up in one poll and two back down. A device
+        // that gained four points net has been on a charger, whatever it did not
+        // say, and measuring across that is how a discharge rate turns into
+        // fiction. The excursion is a lone reading and the level did move back,
+        // so only its size says this was not a bounce.
+        let mut history = History::default();
+        let mut minute = 0;
+        for percent in [70.0, 69.0, 68.0, 73.0, 72.0, 71.0] {
+            history.record(percent, SILENT, at(minute));
+            minute += 60;
+        }
+
+        let trend = history.report().trend;
+        assert_eq!(
+            trend.steps, 2,
+            "the trend starts at the level it jumped to: {trend:?}"
+        );
+        assert_eq!(trend.direction, Direction::Discharging);
+        assert_eq!(
+            trend.percent_per_hour,
+            Some(-1.0),
+            "measured over the fall since the jump, not across it"
+        );
+    }
+
+    #[test]
+    fn a_reversal_that_kept_going_still_ends_the_trend() {
+        // Two crossings the same way is a new regime, not a bounce: this is the
+        // charge nobody reported, and it must not be averaged with the discharge
+        // before it.
+        let mut history = History::default();
+        let mut minute = 0;
+        for percent in [60.0, 59.0, 58.0, 59.0, 60.0, 61.0] {
+            history.record(percent, SILENT, at(minute));
+            minute += 60;
+        }
+
+        let trend = history.report().trend;
+        assert_eq!(trend.direction, Direction::Charging);
+        assert_eq!(trend.steps, 3);
+        assert_eq!(
+            trend.percent_per_hour,
+            Some(1.0),
+            "measured over the rise alone: {trend:?}"
+        );
+        assert_eq!(
+            trend.observed_hours,
+            Some(2.0),
+            "the two hours since the level turned, not the five before it"
+        );
+    }
+
+    #[test]
+    fn a_charge_starting_at_a_level_the_panel_sat_on_is_not_read_as_a_bounce() {
+        // The bottom of a discharge looks exactly like a bounce - one reading
+        // with a higher one either side - and treating it as one anchors the
+        // charge rate on when the panel *reached* 58%, five hours before the
+        // charger went in. That is the same error the module note opens with, and
+        // it is why a bounce has to be a spike: 59, 58 went the same way, so 58
+        // is where the fall ended, not an excursion out of a rise.
+        let mut history = History::default();
+        for (percent, hour) in [(60.0, 0), (59.0, 1), (58.0, 2)] {
+            history.record(percent, SILENT, at(hour * 60));
+        }
+        for hour in 3..=6 {
+            history.record(58.0, SILENT, at(hour * 60));
+        }
+        for (percent, hour) in [(59.0, 7), (60.0, 8)] {
+            history.record(percent, SILENT, at(hour * 60));
+        }
+
+        let trend = history.report().trend;
+        assert_eq!(trend.direction, Direction::Charging);
+        assert_eq!(
+            trend.percent_per_hour,
+            Some(1.0),
+            "1% an hour is what the charge did; anchoring on 58%'s `since` says a third of that: {trend:?}"
+        );
+        assert_eq!(trend.observed_hours, Some(1.0));
+    }
+
+    #[test]
+    fn a_reversal_at_the_newest_poll_stands_alone_until_something_confirms_it() {
+        // One poll up after a long fall is either a charger or a boundary, and
+        // nothing on the wire says which. One step is no rate, which is the
+        // honest answer for as long as it lasts.
+        let mut history = History::default();
+        let mut minute = 0;
+        for percent in [68.0, 67.0, 66.0, 65.0, 64.0, 65.0] {
+            history.record(percent, SILENT, at(minute));
+            minute += 60;
+        }
+
+        let trend = history.report().trend;
+        assert_eq!(trend.steps, 1);
+        assert_eq!(trend.percent_per_hour, None);
+        assert_eq!(trend.eta_at, None);
+        assert_eq!(
+            trend.direction,
+            Direction::Charging,
+            "the level did go up, and that is all that is claimed"
+        );
+    }
+
+    #[test]
+    fn a_discharge_recovers_its_window_the_poll_after_a_bounce_resolves() {
+        // The poll that closes the bounce is the one that says it was a bounce,
+        // so the long window comes back rather than restarting from here.
+        let mut history = History::default();
+        let mut minute = 0;
+        for percent in [68.0, 67.0, 66.0, 65.0, 64.0, 65.0, 64.0, 63.0] {
+            history.record(percent, SILENT, at(minute));
+            minute += 60;
+        }
+
+        let trend = history.report().trend;
+        assert_eq!(trend.direction, Direction::Discharging);
+        assert_eq!(trend.steps, 7, "back to the whole fall: {trend:?}");
+        // 67% to 63% over the six hours between those crossings, the bounce's
+        // two hours at 64/65 included: shallower than the fall's own 1% an hour,
+        // and measured over six hours instead of the one this poll could see.
+        assert_eq!(trend.percent_per_hour, Some(-0.667));
+        assert_eq!(trend.observed_hours, Some(6.0));
     }
 
     #[test]
