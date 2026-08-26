@@ -81,6 +81,11 @@ pub struct Server {
     /// reproducible and keeps a dashboard drawable while the internet is down.
     #[serde(default = "default_icon_cache_path")]
     pub icon_cache_path: String,
+    /// Where the hash of each printer sink's last delivered frame is persisted,
+    /// so a restart — which re-renders every device — does not reprint an
+    /// unchanged dashboard. Paper is not idempotent.
+    #[serde(default = "default_print_state_path")]
+    pub print_state_path: String,
 }
 
 fn default_content_path() -> String {
@@ -89,6 +94,10 @@ fn default_content_path() -> String {
 
 fn default_icon_cache_path() -> String {
     "paneld-icons".to_owned()
+}
+
+fn default_print_state_path() -> String {
+    "paneld-printed.json".to_owned()
 }
 
 /// Home Assistant connection details, required by any `ha_entity` widget.
@@ -132,6 +141,27 @@ pub struct Device {
     pub max_frame_bytes: usize,
     pub grid: Grid,
     pub widgets: Vec<Widget>,
+    /// A thermal printer this device's frames are delivered to. The device is
+    /// otherwise ordinary — its frame is still rendered, stored and served, so
+    /// anything that can show a PNG previews exactly what will print.
+    pub sink: Option<Sink>,
+}
+
+/// A validated printer sink.
+///
+/// Only one kind exists today — `nanoprint`, the ESP32 BLE bridge for the
+/// DP-L1S — but the file spells it explicitly so a second kind is a new
+/// accepted value rather than a breaking change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sink {
+    /// Bridge base URL, stored without a trailing slash; frames are posted to
+    /// `{url}/print/raster`.
+    pub url: String,
+    /// Print density 0..=2 passed through to the printer, when set.
+    pub density: Option<u8>,
+    /// Whether a changed frame prints by itself. `false` means only the
+    /// explicit `POST /d/<id>/api/print` prints, which suits preview-then-print.
+    pub auto: bool,
 }
 
 /// The dashboard grid a device's widgets are placed on.
@@ -431,6 +461,7 @@ fn validate_device(device: RawDevice, has_home_assistant: bool) -> Result<Device
         max_frame_bytes,
         grid,
         widgets,
+        sink,
     } = device;
 
     ensure!(!id.is_empty(), "device id must not be empty");
@@ -485,6 +516,8 @@ fn validate_device(device: RawDevice, has_home_assistant: bool) -> Result<Device
         .collect::<Result<Vec<_>>>()?;
     validate_placement(&id, grid, &widgets)?;
 
+    let sink = sink.map(|sink| validate_sink(sink, &id, width, palette)).transpose()?;
+
     Ok(Device {
         id,
         width,
@@ -496,6 +529,53 @@ fn validate_device(device: RawDevice, has_home_assistant: bool) -> Result<Device
         max_frame_bytes,
         grid,
         widgets,
+        sink,
+    })
+}
+
+/// Validates a device's printer sink.
+///
+/// The DP-L1S printhead is 384 dots wide and its bridge accepts exactly
+/// 48-byte rows, so a sink constrains the device's geometry and palette rather
+/// than adapting to them: scaling or re-quantising here would silently break
+/// the promise that a previewed frame is the printed frame.
+fn validate_sink(sink: RawSink, device_id: &str, width: u32, palette: Palette) -> Result<Sink> {
+    let RawSink {
+        kind,
+        url,
+        density,
+        auto,
+    } = sink;
+
+    ensure!(
+        kind == "nanoprint",
+        "device `{device_id}` has a sink of kind `{kind}`; only `nanoprint` exists"
+    );
+    ensure!(
+        palette == Palette::Mono,
+        "device `{device_id}` has a printer sink but palette `{palette:?}`; \
+         a thermal printhead is 1-bit, so a sink requires `palette = \"mono\"`"
+    );
+    ensure!(
+        width == 384,
+        "device `{device_id}` is {width} pixels wide, but the nanoprint bridge \
+         prints exactly 384 (the DP-L1S printhead)"
+    );
+    ensure!(
+        url.starts_with("http://") || url.starts_with("https://"),
+        "device `{device_id}` sink url `{url}` must start with http:// or https://"
+    );
+    if let Some(density) = density {
+        ensure!(
+            density <= 2,
+            "device `{device_id}` sink density {density} is outside 0..=2"
+        );
+    }
+
+    Ok(Sink {
+        url: url.trim_end_matches('/').to_owned(),
+        density,
+        auto: auto.unwrap_or(true),
     })
 }
 
@@ -733,6 +813,17 @@ struct RawDevice {
     grid: Grid,
     #[serde(default, rename = "widget")]
     widgets: Vec<RawWidget>,
+    sink: Option<RawSink>,
+}
+
+/// A `sink` as the file spells it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSink {
+    kind: String,
+    url: String,
+    density: Option<u8>,
+    auto: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -824,6 +915,71 @@ grid = { cols = 4, rows = 3 }
         assert_eq!(device.palette, Palette::Gray16);
         assert_eq!(device.dither, Dither::Atkinson);
         assert_eq!(device.grid, Grid { cols: 4, rows: 3 });
+    }
+
+    const PRINTER: &str = r#"
+[[device]]
+id = "printer"
+width = 384
+height = 768
+palette = "mono"
+dither = "floyd-steinberg"
+refresh_rate = 300
+grid = { cols = 1, rows = 2 }
+sink = { kind = "nanoprint", url = "http://nanoprint.local/" }
+"#;
+
+    #[test]
+    fn parses_a_printer_sink_with_defaults() {
+        let config = parse(&format!("{BASE}{PRINTER}")).unwrap();
+        let sink = config.devices[1].sink.as_ref().unwrap();
+        // The trailing slash is stripped, like every other base URL.
+        assert_eq!(sink.url, "http://nanoprint.local");
+        assert_eq!(sink.density, None);
+        assert!(sink.auto, "a sink prints changed frames unless told otherwise");
+    }
+
+    #[test]
+    fn a_sink_accepts_density_and_manual_mode() {
+        let text = format!("{BASE}{PRINTER}").replace(
+            r#"sink = { kind = "nanoprint", url = "http://nanoprint.local/" }"#,
+            r#"sink = { kind = "nanoprint", url = "http://nanoprint.local", density = 2, auto = false }"#,
+        );
+        let sink = parse(&text).unwrap().devices[1].sink.clone().unwrap();
+        assert_eq!(sink.density, Some(2));
+        assert!(!sink.auto);
+    }
+
+    #[test]
+    fn a_sink_requires_the_mono_palette() {
+        let text = format!("{BASE}{PRINTER}").replace("palette = \"mono\"", "palette = \"gray16\"");
+        assert!(err(&text).contains("mono"));
+    }
+
+    #[test]
+    fn a_sink_requires_the_printhead_width() {
+        let text = format!("{BASE}{PRINTER}").replace("width = 384", "width = 400");
+        assert!(err(&text).contains("384"));
+    }
+
+    #[test]
+    fn a_sink_of_an_unknown_kind_is_rejected() {
+        let text = format!("{BASE}{PRINTER}").replace("kind = \"nanoprint\"", "kind = \"cups\"");
+        assert!(err(&text).contains("nanoprint"));
+    }
+
+    #[test]
+    fn a_sink_density_outside_the_printer_range_is_rejected() {
+        let text = format!("{BASE}{PRINTER}").replace(
+            r#"url = "http://nanoprint.local/" }"#,
+            r#"url = "http://nanoprint.local", density = 3 }"#,
+        );
+        assert!(err(&text).contains("0..=2"));
+    }
+
+    #[test]
+    fn a_device_without_a_sink_is_untouched() {
+        assert_eq!(parse(BASE).unwrap().devices[0].sink, None);
     }
 
     #[test]

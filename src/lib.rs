@@ -26,6 +26,7 @@ pub mod icon;
 pub mod render;
 pub mod renderer;
 pub mod schedule;
+pub mod sink;
 pub mod status;
 pub mod tap;
 pub mod telemetry;

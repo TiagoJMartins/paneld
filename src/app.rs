@@ -17,6 +17,7 @@ use crate::frame::{Frame, FrameStore};
 use crate::ha::{HaClient, HttpHaClient, LastGood, Reading, Reported, fetch_readings};
 use crate::icon;
 use crate::render::{self, RenderInputs};
+use crate::sink::{self, PrintedStore};
 use crate::status::StatusStore;
 use crate::tap::{self, Taps};
 
@@ -64,6 +65,12 @@ pub struct Runtime {
     /// Recent tap event ids, so a client that retries does not act twice.
     taps: Taps,
     wake_tx: mpsc::Sender<String>,
+    /// The frame hash last delivered to each printer sink, shared with the
+    /// delivery tasks spawned by [`Runtime::render_device`].
+    printed: Arc<PrintedStore>,
+    /// One HTTP client for every sink delivery. The generous timeout is for the
+    /// bridge, which replies only after the printer acknowledges the job.
+    sink_client: reqwest::Client,
     /// Placeholders for unconfigured device ids, rendered on demand.
     placeholders: Mutex<HashMap<PlaceholderKey, Frame>>,
 }
@@ -88,6 +95,7 @@ impl Runtime {
         ha: Option<Box<dyn HaClient>>,
     ) -> Result<(Arc<Self>, mpsc::Receiver<String>)> {
         let content = ContentStore::load(config.server.content_path.clone());
+        let config_print_state_path = config.server.print_state_path.clone();
         let (wake_tx, wake_rx) = mpsc::channel(WAKE_CHANNEL_CAPACITY);
 
         // A cache directory that cannot be created is logged once here rather than
@@ -115,6 +123,12 @@ impl Runtime {
             icons,
             taps: Taps::new(),
             wake_tx,
+            printed: Arc::new(PrintedStore::load(&config_print_state_path)),
+            sink_client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(90))
+                .build()
+                .context("building the sink HTTP client")?,
             placeholders: Mutex::new(HashMap::new()),
         });
         Ok((runtime, wake_rx))
@@ -217,7 +231,85 @@ impl Runtime {
             .unwrap_or_default();
         self.status.record_render(device_id, &hash, now);
 
+        if changed && let Some(sink) = device.sink.as_ref().filter(|sink| sink.auto) {
+            self.spawn_delivery(device_id, sink, &hash);
+        }
+
         Ok(changed)
+    }
+
+    /// Delivers the current frame to `device_id`'s sink right now, regardless of
+    /// whether it changed — the reprint button. `POST /d/<id>/api/print`.
+    pub async fn print_device(&self, device_id: &str) -> Result<sink::Delivery> {
+        let config = self.config();
+        let device = config
+            .devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .with_context(|| format!("device `{device_id}` is not configured"))?;
+        let sink = device
+            .sink
+            .as_ref()
+            .with_context(|| format!("device `{device_id}` has no printer sink"))?;
+        let frame = self
+            .frames
+            .current(device_id)
+            .with_context(|| format!("device `{device_id}` has no rendered frame yet"))?;
+
+        let raster = sink::raster_from_png(&frame.bytes, device.width)?;
+        anyhow::ensure!(!raster.is_empty(), "the frame is blank; nothing to print");
+        let delivery =
+            sink::deliver(&self.sink_client, &sink.url, sink.density, raster, device.width)
+                .await?;
+        self.printed.record(device_id, &frame.hash);
+        Ok(delivery)
+    }
+
+    /// Spawns one sink delivery for a changed frame, off the render loop.
+    ///
+    /// Detached deliberately: a slow or absent bridge must never stall the loop
+    /// that renders every other device. Success records the hash so an unchanged
+    /// re-render — or a restart, via the persisted record — does not reprint;
+    /// failure leaves it unrecorded, so the next *changed* frame tries again and
+    /// the manual print endpoint remains for everything in between.
+    fn spawn_delivery(&self, device_id: &str, sink: &crate::config::Sink, hash: &str) {
+        if self.printed.already_printed(device_id, hash) {
+            tracing::debug!(device = device_id, hash, "frame already on paper; not reprinting");
+            return;
+        }
+        let Some(frame) = self.frames.current(device_id) else {
+            return;
+        };
+        let (device_id, hash) = (device_id.to_owned(), hash.to_owned());
+        let (url, density) = (sink.url.clone(), sink.density);
+        let width = self.config().devices.iter().find(|d| d.id == device_id).map(|d| d.width);
+        let Some(width) = width else { return };
+        let (client, printed) = (self.sink_client.clone(), Arc::clone(&self.printed));
+
+        tokio::spawn(async move {
+            let raster = match sink::raster_from_png(&frame.bytes, width) {
+                Ok(raster) if raster.is_empty() => {
+                    tracing::debug!(device = %device_id, "frame is blank; nothing to print");
+                    printed.record(&device_id, &hash);
+                    return;
+                }
+                Ok(raster) => raster,
+                Err(error) => {
+                    tracing::warn!(device = %device_id, error = format!("{error:#}"),
+                        "the frame did not decode to a printable raster");
+                    return;
+                }
+            };
+            match sink::deliver(&client, &url, density, raster, width).await {
+                Ok(delivery) => {
+                    printed.record(&device_id, &hash);
+                    tracing::info!(device = %device_id, height_px = delivery.height_px,
+                        "frame delivered to the printer");
+                }
+                Err(error) => tracing::warn!(device = %device_id, error = format!("{error:#}"),
+                    "sink delivery failed; the next changed frame will try again"),
+            }
+        });
     }
 
     /// Resolves every Home Assistant reading this device's dashboard references,

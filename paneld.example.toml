@@ -200,3 +200,55 @@ label = "Notes"
 # row = 1
 # label = "Refresh"
 # tap = "refresh"
+
+# ---------------------------------------------------------------------------
+# A thermal printer as a device
+# ---------------------------------------------------------------------------
+#
+# A device with a `sink` is rendered, stored and served like any panel — open
+# http://192.168.0.50:4444/d/printer/current.png (or point a Kindle at the same
+# device) and you are previewing exactly the bytes that will print. On top of
+# that, frames are delivered to a nanoprint bridge (the ESP32 BLE bridge for
+# the Lidl TRONIC / DP-L1S pocket printer): automatically whenever the encoded
+# frame *changes*, or on demand with
+#
+#   curl -X POST http://192.168.0.50:4444/d/printer/api/print
+#
+# which prints the current frame changed or not. Paper is not idempotent, so
+# auto-printing rides the same frame-hash comparison the e-ink refresh uses,
+# the last printed hash is persisted (`print_state_path`, default
+# `paneld-printed.json`) so a restart never reprints an unchanged dashboard,
+# blank frames are skipped, and trailing blank rows are trimmed — paper ends
+# where the content does.
+#
+# The printhead fixes the geometry: `width` must be 384 and `palette` must be
+# `mono`. Height is the ticket length; trailing whitespace is trimmed, so err
+# long. `dither = "floyd-steinberg"` reads best on paper; use `bayer` if a
+# mostly-static dashboard reprints from diffusion noise alone.
+#
+# [[device]]
+# id = "printer"
+# width = 384
+# height = 768
+# palette = "mono"
+# dither = "floyd-steinberg"
+# refresh_rate = 300
+# render_interval = 300
+# grid = { cols = 1, rows = 2 }
+# # auto = false limits printing to the explicit endpoint (preview-then-print).
+# # density is the printer's darkness setting, 0..=2.
+# sink = { kind = "nanoprint", url = "http://nanoprint.local", density = 2 }
+#
+# [[device.widget]]
+# id = "morning_note"
+# kind = "text"
+# col = 0
+# row = 0
+# label = "Note"
+#
+# [[device.widget]]
+# id = "todo"
+# kind = "text"
+# col = 0
+# row = 1
+# label = "Today"

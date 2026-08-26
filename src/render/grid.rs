@@ -153,6 +153,7 @@ mod tests {
             max_frame_bytes: 0,
             grid: Grid { cols, rows },
             widgets,
+            sink: None,
         }
     }
 

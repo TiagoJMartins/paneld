@@ -1259,6 +1259,7 @@ mod tests {
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             grid: Grid { cols: 2, rows: 2 },
             widgets,
+            sink: None,
         }
     }
 

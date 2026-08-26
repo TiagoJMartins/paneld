@@ -67,6 +67,7 @@ fn routes(runtime: Arc<Runtime>) -> Router {
         .route("/d/{device}/api/display", get(display))
         .route("/d/{device}/api/setup", get(setup))
         .route("/d/{device}/api/tap", post(tap))
+        .route("/d/{device}/api/print", post(print_now))
         .route("/d/{device}/api/log", post(device_log))
         .route("/d/{device}/frames/{file}", get(frame_file))
         .route("/d/{device}/current.png", get(current_frame))
@@ -265,6 +266,37 @@ async fn display(
         )),
     )
         .into_response()
+}
+
+/// `POST /d/{device}/api/print` — deliver the frame being served to the device's
+/// printer sink, changed or not. The reprint button, and the whole of the
+/// preview-then-print flow: look at `/d/{device}/current.png` (or the same
+/// dashboard on any panel), then post here.
+///
+/// Replies after the printer acknowledges the job, so a `200` means paper moved.
+async fn print_now(
+    State(runtime): State<Arc<Runtime>>,
+    Path(device_id): Path<String>,
+) -> Response {
+    match runtime.print_device(&device_id).await {
+        Ok(delivery) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "printed": true,
+                "height_px": delivery.height_px,
+                "bytes": delivery.bytes,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!(device = %device_id, error = format!("{error:#}"), "manual print failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "printed": false, "error": format!("{error:#}") })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// The placeholder poll response, so a mistyped base URL is diagnosable on the
