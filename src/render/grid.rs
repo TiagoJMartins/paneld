@@ -412,6 +412,7 @@ mod tests {
             chrome: Chrome::derived(width, height, grid),
             status_bar: None,
             widgets,
+            sink: None,
         }
     }
 

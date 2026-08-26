@@ -69,6 +69,40 @@ pub struct Runtime {
     wake_tx: mpsc::Sender<String>,
     /// Placeholders for unconfigured device ids, rendered on demand.
     placeholders: Mutex<HashMap<PlaceholderKey, Frame>>,
+    /// One HTTP client for every sink delivery. The generous timeout is for the
+    /// bridge, which replies only after the printer acknowledges the job.
+    sink_client: reqwest::Client,
+}
+
+/// Why a manual print did not put anything on paper.
+///
+/// Split by whose fault it is, because the HTTP surface answers differently:
+/// asking for a device that cannot print is the caller's error, a bridge that
+/// refused is the printer's.
+#[derive(Debug)]
+pub enum PrintError {
+    /// No device with that id is configured.
+    NoSuchDevice,
+    /// The device exists but declares no `sink`.
+    NoSink,
+    /// The device has not been rendered yet.
+    NoFrame,
+    /// The frame is all white; an empty dashboard is not worth a blank receipt.
+    Blank,
+    /// Decoding the frame or talking to the bridge failed.
+    Delivery(anyhow::Error),
+}
+
+impl std::fmt::Display for PrintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSuchDevice => write!(f, "the device is not configured"),
+            Self::NoSink => write!(f, "the device has no printer sink"),
+            Self::NoFrame => write!(f, "the device has no rendered frame yet"),
+            Self::Blank => write!(f, "the frame is blank; nothing to print"),
+            Self::Delivery(error) => write!(f, "{error:#}"),
+        }
+    }
 }
 
 type PlaceholderKey = (String, u32, u32);
@@ -121,6 +155,11 @@ impl Runtime {
             taps: Taps::new(),
             wake_tx,
             placeholders: Mutex::new(HashMap::new()),
+            sink_client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(90))
+                .build()
+                .context("building the sink HTTP client")?,
         });
         Ok((runtime, wake_rx))
     }
@@ -192,6 +231,38 @@ impl Runtime {
                 "render wake channel is full; the device will be rebuilt on its interval"
             );
         }
+    }
+
+    /// Delivers the frame currently being served for `device_id` to its printer
+    /// sink. `POST /api/print/{device}` — the only way paper ever moves.
+    ///
+    /// Returns after the bridge acknowledges the job, so success means paper
+    /// moved. The frame is the one any preview of the device is already showing:
+    /// the raster is decoded from the same encoded bytes.
+    pub async fn print_device(&self, device_id: &str) -> Result<crate::sink::Delivery, PrintError> {
+        let config = self.config();
+        let device = config
+            .devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .ok_or(PrintError::NoSuchDevice)?;
+        let sink = device.sink.as_ref().ok_or(PrintError::NoSink)?;
+        let frame = self.frames.current(device_id).ok_or(PrintError::NoFrame)?;
+
+        let raster = crate::sink::raster_from_png(&frame.bytes, device.width)
+            .map_err(PrintError::Delivery)?;
+        if raster.is_empty() {
+            return Err(PrintError::Blank);
+        }
+        crate::sink::deliver(
+            &self.sink_client,
+            &sink.url,
+            sink.density,
+            raster,
+            device.width,
+        )
+        .await
+        .map_err(PrintError::Delivery)
     }
 
     /// Renders one device and offers the result to the frame store.

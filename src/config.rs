@@ -190,6 +190,11 @@ pub struct Device {
     /// whole frame.
     pub status_bar: Option<StatusBar>,
     pub widgets: Vec<Widget>,
+    /// A thermal printer this device's frames can be delivered to, on demand.
+    /// The device is otherwise ordinary — its frame is still rendered, stored
+    /// and served, so anything that can show a PNG previews exactly what
+    /// `POST /api/print/{device}` will put on paper.
+    pub sink: Option<Sink>,
 }
 
 impl Device {
@@ -231,6 +236,21 @@ impl Device {
             Edge::Right => (self.width - thickness, 0, thickness, self.height),
         })
     }
+}
+
+/// A validated thermal printer sink: where a device's frame goes when the print
+/// endpoint is posted to.
+///
+/// Nothing prints on its own. Paper is not idempotent — a repainted panel is
+/// free, a reprinted receipt is litter — so delivery happens only on an
+/// explicit `POST /api/print/{device}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sink {
+    /// Base URL of the nanoprint bridge, without a trailing slash. The raster
+    /// is posted to `{url}/print/raster`.
+    pub url: String,
+    /// The printer's darkness setting, `0..=2`, passed through to the bridge.
+    pub density: Option<u8>,
 }
 
 /// The widget grid's rect within a frame, as `(x, y, width, height)`.
@@ -1206,6 +1226,7 @@ fn validate_device(
         status_bar,
         dashboard,
         widgets,
+        sink,
     } = device;
 
     ensure!(!id.is_empty(), "device id must not be empty");
@@ -1323,6 +1344,10 @@ fn validate_device(
     validate_ids(&id, &widgets)?;
     validate_group_geometry(&id, chrome, cell_w, cell_h, &widgets)?;
 
+    let sink = sink
+        .map(|sink| validate_sink(sink, &id, width, palette))
+        .transpose()?;
+
     Ok(Device {
         id,
         width,
@@ -1337,6 +1362,48 @@ fn validate_device(
         chrome,
         status_bar,
         widgets,
+        sink,
+    })
+}
+
+/// Validates a device's printer sink.
+///
+/// The printhead fixes most of this: the nanoprint bridge drives a DP-L1S,
+/// which prints 384 dots per row, one bit each — so the device must be exactly
+/// 384 wide and `palette = "mono"`. Everything else about the device stays a
+/// panel's: the height is the ticket length, and trailing blank rows are
+/// trimmed at delivery, so err long.
+fn validate_sink(sink: RawSink, device_id: &str, width: u32, palette: Palette) -> Result<Sink> {
+    let RawSink { kind, url, density } = sink;
+
+    ensure!(
+        kind == "nanoprint",
+        "device `{device_id}` has a sink of kind `{kind}`; only `nanoprint` exists"
+    );
+    ensure!(
+        palette == Palette::Mono,
+        "device `{device_id}` has a printer sink but palette `{palette:?}`; \
+         a thermal printhead is 1-bit, so a sink requires `palette = \"mono\"`"
+    );
+    ensure!(
+        width == 384,
+        "device `{device_id}` is {width} pixels wide, but the nanoprint bridge \
+         prints exactly 384 (the DP-L1S printhead)"
+    );
+    ensure!(
+        url.starts_with("http://") || url.starts_with("https://"),
+        "device `{device_id}` sink url `{url}` must start with http:// or https://"
+    );
+    if let Some(density) = density {
+        ensure!(
+            density <= 2,
+            "device `{device_id}` sink density {density} is outside 0..=2"
+        );
+    }
+
+    Ok(Sink {
+        url: url.trim_end_matches('/').to_owned(),
+        density,
     })
 }
 
@@ -2121,6 +2188,17 @@ struct RawDevice {
     dashboard: Option<String>,
     #[serde(default, rename = "widget")]
     widgets: Vec<RawWidget>,
+    /// A thermal printer to deliver frames to, on explicit request only.
+    sink: Option<RawSink>,
+}
+
+/// A `sink` as the file spells it.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct RawSink {
+    kind: String,
+    url: String,
+    density: Option<u8>,
 }
 
 /// A device's spacing, as the file may leave it: any field absent is derived from
@@ -2490,6 +2568,71 @@ row = 0
                 fit: Fit::Stretch
             }
         );
+    }
+
+    /// A second device shaped like the printer: the DP-L1S printhead's 384 dots,
+    /// mono, with a sink for [`BASE`]'s server to deliver to.
+    const PRINTER: &str = r#"
+[[device]]
+id = "printer"
+width = 384
+height = 768
+palette = "mono"
+dither = "floyd-steinberg"
+refresh_rate = 300
+grid = { cols = 1, rows = 2 }
+sink = { kind = "nanoprint", url = "http://nanoprint.local/" }
+"#;
+
+    #[test]
+    fn parses_a_printer_sink() {
+        let config = parse(&format!("{BASE}{PRINTER}")).unwrap();
+        let sink = config.devices[1].sink.as_ref().unwrap();
+        // The trailing slash is stripped, like every other base URL.
+        assert_eq!(sink.url, "http://nanoprint.local");
+        assert_eq!(sink.density, None);
+    }
+
+    #[test]
+    fn a_sink_accepts_a_density() {
+        let text = format!("{BASE}{PRINTER}").replace(
+            r#"url = "http://nanoprint.local/" }"#,
+            r#"url = "http://nanoprint.local", density = 2 }"#,
+        );
+        let sink = parse(&text).unwrap().devices[1].sink.clone().unwrap();
+        assert_eq!(sink.density, Some(2));
+    }
+
+    #[test]
+    fn a_sink_requires_the_mono_palette() {
+        let text = format!("{BASE}{PRINTER}").replace("palette = \"mono\"", "palette = \"gray16\"");
+        assert!(err(&text).contains("mono"));
+    }
+
+    #[test]
+    fn a_sink_requires_the_printhead_width() {
+        let text = format!("{BASE}{PRINTER}").replace("width = 384", "width = 400");
+        assert!(err(&text).contains("384"));
+    }
+
+    #[test]
+    fn a_sink_of_an_unknown_kind_is_rejected() {
+        let text = format!("{BASE}{PRINTER}").replace("kind = \"nanoprint\"", "kind = \"cups\"");
+        assert!(err(&text).contains("nanoprint"));
+    }
+
+    #[test]
+    fn a_sink_density_outside_the_printer_range_is_rejected() {
+        let text = format!("{BASE}{PRINTER}").replace(
+            r#"url = "http://nanoprint.local/" }"#,
+            r#"url = "http://nanoprint.local", density = 3 }"#,
+        );
+        assert!(err(&text).contains("0..=2"));
+    }
+
+    #[test]
+    fn a_device_without_a_sink_is_untouched() {
+        assert_eq!(parse(BASE).unwrap().devices[0].sink, None);
     }
 
     #[test]

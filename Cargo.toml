@@ -71,3 +71,7 @@ tz-rs = { version = "0.7", default-features = false, features = ["std"] }
 # Drives the axum router in-process, without binding a port (test seam 1).
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# The sink suite binds a loopback stub bridge, the one test that does real I/O.
+tokio = { version = "1.53", features = ["net"] }
+# Unpoisonable locks for test stubs.
+parking_lot = "0.12"

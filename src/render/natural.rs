@@ -303,6 +303,7 @@ mod tests {
             style: Style::default(),
             status_bar: None,
             widgets,
+            sink: None,
         }
     }
 

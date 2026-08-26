@@ -735,6 +735,56 @@ label = "Notes"
 # dashboard = "kitchen"
 
 # ---------------------------------------------------------------------------
+# A thermal printer as a device
+# ---------------------------------------------------------------------------
+#
+# A device with a `sink` is rendered, stored and served like any panel — open
+# http://192.168.0.50:4444/d/printer/current.png (or point a Kindle at the same
+# device) and you are previewing exactly the bytes that will print. Nothing
+# prints on its own: paper is not idempotent, so the frame goes to the printer
+# only when you post
+#
+#   curl -X POST http://192.168.0.50:4444/api/print/printer
+#
+# which delivers the frame being served right now and replies once the printer
+# has acknowledged the job — a 200 means paper moved. Preview, then print.
+# An all-white frame is refused (an empty dashboard is not worth a blank
+# receipt) and trailing blank rows are trimmed: paper ends where the content
+# does.
+#
+# The `sink` points at a nanoprint bridge — an ESP32 BLE bridge for the Lidl
+# TRONIC / DP-L1S pocket printer — and the printhead fixes the geometry:
+# `width` must be 384 and `palette` must be `mono`. Height is the ticket
+# length; trailing whitespace is trimmed, so err long. `dither =
+# "floyd-steinberg"` reads best on paper.
+#
+# [[device]]
+# id = "printer"
+# width = 384
+# height = 768
+# palette = "mono"
+# dither = "floyd-steinberg"
+# refresh_rate = 300
+# render_interval = 300
+# grid = { cols = 1, rows = 2 }
+# # density is the printer's darkness setting, 0..=2.
+# sink = { kind = "nanoprint", url = "http://nanoprint.local", density = 2 }
+#
+# [[device.widget]]
+# id = "morning_note"
+# kind = "text"
+# col = 0
+# row = 0
+# label = "Note"
+#
+# [[device.widget]]
+# id = "todo"
+# kind = "text"
+# col = 0
+# row = 1
+# label = "Today"
+
+# ---------------------------------------------------------------------------
 # The drop-in directory
 # ---------------------------------------------------------------------------
 #

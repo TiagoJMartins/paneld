@@ -76,6 +76,7 @@ fn routes(runtime: Arc<Runtime>) -> Router {
         )
         .route("/api/status", get(status))
         .route("/api/battery", get(battery))
+        .route("/api/print/{device}", post(print))
         .with_state(runtime)
 }
 
@@ -687,6 +688,49 @@ async fn status(State(runtime): State<Arc<Runtime>>) -> Response {
 /// wrong.
 async fn battery(State(runtime): State<Arc<Runtime>>) -> Response {
     (StatusCode::OK, Json(runtime.battery.reports())).into_response()
+}
+
+/// `POST /api/print/{device}` — deliver the frame currently being served to the
+/// device's printer sink.
+///
+/// The only way paper ever moves: nothing prints automatically, because paper
+/// is not idempotent. The whole preview-then-print flow is to look at
+/// `/d/{device}/current.png` (or the same dashboard on any panel), then post
+/// here. Replies after the printer acknowledges the job, so a `200` means
+/// paper moved.
+///
+/// An operator endpoint, so ordinary status codes: `404` when the device
+/// cannot print (unknown, sinkless or not yet rendered), `409` for a blank
+/// frame, `502` when the bridge refused or could not be reached.
+async fn print(State(runtime): State<Arc<Runtime>>, Path(device_id): Path<String>) -> Response {
+    use crate::app::PrintError;
+
+    match runtime.print_device(&device_id).await {
+        Ok(delivery) => (
+            StatusCode::OK,
+            Json(json!({
+                "printed": true,
+                "height_px": delivery.height_px,
+                "bytes": delivery.bytes,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            let status = match &error {
+                PrintError::NoSuchDevice | PrintError::NoSink | PrintError::NoFrame => {
+                    StatusCode::NOT_FOUND
+                }
+                PrintError::Blank => StatusCode::CONFLICT,
+                PrintError::Delivery(_) => StatusCode::BAD_GATEWAY,
+            };
+            tracing::warn!(device = %device_id, error = %error, "manual print failed");
+            (
+                status,
+                Json(json!({ "printed": false, "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
 }
 
 fn find_device<'a>(config: &'a Config, device_id: &str) -> Option<&'a Device> {

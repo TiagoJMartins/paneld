@@ -2203,6 +2203,7 @@ mod tests {
             chrome: Chrome::derived(400, 300, GRID),
             status_bar: None,
             widgets,
+            sink: None,
         }
     }
 
