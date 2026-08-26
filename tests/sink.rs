@@ -16,15 +16,16 @@ use parking_lot::Mutex;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::routing::post;
 use common::Harness;
 
 /// The printhead's row width in bytes: 384 dots, one bit each.
 const ROW_BYTES: usize = 384 / 8;
 
-/// What the stub bridge saw: the request's query string and raw body.
-type Captured = Arc<Mutex<Option<(String, Vec<u8>)>>>;
+/// What the stub bridge saw: the request's query string, content type and raw
+/// body.
+type Captured = Arc<Mutex<Option<(String, String, Vec<u8>)>>>;
 
 /// A kindle without a sink beside a printer with one, so the same harness
 /// answers both "this device prints" and "this one cannot".
@@ -80,8 +81,22 @@ async fn stub_bridge() -> (String, Captured) {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let captured: Captured = Arc::new(Mutex::new(None));
 
-    async fn accept(State(captured): State<Captured>, uri: Uri, body: Bytes) -> StatusCode {
-        *captured.lock() = Some((uri.query().unwrap_or("").to_owned(), body.to_vec()));
+    async fn accept(
+        State(captured): State<Captured>,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> StatusCode {
+        let content_type = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        *captured.lock() = Some((
+            uri.query().unwrap_or("").to_owned(),
+            content_type,
+            body.to_vec(),
+        ));
         StatusCode::OK
     }
 
@@ -113,13 +128,17 @@ async fn a_manual_print_delivers_the_served_frame_as_a_packed_raster() {
     );
     assert_eq!(height, bytes / ROW_BYTES);
 
-    let (query, raster) = captured
+    let (query, content_type, raster) = captured
         .lock()
         .clone()
         .expect("the bridge should have been posted to");
     assert_eq!(
         query, "density=2",
         "the configured density rides the query string"
+    );
+    assert_eq!(
+        content_type, "application/octet-stream",
+        "the bridge documents the raster body as an octet stream"
     );
     assert_eq!(
         raster.len(),

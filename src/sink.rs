@@ -56,6 +56,10 @@ pub async fn deliver(
     };
     let response = client
         .post(target)
+        // The bridge documents the body as application/octet-stream. reqwest
+        // sends no content type for a raw byte body, so it is set explicitly
+        // rather than left to whatever the firmware assumes of a typeless POST.
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
         .body(raster)
         .send()
         .await
