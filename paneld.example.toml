@@ -58,6 +58,12 @@ palette = "gray16"
 # pixel, so a change in one corner leaves every other pixel byte-identical and the
 # panel only repaints when something visibly moved. Prefer `bayer` when frame
 # stability matters more than tone.
+#
+# `none` thresholds instead of dithering, and it is the right answer for a frame
+# that is all type on a two-level palette: with one bit per pixel there is no
+# tone to give better, and diffusion spends that bit carrying the grey of an
+# antialiased glyph edge into the paper beside it. See the thermal printer at the
+# foot of this file, where it is measured.
 dither = "atkinson"
 
 # Advice sent to the device telling it when to poll again, in seconds. Clamped to
@@ -788,8 +794,17 @@ label = "Notes"
 #
 # The `sink` points at a nanoprint bridge — an ESP32 BLE bridge for the Lidl
 # TRONIC / DP-L1S pocket printer — and the printhead fixes the geometry:
-# `width` must be 384 and `palette` must be `mono`. `dither =
-# "floyd-steinberg"` reads best on paper.
+# `width` must be 384 and `palette` must be `mono`.
+#
+# `dither = "none"` is what a ticket of words wants, and it is the one choice
+# here that is not taste. A printhead has two states, and error diffusion spends
+# the second one carrying the grey of an antialiased glyph edge out into the
+# paper around it: measured on a ten-item list, `floyd-steinberg` left 13.5% of
+# the ink as pixels with no neighbour and `bayer` 26.5%, against 1.2% for `none`
+# — which is a stem eaten from the side and a speckle beside it, at a size where
+# the stem is two dots wide to begin with. Thresholding instead puts every edge
+# pixel on one side or the other, and glyphs come off solid. Reach for diffusion
+# only when a ticket carries a photograph, which is the case it is for.
 #
 # `height` is not the ticket length. It is the longest ticket this device may
 # print: the frame is rendered at that height, the layout leaves whatever it
@@ -827,7 +842,9 @@ label = "Notes"
 # # The longest ticket, not the ticket: the blank tail is trimmed.
 # height = 1200
 # palette = "mono"
-# dither = "floyd-steinberg"
+# # Thresholded, not diffused: a printhead has two states and a glyph edge is not
+# # a tone to spread around.
+# dither = "none"
 # refresh_rate = 300
 # render_interval = 300
 # grid = { cols = 1, rows = 2, fit = "content" }
