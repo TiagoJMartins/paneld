@@ -433,7 +433,13 @@ impl Runtime {
             return tap::Report::bare(tap::Outcome::Deduped);
         }
 
-        let Some(widget) = render::Layout::for_device(device).hit(device, x, y) else {
+        // Resolved against the content the store holds now, because a content-fit
+        // grid sizes a pushed list's track from how many rows it holds — so the
+        // geometry a finger is resolved against is only geometry given the data.
+        // The frame on the glass is a render behind that either way, and the next
+        // render brings the two back together.
+        let layout = render::Layout::for_device(device, &self.content.snapshot());
+        let Some(widget) = layout.hit(device, x, y) else {
             return tap::Report::bare(tap::Outcome::NoTarget);
         };
         tap::dispatch(self.ha.as_deref(), widget).await

@@ -72,6 +72,45 @@ label = "Today"
     )
 }
 
+/// A printer laid out the way a ticket wants: rows sized to their content, pinned
+/// to a legible 20 pixels, and a pushed list as the last cell on the grid.
+///
+/// The roll is declared long on purpose. `height` is the longest ticket this device
+/// may print, not the ticket: what the layout leaves blank the sink trims off.
+fn ticket_fixture(bridge_url: &str) -> String {
+    format!(
+        r#"
+[server]
+listen = "0.0.0.0:4444"
+public_base_url = "http://192.168.0.50:4444"
+
+[[device]]
+id = "printer"
+width = 384
+height = 1200
+palette = "mono"
+dither = "floyd-steinberg"
+refresh_rate = 300
+grid = {{ cols = 1, rows = 2, fit = "content" }}
+chrome = {{ border = 0, padding = 2, gap = 6 }}
+style = {{ row_type = 20, row_width = "full", reading_ceiling = 1.8 }}
+sink = {{ kind = "nanoprint", url = "{bridge_url}", density = 2 }}
+
+[[device.widget]]
+id = "heading"
+kind = "value"
+col = 0
+row = 0
+
+[[device.widget]]
+id = "shopping"
+kind = "list"
+col = 0
+row = 1
+"#
+    )
+}
+
 /// Binds a stub bridge on an ephemeral loopback port and serves
 /// `POST /print/raster`, capturing what arrives.
 async fn stub_bridge() -> (String, Captured) {
@@ -154,6 +193,82 @@ async fn a_manual_print_delivers_the_served_frame_as_a_packed_raster() {
             .iter()
             .any(|&byte| byte != 0),
         "trailing blank rows are trimmed: the last row must hold ink"
+    );
+}
+
+/// The paper a ticket costs is the paper its content costs.
+///
+/// The complaint this pins was measured on the roll: one cell stretched to the
+/// frame, its type sized to fill it, and a one-item list costing the same paper as a
+/// ten-item one. Here the whole path runs twice — push, render, encode, decode,
+/// trim, deliver — and what the printhead is sent has to grow by the rows that were
+/// added and by nothing else.
+#[tokio::test]
+async fn a_pushed_lists_ticket_is_as_long_as_the_list() {
+    let (bridge_url, captured) = stub_bridge().await;
+    let mut harness = Harness::start(&ticket_fixture(&bridge_url)).await;
+
+    let (status, _) = harness
+        .put(
+            "/api/content/heading",
+            serde_json::json!({ "value": "Saturday", "render": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut printed = Vec::new();
+    for count in [3_usize, 10] {
+        let rows: Vec<_> = (0..count)
+            .map(|index| serde_json::json!({ "label": format!("item {index}"), "value": index }))
+            .collect();
+        let (status, _) = harness
+            .put(
+                "/api/content/shopping",
+                serde_json::json!({ "rows": rows, "render": true }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        harness.tick(std::time::Duration::ZERO).await;
+
+        let (status, body) = harness.post_raw("/api/print/printer", Vec::new()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let height = body["height_px"]
+            .as_u64()
+            .expect("height_px should be a number");
+        let raster = captured
+            .lock()
+            .clone()
+            .expect("the bridge should have been posted to")
+            .2;
+        assert_eq!(
+            raster.len(),
+            height as usize * ROW_BYTES,
+            "the raster is whole rows of the printhead's width"
+        );
+        assert!(
+            raster[raster.len() - ROW_BYTES..]
+                .iter()
+                .any(|&byte| byte != 0),
+            "the trim must leave the last row inked: a {count}-item ticket that ends \
+             in blank paper is paper spent on nothing"
+        );
+        printed.push(height);
+    }
+
+    let (short, long) = (printed[0], printed[1]);
+    // Seven more items, and each of them costs a row of paper: at least the line box
+    // it is set in and at most its pitch, plus the few pixels the cell's own header
+    // gap grows by once its cell is taller.
+    let grown = long - short;
+    assert!(
+        (7 * 24..=8 * 32).contains(&grown),
+        "seven more items must cost seven rows of paper: {short} rows against {long} \
+         is {grown}"
+    );
+    assert!(
+        long + 200 < 1200,
+        "and the roll must not be what decides it: a ten-item ticket took {long} of \
+         the 1200 rows this device may print"
     );
 }
 

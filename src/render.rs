@@ -278,7 +278,7 @@ fn dashboard_node(fonts: &Fonts, inputs: &RenderInputs<'_>) -> Node {
 fn grid_node(fonts: &Fonts, inputs: &RenderInputs<'_>) -> Node {
     let device = inputs.device;
     let grid = device.grid;
-    let layout = Layout::for_device(device);
+    let layout = Layout::for_device(device, inputs.content);
     let gutter = layout.gutter();
     let (_, _, area_w, area_h) = device.grid_area();
 
@@ -1037,6 +1037,7 @@ fn rows_node(fonts: &Fonts, rows: &[Line], space: Space) -> Node {
         style,
     } = space;
     let greys = space.greys();
+    let pinned = style.row_type > 0.0;
     // Three things bound a reading's size, and the smallest wins.
     //
     // The height, because the rows are laid out down the box. The width, because a
@@ -1044,15 +1045,23 @@ fn rows_node(fonts: &Fonts, rows: &[Line], space: Space) -> Node {
     // a margin nobody asked for — so the type grows until the widest row occupies
     // `COLUMN_TARGET` of the width, which is what makes a cell look filled rather
     // than furnished. And the ceiling, because past it a table stops being a table.
-    let by_height = height / (rows.len().max(1) as f32 * 1.48 - 0.28);
+    let by_height = height / block(rows.len());
     let by_width = width_driven_size(fonts, rows, width, greys);
-    let design = by_height
-        .min(by_width)
-        .min(label_px * style.reading_ceiling)
-        .max(style.min_type);
+    let ceiling = natural::row_ceiling(label_px, *style);
+    // A pinned row is fitted to nothing, and that is the whole of what pinning
+    // means: the box stops being a constraint on the type and becomes a consequence
+    // of it. A panel wants the other direction — every pixel of the frame spent, so
+    // a short list in a tall cell grows to meet it — but a roll has no height to
+    // fill, only a length that is spent, so on paper the type is a decision about
+    // the reader and the length is whatever the content came to.
+    let design = match pinned {
+        true => ceiling,
+        false => by_height.min(by_width).min(ceiling).max(style.min_type),
+    };
     // Shaved against the real measurement at the size actually chosen: the estimate
     // above is linear in the type size, which is exact for a text run and slightly
-    // out once a glyph's own margins are in the row.
+    // out once a glyph's own margins are in the row. A pinned row is shaved too — a
+    // pin is a request for a size, not a licence to print past the paper's edge.
     let row_px = rows_size(fonts, rows, width, design, greys);
 
     // The column is as wide as its widest row needs and no wider, then centred.
@@ -1079,14 +1088,7 @@ fn rows_node(fonts: &Fonts, rows: &[Line], space: Space) -> Node {
         }
     };
 
-    // Down the axis, the gap is bounded rather than spread. Sharing out whatever
-    // the ceiling left over put a hundred and eighty pixels between two readings,
-    // which reads as four unrelated cells rather than one table; a bounded gap
-    // leaves the block centred with air around it, which is what air is for.
-    let gap = (row_px * 0.28).max(
-        ((height - row_px * rows.len() as f32) / (rows.len().max(2) - 1) as f32)
-            .min(row_px * ROW_GAP_CEILING),
-    );
+    let gap = row_gap(row_px, rows.len(), height, pinned);
 
     let mut children = rows
         .iter()
@@ -1099,37 +1101,78 @@ fn rows_node(fonts: &Fonts, rows: &[Line], space: Space) -> Node {
     // because without them it would draw nothing at all: the blank lines *are* their
     // rules.
     if style.row_rule && style.row_fill {
-        let pitch = row_px * ROW_LINE + gap;
+        let pitch = row_px * natural::LINE_BOX + gap;
         let ruled = (height / pitch).floor() as usize;
-        children
-            .extend((rows.len()..ruled).map(|_| blank_row_node(row_px * ROW_LINE, column, greys)));
+        children.extend(
+            (rows.len()..ruled).map(|_| blank_row_node(row_px * natural::LINE_BOX, column, greys)),
+        );
     }
+
+    // Ruled from the top when the rules are on, because a form starts at the top of
+    // its page. Pinned rows start there too, and give up the centring across the box
+    // as well, for one reason: a pinned column is not fitted to its box, so there is
+    // no middle of anything it was trying to fill. Down the box what is left below
+    // the last row is paper a ticket declined to spend; across it, a narrow column
+    // centred in a cell reads as an indent nobody asked for.
+    let (justify, align) = match (pinned, style.row_rule) {
+        (true, _) => (JustifyContent::Start, AlignItems::Start),
+        (false, true) => (JustifyContent::Start, AlignItems::Center),
+        (false, false) => (JustifyContent::Center, AlignItems::Center),
+    };
 
     Node::container(children).with_style(
         Style::default()
             .with(StyleDeclaration::display(Display::Flex))
             .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-            // Ruled from the top when the rules are on, because a form starts at the
-            // top of its page; centred otherwise, because a block of figures with air
-            // above and below it is a block, and air is what tells the eye so.
-            .with(StyleDeclaration::justify_content(match style.row_rule {
-                true => JustifyContent::Start,
-                false => JustifyContent::Center,
-            }))
-            .with(StyleDeclaration::align_items(AlignItems::Center))
+            .with(StyleDeclaration::justify_content(justify))
+            .with(StyleDeclaration::align_items(align))
             .with(StyleDeclaration::height(Length::Px(height)))
             .with(StyleDeclaration::width(Length::Px(width)))
             .with(StyleDeclaration::row_gap(Gap::Length(Length::Px(gap)))),
     )
 }
 
-/// The line box a run of the panel's faces occupies, as a multiple of its size.
+/// What a column of `count` rows occupies at the tightest pitch it is ever drawn
+/// at, as a multiple of one row's type size.
 ///
-/// Measured off a rendered frame rather than taken from the font, because it is the
-/// engine's laid-out line that a blank ruled line has to agree with. Only reached
-/// with `row_fill` on, and being wrong there costs an uneven last pitch rather than
-/// anything a reader would notice.
-const ROW_LINE: f32 = 1.29;
+/// A line box each and the air between two of them, which is the same sum
+/// [`natural`] charges a track for the same column — and it has to be. A column at
+/// one pitch and drawn at another is either a reading clipped by the cell's edge or
+/// a strip of the cell nothing ever uses.
+///
+/// The last row's gap is not in it, because a gap is between two rows and the last
+/// has nothing under it. The track estimate charges for it anyway; that is the
+/// difference between an estimate that must never come out short and an arrangement
+/// that must fit exactly what it was given.
+fn block(count: usize) -> f32 {
+    count.max(1) as f32 * (natural::LINE_BOX + natural::ROW_GAP_FLOOR) - natural::ROW_GAP_FLOOR
+}
+
+/// The air between two rows of a column of `count` set at `row_px` in a box
+/// `height` tall, in pixels.
+///
+/// Bounded rather than shared out. Giving the rows whatever the type ceiling left
+/// over put a hundred and eighty pixels between two readings, which reads as four
+/// unrelated cells rather than one table; a bounded gap leaves the block with air
+/// around it instead of inside it, which is what air is for.
+///
+/// The slack is measured against the line boxes the rows occupy and not against
+/// their type size, which is the bug this function exists to have fixed: a column of
+/// ten measured on the size alone left a fifth of itself unaccounted for, spread
+/// that height into the gaps as well, and drew its last reading past the bottom of
+/// the cell.
+///
+/// A pinned column takes the floor and nothing else. Spreading is how a box gets
+/// filled and a pinned column is not filling one — what is under its last row is
+/// paper a ticket declined to spend.
+fn row_gap(row_px: f32, count: usize, height: f32, pinned: bool) -> f32 {
+    let floor = row_px * natural::ROW_GAP_FLOOR;
+    if pinned {
+        return floor;
+    }
+    let slack = height - row_px * natural::LINE_BOX * count as f32;
+    (slack / (count.max(2) - 1) as f32).clamp(floor, row_px * ROW_GAP_CEILING)
+}
 
 /// A ruled line with nothing written on it, at a real line's height.
 ///
@@ -1812,6 +1855,13 @@ fn resolve(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
             body: Body::Group,
             ink: Ink::Current,
         },
+        // A list whose readings the author declared reads Home Assistant; one that
+        // declares none is fed by push, which is how a publisher sends a shopping
+        // list nobody could have written into a config file. Told apart by
+        // `Widget::fed_by_push`, which the layout reads too — a cell drawn from a
+        // push and charged a track as though it read Home Assistant is a list drawn
+        // over its neighbour.
+        WidgetKind::List if widget.fed_by_push() => resolve_pushed(widget, inputs),
         WidgetKind::HaEntity | WidgetKind::Weather | WidgetKind::List => resolve_ha(widget, inputs),
         WidgetKind::Value | WidgetKind::Beacon | WidgetKind::Text => resolve_pushed(widget, inputs),
     }
@@ -1874,7 +1924,12 @@ fn resolve_pushed(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
             }
         }
         WidgetKind::Text => Body::Prose(value_text(&record.value)),
-        WidgetKind::HaEntity | WidgetKind::Weather | WidgetKind::List => {
+        // A pushed list whose record carried a scalar rather than rows: the
+        // publisher sent something, and it was not a list. Named rather than drawn
+        // as a one-row table, because a cell that quietly showed the scalar would
+        // leave an author reloading the page wondering where the other rows went.
+        WidgetKind::List => Body::Absent("no rows"),
+        WidgetKind::HaEntity | WidgetKind::Weather => {
             unreachable!("handled by resolve_ha")
         }
         WidgetKind::Group => unreachable!("handled by resolve"),
@@ -1990,14 +2045,10 @@ fn resolve_ha(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
 /// an em dash, and the lines around either of them stay black. Muting the whole cell
 /// because one sensor is unreachable would throw away the readings the panel does
 /// still have.
+///
+/// Reached only by a list that declared readings: one that declared none is a pushed
+/// cell, which [`resolve`] routes to [`resolve_pushed`] before this is called.
 fn resolve_list(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
-    if widget.readings.is_empty() {
-        // Config validation rejects this, so it cannot happen from a config file.
-        return Cell {
-            body: Body::Absent("no readings"),
-            ink: Ink::Current,
-        };
-    }
     let rows = lines(&widget.readings, inputs);
     let ink = held_over(Ink::Current, &rows);
     Cell {
@@ -2183,6 +2234,13 @@ mod tests {
         rule: 170,
     };
 
+    /// A dashboard nobody has pushed to, for the geometry tests: a rect, a gutter
+    /// and a rule are what a configuration says they are, and none of them moves
+    /// because a publisher spoke.
+    fn nothing_pushed() -> HashMap<String, ContentRecord> {
+        HashMap::new()
+    }
+
     fn device(widgets: Vec<Widget>) -> Device {
         const GRID: Grid = Grid {
             cols: 2,
@@ -2317,7 +2375,7 @@ mod tests {
         let (device, content, states) = styled_panel(shipped);
         let baseline = frame_hash(&render_with(&device, &content, &states, &HashMap::new()));
 
-        let turned: [(&str, crate::config::Style); 15] = [
+        let turned: [(&str, crate::config::Style); 16] = [
             (
                 "type_scale",
                 crate::config::Style {
@@ -2357,6 +2415,13 @@ mod tests {
                 "glyph_share",
                 crate::config::Style {
                     glyph_share: 0.8,
+                    ..shipped
+                },
+            ),
+            (
+                "row_type",
+                crate::config::Style {
+                    row_type: 18.0,
                     ..shipped
                 },
             ),
@@ -3044,7 +3109,7 @@ mod tests {
         )
         .expect("should rasterise");
 
-        let (x, y, w, h) = Layout::for_device(device).rect(widget);
+        let (x, y, w, h) = Layout::for_device(device, &nothing_pushed()).rect(widget);
         // Inset past the cell's own rule, which would otherwise ink every cell fully.
         let (x0, y0) = ((x + 3.0) as u32, (y + 3.0) as u32);
         let (x1, y1) = ((x + w - 3.0) as u32, (y + h - 3.0) as u32);
@@ -3550,7 +3615,7 @@ mod tests {
         let (width, _, levels) = greys(&render(&device, &content));
 
         let group = &device.widgets[0];
-        let sub = Layout::for_device(&device)
+        let sub = Layout::for_device(&device, &nothing_pushed())
             .sub_layout(group)
             .expect("a group has a sub-layout");
         let children = &group.group.as_ref().expect("the group is set").widgets;
@@ -3595,7 +3660,7 @@ mod tests {
         let (titled, _) = grouped_panel(Some("INDOORS AND OUT"));
 
         let group = &untitled.widgets[0];
-        let sub = Layout::for_device(&untitled)
+        let sub = Layout::for_device(&untitled, &nothing_pushed())
             .sub_layout(group)
             .expect("a group has a sub-layout");
         let children = &group.group.as_ref().expect("the group is set").widgets;
@@ -3638,7 +3703,7 @@ mod tests {
 
         // The cell's top edge, which a rule traces corner to corner and nothing else
         // reaches: a cell's content sits a padding inside it.
-        let (x, y, w, h) = Layout::for_device(&framed).rect(&framed.widgets[0]);
+        let (x, y, w, h) = Layout::for_device(&framed, &nothing_pushed()).rect(&framed.widgets[0]);
         let edge = (x + 2.0, y, w - 4.0, 1.0);
 
         let (width, _, ruled) = greys(&render(&framed, &content));
@@ -3706,7 +3771,8 @@ mod tests {
             );
 
             // And the grid moved out of its way rather than under it.
-            let (x, y, w, h) = Layout::for_device(&barred).rect(&barred.widgets[0]);
+            let (x, y, w, h) =
+                Layout::for_device(&barred, &nothing_pushed()).rect(&barred.widgets[0]);
             let (gx, gy, gw, gh) = barred.grid_area();
             assert!(
                 x >= gx as f32
@@ -3745,7 +3811,7 @@ mod tests {
         // The cell's top rule traces the rect the layout places it at, and nothing
         // else reaches that line — a cell's content sits a padding inside its own
         // rule. Had the wrapper shifted the grid, the row above would be the inked one.
-        let (x, y, w, _) = Layout::for_device(&bare).rect(&bare.widgets[0]);
+        let (x, y, w, _) = Layout::for_device(&bare, &nothing_pushed()).rect(&bare.widgets[0]);
         assert!(
             inked(&levels, width, (x + 2.0, y, w - 4.0, 1.0)),
             "the cell's rule must still trace the top edge the layout gives it"
@@ -4086,6 +4152,40 @@ mod tests {
         );
     }
 
+    /// A list that declares no reading is fed by push, which is the only way a
+    /// shopping list gets onto a ticket: nobody writes one into a config file.
+    #[test]
+    fn a_list_with_no_reading_draws_the_rows_it_was_pushed() {
+        let list = widget("items", WidgetKind::List, 0, 0);
+        let sent = HashMap::from([("items".to_owned(), rows_record(2))]);
+
+        assert_eq!(
+            resolved_push(&list, &sent, &HashMap::new()),
+            Cell {
+                body: Body::Rows(vec![
+                    resolved_line("item 0", serde_json::json!("0"), None, Ink::Current),
+                    resolved_line("item 1", serde_json::json!("1"), None, Ink::Current),
+                ]),
+                ink: Ink::Current,
+            },
+            "a pushed list's rows are its body"
+        );
+
+        // Nothing pushed yet, and a push that was not a list, are both named rather
+        // than drawn as an empty table: a cell that quietly showed the scalar would
+        // leave an author wondering where the other rows went.
+        assert_eq!(
+            resolved_push(&list, &HashMap::new(), &HashMap::new()).body,
+            Body::Absent("no data")
+        );
+        let scalar =
+            HashMap::from([("items".to_owned(), record(serde_json::json!("21.4"), now()))]);
+        assert_eq!(
+            resolved_push(&list, &scalar, &HashMap::new()).body,
+            Body::Absent("no rows")
+        );
+    }
+
     #[test]
     fn a_group_resolves_to_a_marker_with_no_body_of_its_own() {
         // The body is deliberately empty: `cell_node` draws a group's children, and a
@@ -4209,7 +4309,7 @@ mod tests {
         ];
 
         let tall = 302.0;
-        let by_height = tall / (3.0 * 1.48 - 0.28);
+        let by_height = tall / block(3);
         let wide = rows_size(&FONTS, &rows, 900.0, by_height, GREYS);
         let narrow = rows_size(&FONTS, &rows, 322.0, by_height, GREYS);
 
@@ -4242,7 +4342,7 @@ mod tests {
             let png = render_with(&device, &HashMap::new(), &states, &HashMap::new());
             let (width, _, levels) = greys(&png);
 
-            let layout = Layout::for_device(&device);
+            let layout = Layout::for_device(&device, &nothing_pushed());
             let (x, y, w, h) = layout.rect(&device.widgets[0]);
             let inset = layout.inset() / 2.0;
             // Below the header, so the label above the readings is not counted as one.
@@ -4308,7 +4408,7 @@ mod tests {
             },
             &content,
         ));
-        let sub = Layout::for_device(&device)
+        let sub = Layout::for_device(&device, &nothing_pushed())
             .sub_layout(&device.widgets[0])
             .expect("a group has a sub-layout");
         let children = &device.widgets[0].group.as_ref().expect("set").widgets;
@@ -4405,25 +4505,174 @@ row = 0
     }
 
     #[test]
-    fn the_gap_between_readings_is_bounded_however_tall_the_cell() {
+    fn a_column_of_readings_never_outgrows_the_box_it_was_given() {
+        // Two bugs in one arrangement, and both of them cost a reading.
+        //
         // Sharing out whatever the ceiling left over put 180px between two readings,
-        // which reads as four unrelated cells rather than one table.
-        let rows: Vec<Line> = ["1", "2", "3", "4"]
-            .iter()
-            .map(|v| resolved_line("", serde_json::json!(*v), None, Ink::Current))
-            .collect();
+        // which reads as four unrelated cells rather than one table. And measuring
+        // the slack against the type size rather than the line box left a fifth of
+        // the column unaccounted for, spread that into the gaps as well, and drew the
+        // last reading past the bottom of the cell — on a ten-item shopping list, off
+        // the end of the ticket.
         let row_px = 60.0_f32;
-        let height = 2000.0_f32;
-        let spread = (height - row_px * rows.len() as f32) / (rows.len() - 1) as f32;
-        let gap = (row_px * 0.28).max(spread.min(row_px * ROW_GAP_CEILING));
+        for (count, height) in [(4, 2000.0_f32), (10, 425.0), (3, 302.0), (1, 500.0)] {
+            let gap = row_gap(row_px, count, height, false);
+            assert!(
+                gap <= row_px * ROW_GAP_CEILING + 0.01,
+                "the gap must stay bounded: {count} rows in {height}px got {gap}"
+            );
+            assert!(
+                gap >= row_px * natural::ROW_GAP_FLOOR - 0.01,
+                "and never go under the floor: {count} rows in {height}px got {gap}"
+            );
+        }
 
+        // The column the sizing rule actually produces, in the box that produced it,
+        // fits inside it: `block` is what the type is fitted by, so a column set at
+        // that size and spaced by `row_gap` cannot come out taller than the box.
+        for (count, height) in [(10, 425.0_f32), (4, 200.0), (2, 90.0), (1, 40.0)] {
+            let size = height / block(count);
+            let column = size * natural::LINE_BOX * count as f32
+                + row_gap(size, count, height, false) * (count - 1) as f32;
+            assert!(
+                column <= height + 0.01,
+                "{count} rows fitted to a {height}px box came out {column}px tall"
+            );
+        }
+
+        // A pinned column is spaced by the floor whatever the box, because the box is
+        // not a thing it is trying to fill.
         assert!(
-            spread > row_px * ROW_GAP_CEILING,
-            "the fixture has to be a cell with height to spare, or it proves nothing"
+            (row_gap(20.0, 10, 4000.0, true) - 20.0 * natural::ROW_GAP_FLOOR).abs() < 0.01,
+            "a pinned column takes the floor and nothing more"
+        );
+    }
+
+    /// A pushed record of `count` labelled rows: what a publisher sends for a list
+    /// nobody could have written into a config file.
+    fn rows_record(count: usize) -> ContentRecord {
+        ContentRecord {
+            rows: Some(
+                (0..count)
+                    .map(|index| Row {
+                        id: None,
+                        label: Some(format!("item {index}")),
+                        value: Some(serde_json::json!(index)),
+                        unit: None,
+                        state: None,
+                    })
+                    .collect(),
+            ),
+            ..record(serde_json::Value::Null, now())
+        }
+    }
+
+    /// A ticket: a heading and a pushed list of `count` rows on a printhead-wide
+    /// frame `height` long, with the rows pinned to 20px and set edge to edge.
+    ///
+    /// The palette is the one these probes read rather than the `mono` a printer
+    /// takes, because the two differ in tone and not in geometry.
+    fn ticket(count: usize, height: u32) -> (Device, HashMap<String, ContentRecord>) {
+        const GRID: Grid = Grid {
+            cols: 1,
+            rows: 2,
+            fit: Fit::Content,
+        };
+        let mut head = widget("head", WidgetKind::Value, 0, 0);
+        head.label = Some("Ticket".to_owned());
+        let mut items = widget("items", WidgetKind::List, 0, 1);
+        // A list that declares no reading is fed by push, and a leaf cell's header is
+        // the mark's home rather than a title, so this one has no label to draw.
+        items.label = None;
+        items.style = crate::config::Style {
+            row_type: 20.0,
+            row_width: crate::config::RowWidth::Full,
+            ..crate::config::Style::SHIPPED
+        };
+        let device = Device {
+            width: 384,
+            height,
+            grid: GRID,
+            chrome: Chrome::derived(384, height, GRID),
+            widgets: vec![head, items],
+            ..device(Vec::new())
+        };
+        let content = HashMap::from([
+            (
+                "head".to_owned(),
+                record(serde_json::json!("Groceries"), now()),
+            ),
+            ("items".to_owned(), rows_record(count)),
+        ]);
+        (device, content)
+    }
+
+    /// How much paper a frame costs: the row after its last inked one, which is
+    /// exactly what the sink's trailing-blank trim leaves on the roll.
+    fn paper(png: &[u8]) -> u32 {
+        let (width, height, levels) = greys(png);
+        (0..height)
+            .rev()
+            .find(|&y| inked(&levels, width, (0.0, y as f32, width as f32, 1.0)))
+            .map_or(0, |y| y + 1)
+    }
+
+    #[test]
+    fn a_pinned_pushed_list_costs_the_paper_its_rows_cost_and_no_more() {
+        // The complaint, measured on the device: one cell stretched to the frame, the
+        // type sized to fill it, and a one-item list costing the same roll as a
+        // ten-item one. Three things have to be true for a ticket to be as long as
+        // its content, and each is asserted here: the rows are all drawn, the frame
+        // ends after the last of them, and the roll's length does not decide either.
+        let (device, content) = ticket(10, 768);
+        let png = render(&device, &content);
+        let (width, _, levels) = greys(&png);
+
+        let layout = Layout::for_device(&device, &content);
+        let (x, y, w, h) = layout.rect(&device.widgets[1]);
+        let inset = layout.inset() / 2.0;
+        assert_eq!(
+            ink_bands(
+                &levels,
+                width,
+                (x + inset, y + inset, w - inset * 2.0, h - inset * 2.0)
+            ),
+            10,
+            "ten pushed rows must draw ten lines: fewer means the column was clipped \
+             by its track, more means two of them overprinted"
+        );
+
+        // Seven more rows cost seven rows of paper. Bounded rather than pinned to a
+        // number, because the engine's own line box is what falls between the two:
+        // each row costs at least that box and at most a full pitch, and paper is
+        // measured in whole rows, so a pixel of rounding is allowed at each end.
+        let (device, content) = ticket(3, 768);
+        let short = paper(&render(&device, &content));
+        let long = paper(&png);
+        let per_row = 20.0 * natural::LINE_BOX - 1.0
+            ..=20.0 * (natural::LINE_BOX + natural::ROW_GAP_FLOOR) + 1.0;
+        let grown = (long - short) as f32 / 7.0;
+        assert!(
+            per_row.contains(&grown),
+            "seven more items must cost seven rows of paper: {short}px against \
+             {long}px is {grown:.1}px each, outside {:.1}..={:.1}",
+            per_row.start(),
+            per_row.end()
+        );
+
+        // And the roll is not what decides it. This is the whole complaint: the frame
+        // height set both the type size and the paper cost, so the same list on a
+        // longer roll printed a longer ticket.
+        let (longer_roll, content) = ticket(10, 1200);
+        assert_eq!(
+            paper(&render(&longer_roll, &content)),
+            long,
+            "the same list on a longer roll must cost the same paper"
         );
         assert!(
-            gap <= row_px * ROW_GAP_CEILING + 0.01,
-            "the gap must stay bounded: got {gap}"
+            long < 768,
+            "and the ticket must end before the frame does, or there is nothing for \
+             the sink to trim: got {long}px of 768"
         );
     }
 
@@ -4475,7 +4724,7 @@ row = 0
         };
 
         let label_px = |device: &Device| {
-            let layout = Layout::for_device(device);
+            let layout = Layout::for_device(device, &nothing_pushed());
             (device.width.min(device.height) as f32 * STYLE.chrome_scale * STYLE.type_scale)
                 .min(layout.cell().1 * 0.11)
                 .max(STYLE.min_type)
@@ -4508,7 +4757,7 @@ row = 0
             &rows,
             691.0,
             {
-                let by_height = 991.0_f32 / (4.0 * 1.48 - 0.28);
+                let by_height = 991.0_f32 / block(4);
                 by_height
                     .min(label_px * STYLE.reading_ceiling)
                     .max(STYLE.min_type)

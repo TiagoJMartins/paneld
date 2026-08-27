@@ -554,9 +554,10 @@ pub enum Fit {
     #[default]
     #[serde(rename = "stretch")]
     Stretch,
-    /// Each track as tall as the tallest thing placed on it, sized from the type
-    /// scale rather than from the frame. What is left over stays as margin at the
-    /// end of the grid, unless some widget asked to `fill`.
+    /// Each track as tall as the tallest thing placed on it: sized from the type
+    /// scale, from the rows a pushed list is holding, and never from the frame. What
+    /// is left over stays as margin at the end of the grid, unless some widget asked
+    /// to `fill` — or, on paper, is the roll the ticket did not spend.
     #[serde(rename = "content")]
     Content,
 }
@@ -586,6 +587,21 @@ pub struct Style {
     /// takes four fifths of this, because there the readings' labels are what runs
     /// out of room first.
     pub glyph_share: f32,
+    /// The size every row of a multi-reading cell is set at, in pixels. `0` fits
+    /// them to the box they landed in.
+    ///
+    /// Fitting is what a panel wants: no pixel of the frame goes unused, and a
+    /// reading grows until the cell is full. Paper wants the opposite. A roll has no
+    /// height to fill — it has a length that is spent — so a ticket's type is a
+    /// decision about the reader and its length is then whatever the content came
+    /// to. Pinning this says that: the rows are set at this size, at their own
+    /// pitch, from the top of the box, and a ten-item list costs twice the paper a
+    /// five-item one does.
+    ///
+    /// Absolute, and deliberately outside `type_scale`, for the same reason
+    /// [`Self::min_type`] is: it is a legibility floor stated in the units the
+    /// printhead works in, not a taste to be scaled along with the dashboard.
+    pub row_type: f32,
     /// Draw a hairline under every reading in a multi-reading cell.
     pub row_rule: bool,
     /// Carry those rules on to the foot of the cell, ruling the lines no reading was
@@ -622,6 +638,7 @@ impl Style {
         reading_ceiling: 2.6,
         unit_scale: 0.55,
         glyph_share: 0.50,
+        row_type: 0.0,
         row_rule: false,
         row_fill: false,
         row_width: RowWidth::Content,
@@ -730,6 +747,27 @@ impl Widget {
     /// construction: [`validate_widget`] rejects a group inside a group.
     pub fn iter(&self) -> impl Iterator<Item = &Widget> {
         std::iter::once(self).chain(self.group.iter().flat_map(|group| group.widgets.iter()))
+    }
+
+    /// Whether this cell's content arrives by `PUT /api/content/<id>` rather than
+    /// from Home Assistant.
+    ///
+    /// A method rather than a match written wherever it is wanted, because two
+    /// places need the same answer and a disagreement between them is not a tidiness
+    /// problem: the renderer routes a cell by this, and the layout charges a
+    /// content-fit track for the rows that cell will draw by this. A track sized for
+    /// a push the renderer ignores is a strip of blank paper; a track sized for a
+    /// reading the renderer draws from a push is a clipped list.
+    ///
+    /// A list is the case worth naming. Its readings *are* its body, so declaring
+    /// them makes it a Home Assistant cell and declaring none makes it a pushed one
+    /// — one kind, told apart by what the author left out.
+    pub fn fed_by_push(&self) -> bool {
+        match self.kind {
+            WidgetKind::Value | WidgetKind::Beacon | WidgetKind::Text => true,
+            WidgetKind::List => self.readings.is_empty(),
+            WidgetKind::HaEntity | WidgetKind::Weather | WidgetKind::Group => false,
+        }
     }
 }
 
@@ -1441,6 +1479,7 @@ fn validate_style(raw: Option<&RawStyle>, inherit: Style, what: &str) -> Result<
         reading_ceiling: raw.reading_ceiling.unwrap_or(inherit.reading_ceiling),
         unit_scale: raw.unit_scale.unwrap_or(inherit.unit_scale),
         glyph_share: raw.glyph_share.unwrap_or(inherit.glyph_share),
+        row_type: raw.row_type.unwrap_or(inherit.row_type),
         row_rule: raw.row_rule.unwrap_or(inherit.row_rule),
         row_fill: raw.row_fill.unwrap_or(inherit.row_fill),
         row_width: raw.row_width.unwrap_or(inherit.row_width),
@@ -1459,6 +1498,11 @@ fn validate_style(raw: Option<&RawStyle>, inherit: Style, what: &str) -> Result<
         ("reading_ceiling", style.reading_ceiling, 0.25..=32.0),
         ("unit_scale", style.unit_scale, 0.05..=4.0),
         ("glyph_share", style.glyph_share, 0.02..=0.98),
+        // Zero is not a size but a switch: it says "fit the rows to their box",
+        // which is what every panel does and what the whole table defaults to. A
+        // real size is bounded like `min_type` because it is the same kind of
+        // number, in the same units.
+        ("row_type", style.row_type, 0.0..=512.0),
         ("bar_type_scale", style.bar_type_scale, 0.05..=1.0),
         ("bar_gap_scale", style.bar_gap_scale, 0.0..=16.0),
         ("bar_margin_scale", style.bar_margin_scale, 0.0..=16.0),
@@ -1493,7 +1537,7 @@ fn validate_style(raw: Option<&RawStyle>, inherit: Style, what: &str) -> Result<
 fn validate_fill(device_id: &str, grid: Grid, widgets: &[Widget]) -> Result<()> {
     for widget in widgets.iter().flat_map(Widget::iter) {
         ensure!(
-            !(widget.fill && !widgets.iter().any(|top| top.id == widget.id)),
+            !widget.fill || widgets.iter().any(|top| top.id == widget.id),
             "widget `{}` on device `{device_id}` sets `fill` inside a group; a group's \
              sub-grid has no leftover of the frame to give away",
             widget.id
@@ -1831,10 +1875,13 @@ fn validate_widget(
         );
     }
 
-    let reads_home_assistant = matches!(
-        kind,
-        WidgetKind::HaEntity | WidgetKind::Weather | WidgetKind::List
-    );
+    // A list is the one kind that may be either: its readings are what it is made
+    // of, so declaring them makes it a Home Assistant cell and declaring none makes
+    // it a pushed one. Said once here and read back off the validated widget by both
+    // the renderer and the layout, which must agree about where a cell's rows come
+    // from.
+    let reads_home_assistant = matches!(kind, WidgetKind::HaEntity | WidgetKind::Weather)
+        || (kind == WidgetKind::List && !readings.is_empty());
     if matches!(kind, WidgetKind::HaEntity | WidgetKind::Weather) {
         ensure!(
             entity.is_some(),
@@ -1866,13 +1913,6 @@ fn validate_widget(
         "widget `{id}` on device `{device_id}` has kind {kind} and a `reading`; only \
          `list` and `weather` cells are made of readings"
     );
-    if kind == WidgetKind::List {
-        ensure!(
-            !readings.is_empty(),
-            "widget `{id}` on device `{device_id}` has kind list but no `reading`; a list \
-             cell is its readings, so there would be nothing to draw"
-        );
-    }
 
     let readings = readings
         .into_iter()
@@ -2225,6 +2265,7 @@ struct RawStyle {
     reading_ceiling: Option<f32>,
     unit_scale: Option<f32>,
     glyph_share: Option<f32>,
+    row_type: Option<f32>,
     row_rule: Option<bool>,
     row_fill: Option<bool>,
     row_width: Option<RowWidth>,
@@ -3307,7 +3348,10 @@ entity = "sensor.office_temperature"
     fn a_failure_inside_an_adopted_dashboard_names_the_adopting_device() {
         // The author's next move is to fix the dashboard, but the panel that went
         // blank is the device, and the message has to connect the two.
-        let broken = DASHBOARD.replace(r#"kind = "text""#, r#"kind = "list""#);
+        // The induced failure is a `weather` cell with no entity, which is rejected
+        // wherever it is written: the point of the fixture is the message, not which
+        // rule produced it.
+        let broken = DASHBOARD.replace(r#"kind = "text""#, r#"kind = "weather""#);
         let text = format!("{}{broken}{}", server_only(), adopting("kindle", "wall"));
         let message = err(&text);
         assert!(message.contains("wall"), "{message}");
@@ -3745,16 +3789,31 @@ precision = 0
         );
     }
 
+    /// A list that declares no reading is not an empty list: it is one whose rows
+    /// arrive by push, which is the only way a shopping list nobody could write into
+    /// a config file gets onto a ticket.
     #[test]
-    fn rejects_a_list_with_no_reading() {
-        // A list cell *is* its readings, so there would be nothing to draw.
-        let text = with_home_assistant(
-            "\n[[device.widget]]\nid = \"empty\"\nkind = \"list\"\ncol = 0\nrow = 0\n\
-             entity = \"sensor.office\"\n",
+    fn a_list_with_no_reading_is_fed_by_push() {
+        // Deliberately without `[home_assistant]`: a pushed list reads nothing from
+        // it, so requiring the section would make a printer need an integration to
+        // print a list of words.
+        let text = format!(
+            "{BASE}\n[[device.widget]]\nid = \"items\"\nkind = \"list\"\ncol = 0\nrow = 0\n"
         );
-        let message = err(&text);
-        assert!(message.contains("empty"), "{message}");
-        assert!(message.contains("reading"), "{message}");
+        let widget = &parse(&text).unwrap().devices[0].widgets[0];
+        assert_eq!(widget.id, "items");
+        assert!(
+            widget.readings.is_empty() && widget.fed_by_push(),
+            "a list with no reading is a pushed cell"
+        );
+
+        // And one that declares its readings is not, because it reads them from
+        // Home Assistant — the same kind, told apart by what the author left out.
+        let ha = with_home_assistant(
+            "\n[[device.widget]]\nid = \"rooms\"\nkind = \"list\"\ncol = 0\nrow = 0\n\
+             [[device.widget.reading]]\nentity = \"sensor.office\"\n",
+        );
+        assert!(!parse(&ha).unwrap().devices[0].widgets[0].fed_by_push());
     }
 
     #[test]

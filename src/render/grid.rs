@@ -62,15 +62,23 @@ impl Layout {
     ///
     /// The row tracks are the one thing not simply read off. Under [`Fit::Content`]
     /// each is sized from what the widgets on it want, which is what
-    /// [`super::natural`] answers; under [`Fit::Stretch`] every track is the cell
-    /// height the shared arithmetic already gave.
-    pub fn for_device(device: &Device) -> Self {
+    /// [`super::natural`] answers from the configuration and `pushed` — the content
+    /// store's snapshot, because how many rows a pushed list holds is the one thing
+    /// about a cell's height that its configuration does not say. Under
+    /// [`Fit::Stretch`] every track is the cell height the shared arithmetic already
+    /// gave, and `pushed` is not read at all.
+    ///
+    /// Both callers hand over the same snapshot they render or resolve against: the
+    /// renderer the one the frame is built from, the tap hit test the one the store
+    /// holds when the tap lands. A push between the two moves a content-fit track,
+    /// and the frame on the glass is one render behind it either way.
+    pub fn for_device(device: &Device, pushed: natural::Pushed<'_>) -> Self {
         let (area_x, area_y, area_w, area_h) = device.grid_area();
         let chrome = device.chrome;
         let (cell_w, cell_h) = config::cell_size(area_w, area_h, device.grid, chrome);
         let tracks = match device.grid.fit {
             Fit::Stretch => vec![cell_h; device.grid.rows.max(1) as usize],
-            Fit::Content => content_tracks(device, cell_w, cell_h),
+            Fit::Content => content_tracks(device, cell_w, cell_h, pushed),
         };
 
         Self {
@@ -294,10 +302,15 @@ impl Layout {
 /// read, where one whose last row is drawn past the bottom of the glass cannot. Only
 /// if height is left over does anything get it, and then only the one widget that
 /// asked.
-fn content_tracks(device: &Device, cell_w: f32, cell_h: f32) -> Vec<f32> {
+fn content_tracks(
+    device: &Device,
+    cell_w: f32,
+    cell_h: f32,
+    pushed: natural::Pushed<'_>,
+) -> Vec<f32> {
     let rows = device.grid.rows.max(1) as usize;
     let mut tracks = vec![config::MIN_CELL as f32; rows];
-    natural::raise_tracks(device, &device.widgets, cell_w, &mut tracks);
+    natural::raise_tracks(device, &device.widgets, cell_w, &mut tracks, pushed);
 
     // What the tracks have to share: the grid area less its own margin and the gaps
     // between tracks. Read back off the stretched cell rather than restated here, so
@@ -362,6 +375,14 @@ mod tests {
     use crate::config::{
         Dither, Edge, Grid, Palette, Reading, StatusBar, Style, Timezone, WidgetKind,
     };
+
+    /// A dashboard nobody has pushed to.
+    ///
+    /// What almost every test here is about: the tracks a *configuration* produces.
+    /// The two that are about a pushed list build a store of their own.
+    fn nothing_pushed() -> std::collections::HashMap<String, crate::content::ContentRecord> {
+        std::collections::HashMap::new()
+    }
 
     /// A widget occupying one or more cells, with everything a hit test does not
     /// look at left empty.
@@ -532,7 +553,7 @@ mod tests {
     #[test]
     fn a_point_inside_a_cell_resolves_to_that_cells_widget() {
         let device = full_grid();
-        let layout = Layout::for_device(&device);
+        let layout = Layout::for_device(&device, &nothing_pushed());
 
         for row in 0..3 {
             for col in 0..4 {
@@ -549,7 +570,7 @@ mod tests {
     #[test]
     fn a_rects_own_centre_hits_the_widget_the_rect_came_from() {
         let device = full_grid();
-        let layout = Layout::for_device(&device);
+        let layout = Layout::for_device(&device, &nothing_pushed());
 
         for widget in &device.widgets {
             let (x, y, w, h) = layout.rect(widget);
@@ -564,7 +585,7 @@ mod tests {
     #[test]
     fn a_point_on_no_cell_resolves_to_nothing() {
         let device = full_grid();
-        let layout = Layout::for_device(&device);
+        let layout = Layout::for_device(&device, &nothing_pushed());
         let (cell_w, cell_h) = layout.cell();
         let gutter = layout.gutter();
         let (centre_x, centre_y) = centre(&layout, 0, 0);
@@ -603,7 +624,7 @@ mod tests {
         // Only (0, 0) is laid out, so the other eleven cells of the 4x3 grid are
         // real cells with nothing in them to fire.
         let device = device(4, 3, vec![widget("only", 0, 0, 1, 1)]);
-        let layout = Layout::for_device(&device);
+        let layout = Layout::for_device(&device, &nothing_pushed());
 
         let (x, y) = centre(&layout, 0, 0);
         assert_eq!(hit_id(&device, &layout, x, y).as_deref(), Some("only"));
@@ -623,7 +644,7 @@ mod tests {
             3,
             vec![widget("wide", 1, 0, 2, 1), widget("tall", 0, 1, 1, 2)],
         );
-        let layout = Layout::for_device(&device);
+        let layout = Layout::for_device(&device, &nothing_pushed());
         let (cell_w, cell_h) = layout.cell();
         let gutter = layout.gutter();
 
@@ -667,7 +688,7 @@ mod tests {
     #[test]
     fn a_cell_owns_its_leading_edge_and_not_its_trailing_one() {
         let device = full_grid();
-        let layout = Layout::for_device(&device);
+        let layout = Layout::for_device(&device, &nothing_pushed());
         let (x, y, w, _) = layout.rect(&device.widgets[0]);
         let (next_x, ..) = layout.rect(&device.widgets[1]);
 
@@ -706,7 +727,7 @@ mod tests {
         ] {
             let last = widget("last", cols - 1, rows - 1, 1, 1);
             let device = device_sized(cols, rows, width, height, vec![last.clone()]);
-            let layout = Layout::for_device(&device);
+            let layout = Layout::for_device(&device, &nothing_pushed());
             let (x, y, w, h) = layout.rect(&last);
             let gutter = layout.gutter();
 
@@ -739,7 +760,7 @@ mod tests {
             border: 2.0,
         };
         let panel = device_with_chrome(4, 3, chrome, vec![widget("mid", 1, 1, 1, 1)]);
-        let layout = Layout::for_device(&panel);
+        let layout = Layout::for_device(&panel, &nothing_pushed());
 
         assert_eq!(
             layout.gutter(),
@@ -759,7 +780,7 @@ mod tests {
         assert!(close(cell_w, (1448.0 - 20.0 * 5.0) / 4.0));
         assert!(close(cell_h, (1072.0 - 20.0 * 4.0) / 3.0));
 
-        let derived = Layout::for_device(&device(4, 3, Vec::new()));
+        let derived = Layout::for_device(&device(4, 3, Vec::new()), &nothing_pushed());
         assert!(
             cell_w < derived.cell().0 && cell_h < derived.cell().1,
             "a 20 pixel gap is wider than the 10 this grid derives, so the cell \
@@ -797,7 +818,7 @@ mod tests {
                 THICKNESS,
                 vec![widget("first", 0, 0, 1, 1), widget("last", 3, 2, 1, 1)],
             );
-            let layout = Layout::for_device(&panel);
+            let layout = Layout::for_device(&panel, &nothing_pushed());
             let gutter = layout.gutter();
             let (area_x, area_y, area_w, area_h) = panel.grid_area();
 
@@ -867,7 +888,7 @@ mod tests {
     #[test]
     fn a_groups_children_fill_its_content_box() {
         let panel = grouped();
-        let layout = Layout::for_device(&panel);
+        let layout = Layout::for_device(&panel, &nothing_pushed());
         let host = &panel.widgets[0];
         let group = host
             .group
@@ -907,7 +928,7 @@ mod tests {
     #[test]
     fn a_tap_inside_a_group_resolves_to_the_child_it_landed_on() {
         let panel = grouped();
-        let layout = Layout::for_device(&panel);
+        let layout = Layout::for_device(&panel, &nothing_pushed());
         let host = &panel.widgets[0];
         let group = host
             .group
@@ -936,7 +957,7 @@ mod tests {
     #[test]
     fn a_tap_between_a_groups_children_falls_back_to_the_group() {
         let panel = grouped();
-        let layout = Layout::for_device(&panel);
+        let layout = Layout::for_device(&panel, &nothing_pushed());
         let host = &panel.widgets[0];
         let group = host
             .group
@@ -984,7 +1005,7 @@ mod tests {
             2,
             vec![listing("many", 0, 0, 1, 4), widget("one", 0, 1, 1, 1)],
         );
-        let layout = Layout::for_device(&panel);
+        let layout = Layout::for_device(&panel, &nothing_pushed());
         let tracks = layout.row_tracks().to_vec();
 
         assert_eq!(tracks.len(), 2, "one track per row of the grid");
@@ -1006,7 +1027,7 @@ mod tests {
 
         // The same widgets on a stretched grid are still given equal tracks, which
         // is the geometry every other test in this module pins.
-        let stretched = Layout::for_device(&device(1, 2, panel.widgets.clone()));
+        let stretched = Layout::for_device(&device(1, 2, panel.widgets.clone()), &nothing_pushed());
         assert!(
             close(stretched.row_tracks()[0], stretched.row_tracks()[1])
                 && close(stretched.row_tracks()[0], stretched.cell().1),
@@ -1025,7 +1046,7 @@ mod tests {
             .map(|row| listing(&format!("row{row}"), 0, row, 1, 8))
             .collect::<Vec<_>>();
         let panel = content_device(1, 8, widgets);
-        let layout = Layout::for_device(&panel);
+        let layout = Layout::for_device(&panel, &nothing_pushed());
         let tracks = layout.row_tracks();
         let gutter = layout.gutter();
         let (_, _, _, area_h) = panel.grid_area();
@@ -1056,7 +1077,7 @@ mod tests {
     fn the_leftover_goes_to_the_filling_widget_or_to_nobody() {
         let widgets = vec![widget("top", 0, 0, 1, 1), widget("bottom", 0, 1, 1, 1)];
         let bare = content_device(1, 2, widgets.clone());
-        let unclaimed = Layout::for_device(&bare);
+        let unclaimed = Layout::for_device(&bare, &nothing_pushed());
         let tracks = unclaimed.row_tracks().to_vec();
         let gutter = unclaimed.gutter();
         let (_, _, _, area_h) = bare.grid_area();
@@ -1076,7 +1097,7 @@ mod tests {
         let mut filling = widgets;
         filling[0].fill = true;
         let panel = content_device(1, 2, filling);
-        let layout = Layout::for_device(&panel);
+        let layout = Layout::for_device(&panel, &nothing_pushed());
         let filled = layout.row_tracks();
         assert!(
             close(filled[0], tracks[0] + leftover) && close(filled[1], tracks[1]),
@@ -1109,7 +1130,7 @@ mod tests {
                 widget("corner", 1, 2, 1, 1),
             ],
         );
-        let layout = Layout::for_device(&panel);
+        let layout = Layout::for_device(&panel, &nothing_pushed());
         let tracks = layout.row_tracks();
         assert!(
             tracks[0] > tracks[1] && tracks[1] > tracks[2],

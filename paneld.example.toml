@@ -97,7 +97,8 @@ grid = { cols = 4, rows = 3 }
 #   stretch  the default. Equal rows, together filling the grid area, so no pixel
 #            of the frame goes unused.
 #   content  each row as tall as the tallest thing placed on it, sized from the
-#            type scale rather than from the frame.
+#            type scale and from what a pushed list is holding, never from the
+#            frame.
 #
 # Both cost something, and the choice is worth making on purpose. `stretch` spends
 # every pixel, and to spend them it inflates what is in the cell: one short reading
@@ -119,6 +120,13 @@ grid = { cols = 4, rows = 3 }
 # well — a ninth or so of the cell's height — and on a short track that cap is what
 # decides the size, not anything in this table. Under `content` there is no cap: the
 # number written here is the number drawn.
+#
+# A pushed list is the one thing under `content` whose height is not in this file.
+# How many rows the cell holds is whatever its publisher last sent, so the track is
+# sized from the store: ten items make a taller track than three, and the cells
+# below move down. That is what lets a ticket be as long as its content — see the
+# printer at the foot of this file — and it is also why a cell placed *after* a list
+# of unknown length is a cell whose position moves when a publisher speaks.
 #
 # grid = { cols = 4, rows = 3, fit = "content" }
 
@@ -164,7 +172,7 @@ grid = { cols = 4, rows = 3 }
 # Every size and grey the renderer used to hold as a constant, said here instead.
 # The defaults *are* those constants — the values this panel shipped with — so
 # writing the table down changes nothing on the glass until a key is set, and
-# setting one key leaves the other fourteen where they were.
+# setting one key leaves the other fifteen where they were.
 #
 # Two levels. `[device.style]` is inherited by every widget on the device; a
 # widget's own `style` overrides it key by key, so a cell that wants smaller type
@@ -199,6 +207,20 @@ grid = { cols = 4, rows = 3 }
 #                               readings, stacked. Side by side it takes four
 #                               fifths of this, because there it is the labels that
 #                               run out of room first.
+#   row_type          0         the size every row of a multi-reading cell is set
+#                               at, in pixels. 0 fits them to the box they landed
+#                               in, which is what a panel wants: no pixel of the
+#                               frame goes unused, so a short list in a tall cell
+#                               grows to meet it. Paper wants the opposite. A roll
+#                               has no height to fill, only a length that is spent,
+#                               so a ticket's type is a decision about the reader
+#                               and its length is whatever the content came to.
+#                               Pinned, the rows are set at this size, at their own
+#                               pitch, from the top of the box and flush to its
+#                               leading edge — and a ten-item list costs twice the
+#                               paper a five-item one does. Absolute, and outside
+#                               `type_scale`, for the reason `min_type` is: it is
+#                               stated in the units the printhead works in.
 #   row_rule          false     a hairline under every reading of a multi-reading
 #                               cell.
 #   row_fill          false     carry those rules on to the foot of the cell,
@@ -488,8 +510,20 @@ label = "Notes"
 # unit = "%"
 # precision = 0
 
-# Several readings as labelled rows in one cell. A `list` *is* its readings, so one
-# with none is rejected — there would be nothing to draw.
+# Several readings as labelled rows in one cell.
+#
+# A `list` *is* its readings, and where they come from is decided by whether you
+# declare any. Declared, each row names a Home Assistant entity and the cell reads
+# them — the arrangement below. Declare none and the same cell is fed by push
+# instead: `PUT /api/content/<id>` with a `rows` array fills it, which is the only
+# way a shopping list gets onto a panel, since nobody writes one into a config file.
+#
+#   curl -X PUT http://192.168.0.50:4444/api/content/shopping \
+#        -H 'content-type: application/json' \
+#        -d '{"rows":[{"label":"Milk","value":"2 L"},{"label":"Bread","value":"1"}]}'
+#
+# Up to 64 rows per push, and the whole record is replaced each time: a list is
+# whatever the last publisher said it was.
 #
 # A list is not a special case of a `group`, and it is worth knowing which of the
 # two you want. A list is **one presentation of n values**: they are laid out and
@@ -754,35 +788,69 @@ label = "Notes"
 #
 # The `sink` points at a nanoprint bridge — an ESP32 BLE bridge for the Lidl
 # TRONIC / DP-L1S pocket printer — and the printhead fixes the geometry:
-# `width` must be 384 and `palette` must be `mono`. Height is the ticket
-# length; trailing whitespace is trimmed, so err long. `dither =
+# `width` must be 384 and `palette` must be `mono`. `dither =
 # "floyd-steinberg"` reads best on paper.
+#
+# `height` is not the ticket length. It is the longest ticket this device may
+# print: the frame is rendered at that height, the layout leaves whatever it
+# does not use blank, and the sink trims the blank tail — so what the printer
+# is sent is as long as the content and no longer. Err long.
+#
+# Two keys are what make that true, and a ticket wants both.
+#
+# `grid.fit = "content"` sizes each row of the grid to what landed on it instead
+# of dividing the frame between them. Under `stretch` a two-row grid puts its
+# second cell halfway down the roll whether or not the first filled its half,
+# and every cell's type is then grown to fill the track it landed in — which is
+# how a one-item list came to cost the same paper as a ten-item one.
+#
+# `style.row_type` pins the rows to a size in pixels. Unpinned, a column of rows
+# is fitted to its box, which is right on glass and wrong on paper: it makes the
+# type a function of the roll. Pinned, the rows are set at that size from the top
+# of the box, and the box is then a consequence of them. 20 is legible on a
+# 384-dot head; 16 is dense and still readable; a list at 20 costs about 31
+# pixels of paper per item.
+#
+# `style.row_width = "full"` sets each row across the ticket — name at the left
+# margin, figure at the right — which is what a receipt looks like. The default
+# keeps a name and its figure close together and centres the pair, which reads as
+# an indent on a 48mm roll.
+#
+# The list below is fed by push and is the last cell on the grid, which is the
+# shape to reach for: a cell placed *after* a list of unknown length has to start
+# somewhere, and the only place the layout can put it is below the longest list
+# that cell could hold.
 #
 # [[device]]
 # id = "printer"
 # width = 384
-# height = 768
+# # The longest ticket, not the ticket: the blank tail is trimmed.
+# height = 1200
 # palette = "mono"
 # dither = "floyd-steinberg"
 # refresh_rate = 300
 # render_interval = 300
-# grid = { cols = 1, rows = 2 }
+# grid = { cols = 1, rows = 2, fit = "content" }
+# # No cell frames, tight spacing: a receipt is a column of words, not a table of
+# # boxes.
+# chrome = { border = 0, padding = 2, gap = 6 }
+# style = { row_type = 20, row_width = "full", reading_ceiling = 1.8 }
 # # density is the printer's darkness setting, 0..=2.
 # sink = { kind = "nanoprint", url = "http://nanoprint.local", density = 2 }
 #
+# # PUT /api/content/heading with {"value": "Saturday"}
 # [[device.widget]]
-# id = "morning_note"
-# kind = "text"
+# id = "heading"
+# kind = "value"
 # col = 0
 # row = 0
-# label = "Note"
 #
+# # PUT /api/content/shopping with {"rows": [{"label": "Milk", "value": "2 L"}, ...]}
 # [[device.widget]]
-# id = "todo"
-# kind = "text"
+# id = "shopping"
+# kind = "list"
 # col = 0
 # row = 1
-# label = "Today"
 
 # ---------------------------------------------------------------------------
 # The drop-in directory

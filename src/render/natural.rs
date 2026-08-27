@@ -6,8 +6,16 @@
 //! been laid out, let alone measured. That ordering is the whole constraint on
 //! this module. The renderer sizes a cell's type from the box its track gave it,
 //! so a track sized from a measurement would be a track sized from itself — which
-//! is why every number here is arithmetic over the configuration and the style
-//! table, with no font, no measurement and no clock in it.
+//! is why nothing here measures anything: every number is arithmetic over the
+//! configuration, the style table, and one fact about the data — how many rows a
+//! cell has been pushed.
+//!
+//! That one fact is admitted because it cannot be declined. A pushed list's length
+//! is not configuration and no arithmetic recovers it: charged as though it were
+//! one line, a ten-item list is drawn over whatever sits beneath it, and the
+//! cell's own type is then fitted to a box a tenth of the size it needed. The
+//! alternative is asking an author to declare how many rows their publisher will
+//! send and to keep the two in step forever.
 //!
 //! Every estimate is deliberately an over-estimate. The renderer shaves a run that
 //! will not fit the width it was given, and shaving can only make a line shorter,
@@ -15,7 +23,17 @@
 //! pixel too short clips a reading, and a clipped reading is the worst failure this
 //! panel has: it looks like a value rather than like an error.
 
+use std::collections::HashMap;
+
 use crate::config::{self, Device, Group, Style, Widget, WidgetKind};
+use crate::content::ContentRecord;
+
+/// The pushed content a track is sized against, keyed by widget id.
+///
+/// The content store's own snapshot, borrowed, rather than a count projected out of
+/// it: the row count is all geometry reads, and a second map keyed by the same ids
+/// would be one more thing to keep in step with the first.
+pub type Pushed<'a> = &'a HashMap<String, ContentRecord>;
 
 /// The line box the layout engine gives a run, as a multiple of its type size.
 ///
@@ -31,7 +49,10 @@ use crate::config::{self, Device, Group, Style, Widget, WidgetKind};
 /// Pinned as a constant rather than measured per call because measuring is what
 /// this module exists to avoid, and because the number is a property of the
 /// embedded faces, which change only when the binary does.
-const LINE_BOX: f32 = 1.29;
+///
+/// Read by the renderer too, and it has to be: a column drawn at a pitch this
+/// module did not charge for is a column drawn past the end of its track.
+pub const LINE_BOX: f32 = 1.29;
 
 /// The least air the renderer leaves between two readings, as a multiple of their
 /// type size.
@@ -40,7 +61,7 @@ const LINE_BOX: f32 = 1.29;
 /// readings further apart, and a cell sized to its content is by definition the case
 /// with none to spare. So this is the pitch a column of readings is charged at, and
 /// no track sized by it is too short for the column that lands on it.
-const ROW_GAP_FLOOR: f32 = 0.28;
+pub const ROW_GAP_FLOOR: f32 = 0.28;
 
 /// The height this widget's content wants, in pixels, at the width it will get.
 ///
@@ -48,9 +69,11 @@ const ROW_GAP_FLOOR: f32 = 0.28;
 /// from it here — the renderer fits type to whichever axis binds, and this estimate
 /// takes the height axis as though it always did — but a group's children are
 /// measured across their own sub-cells, so the width has to travel down.
-pub fn natural_height(device: &Device, widget: &Widget, cell_w: f32) -> f32 {
+pub fn natural_height(device: &Device, widget: &Widget, cell_w: f32, pushed: Pushed<'_>) -> f32 {
     let label_px = chrome_type(device, widget.style);
-    header(widget, label_px) + body(device, widget, cell_w, label_px) + device.chrome.inset()
+    header(widget, label_px)
+        + body(device, widget, cell_w, label_px, pushed)
+        + device.chrome.inset()
 }
 
 /// A cell's chrome type under content fit, in pixels.
@@ -80,10 +103,16 @@ pub fn chrome_type(device: &Device, style: Style) -> f32 {
 ///
 /// Shared with a group's own sub-grid, which sizes its rows by this same rule
 /// against the same kind of widget list.
-pub fn raise_tracks(device: &Device, widgets: &[Widget], cell_w: f32, tracks: &mut [f32]) {
+pub fn raise_tracks(
+    device: &Device,
+    widgets: &[Widget],
+    cell_w: f32,
+    tracks: &mut [f32],
+    pushed: Pushed<'_>,
+) {
     for widget in widgets {
         let span = widget.row_span.max(1);
-        let share = natural_height(device, widget, cell_w) / span as f32;
+        let share = natural_height(device, widget, cell_w, pushed) / span as f32;
         // Clamped rather than indexed: a widget placed outside its grid is a config
         // error that validation rejects, and an arithmetic panic inside a request
         // handler is a worse way to report one than a track nobody raised.
@@ -128,7 +157,16 @@ fn header_gap(label_px: f32) -> f32 {
 ///
 /// Every kind is named rather than swept into a wildcard, so adding one is a compile
 /// error here rather than a track sized as though the new cell were empty.
-fn body(device: &Device, widget: &Widget, cell_w: f32, label_px: f32) -> f32 {
+fn body(device: &Device, widget: &Widget, cell_w: f32, label_px: f32, pushed: Pushed<'_>) -> f32 {
+    // Ahead of the kind, because `rows` overrides a pushed cell's own body whatever
+    // its kind is, and the charge has to follow what the renderer will draw rather
+    // than what the author declared. A `value` cell whose publisher sends rows is a
+    // list on the glass, and a track charged one figure for it is a list drawn over
+    // the cell below.
+    if let Some(count) = pushed_rows(widget, pushed) {
+        return readings(count, label_px, widget.style);
+    }
+
     match widget.kind {
         WidgetKind::List => readings(widget.readings.len(), label_px, widget.style),
 
@@ -137,12 +175,12 @@ fn body(device: &Device, widget: &Widget, cell_w: f32, label_px: f32) -> f32 {
         // A figure, an entity's state and a beacon's indicator are each one thing
         // filling the cell under its header, so each is charged one line of it.
         //
-        // A `text` cell is charged the same, and it is the one estimate here that
-        // could come out short: its content arrives by push, so how many lines it
-        // wants is not configuration and cannot be read from anywhere at this point.
-        // What makes one line the right charge rather than a hopeful one is that the
-        // renderer wraps that content to whatever box it is given and elides the
-        // rest, so a long push is a bounded paragraph and never an overflow.
+        // A `text` cell is charged the same, and a pushed cell waiting for its first
+        // push is too: `no data` is one line, and a list that has not arrived yet
+        // cannot be charged for the rows it will bring. What makes one line the right
+        // charge for prose rather than a hopeful one is that the renderer wraps that
+        // content to whatever box it is given and elides the rest, so a long push is
+        // a bounded paragraph and never an overflow.
         WidgetKind::Value | WidgetKind::HaEntity | WidgetKind::Beacon | WidgetKind::Text => {
             figure(label_px, widget.style)
         }
@@ -155,8 +193,24 @@ fn body(device: &Device, widget: &Widget, cell_w: f32, label_px: f32) -> f32 {
         WidgetKind::Group => widget
             .group
             .as_ref()
-            .map_or(0.0, |group| group_height(device, group, cell_w)),
+            .map_or(0.0, |group| group_height(device, group, cell_w, pushed)),
     }
+}
+
+/// How many rows this cell has been pushed, and `None` for a cell drawn from
+/// anything else.
+///
+/// Gated on [`Widget::fed_by_push`] rather than on the record's existence alone: a
+/// list that names its readings reads Home Assistant and ignores whatever was pushed
+/// to its id, so charging a track for those rows would reserve paper for a column
+/// nothing draws. An empty `rows` is `None` for the same reason — the cell draws
+/// `no data`, which is one line.
+fn pushed_rows(widget: &Widget, pushed: Pushed<'_>) -> Option<usize> {
+    if !widget.fed_by_push() {
+        return None;
+    }
+    let rows = pushed.get(&widget.id)?.rows.as_ref()?;
+    (!rows.is_empty()).then_some(rows.len())
 }
 
 /// One large reading's line, in pixels.
@@ -170,19 +224,34 @@ fn figure(label_px: f32, style: Style) -> f32 {
     label_px * style.reading_ceiling * LINE_BOX
 }
 
+/// The size one row of a multi-reading cell is set at when nothing shrinks it, in
+/// pixels.
+///
+/// One rule, read by the renderer as well as by this estimate, because a track
+/// charged at one size and drawn at another is either a clipped reading or a strip
+/// of paper nobody asked for. `row_type` pins it outright; unpinned it is the
+/// ceiling the renderer holds a fitted column to, which is what such a column comes
+/// out at on a track this module sized from that same ceiling.
+pub fn row_ceiling(label_px: f32, style: Style) -> f32 {
+    match style.row_type > 0.0 {
+        true => style.row_type,
+        false => label_px * style.reading_ceiling,
+    }
+}
+
 /// A column of `count` labelled readings, in pixels.
 ///
-/// At the tightest pitch the renderer will produce for them: the type is capped at
-/// the style's ceiling over the chrome, and the air between two rows has a floor of
-/// its own that no shortage of height goes under. Both are per row, so `count` of
-/// them is the column.
+/// At the tightest pitch the renderer will produce for them: the type is
+/// [`row_ceiling`], and the air between two rows has a floor of its own that no
+/// shortage of height goes under. Both are per row, so `count` of them is the
+/// column.
 ///
 /// The last row is charged for a gap it never draws. One row's worth of air at the
 /// foot of a column costs a dashboard nothing, where subtracting it would make this
 /// estimate exactly as tall as the thing it estimates — which is the one thing it
 /// must not be.
 fn readings(count: usize, label_px: f32, style: Style) -> f32 {
-    let row_px = label_px * style.reading_ceiling;
+    let row_px = row_ceiling(label_px, style);
     count as f32 * (row_px * LINE_BOX + row_px * ROW_GAP_FLOOR)
 }
 
@@ -218,7 +287,7 @@ fn sky(widget: &Widget, label_px: f32) -> f32 {
 /// the group wants is the tallest child of each of those tracks, summed, plus the
 /// gaps the renderer leaves between them — `n - 1` of them for `n` tracks, because
 /// the group's own padding is what holds the outermost children off its frame.
-fn group_height(device: &Device, group: &Group, cell_w: f32) -> f32 {
+fn group_height(device: &Device, group: &Group, cell_w: f32, pushed: Pushed<'_>) -> f32 {
     let content_w = (cell_w - device.chrome.inset()).max(1.0);
     // The width a child gets, read off the shared sub-cell arithmetic rather than
     // restated here. The height half of that answer is discarded, because the height
@@ -227,7 +296,7 @@ fn group_height(device: &Device, group: &Group, cell_w: f32) -> f32 {
     let (child_w, _) = config::sub_cell_size(content_w, content_w, group.grid, device.chrome);
 
     let mut tracks = vec![0.0; group.grid.rows.max(1) as usize];
-    raise_tracks(device, &group.widgets, child_w, &mut tracks);
+    raise_tracks(device, &group.widgets, child_w, &mut tracks, pushed);
     tracks.iter().sum::<f32>() + device.chrome.gap * (tracks.len() - 1) as f32
 }
 
@@ -235,6 +304,37 @@ fn group_height(device: &Device, group: &Group, cell_w: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::config::{Chrome, Dither, Fit, Grid, Palette, Reading};
+
+    /// A dashboard nobody has pushed to.
+    ///
+    /// What most of these estimates are about: a track sized from the configuration
+    /// alone. The tests that are about a push build a record of their own.
+    fn nothing_pushed() -> HashMap<String, ContentRecord> {
+        HashMap::new()
+    }
+
+    /// One pushed record of `count` rows, stored under `id`.
+    fn pushed(id: &str, count: usize) -> HashMap<String, ContentRecord> {
+        let rows = (0..count)
+            .map(|index| crate::content::Row {
+                id: None,
+                label: Some(format!("item {index}")),
+                value: Some(serde_json::json!(index)),
+                unit: None,
+                state: None,
+            })
+            .collect();
+        HashMap::from([(
+            id.to_owned(),
+            ContentRecord {
+                value: serde_json::Value::Null,
+                state: None,
+                unit: None,
+                rows: Some(rows),
+                received_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+        )])
+    }
 
     /// A widget of `kind` with everything an estimate does not read left empty.
     fn widget(id: &str, kind: WidgetKind) -> Widget {
@@ -321,8 +421,8 @@ mod tests {
         let four = listed("four", WidgetKind::List, 4);
         let panel = device(vec![two.clone(), four.clone()]);
 
-        let short = natural_height(&panel, &two, 700.0);
-        let tall = natural_height(&panel, &four, 700.0);
+        let short = natural_height(&panel, &two, 700.0, &nothing_pushed());
+        let tall = natural_height(&panel, &four, 700.0, &nothing_pushed());
         assert!(
             tall > short,
             "four readings must want more height than two, not {tall} against {short}"
@@ -346,8 +446,8 @@ mod tests {
         let rows = listed("rows", WidgetKind::List, 2);
         let panel = device(vec![sky.clone(), rows.clone()]);
 
-        let with_glyph = natural_height(&panel, &sky, 700.0);
-        let without = natural_height(&panel, &rows, 700.0);
+        let with_glyph = natural_height(&panel, &sky, 700.0, &nothing_pushed());
+        let without = natural_height(&panel, &rows, 700.0, &nothing_pushed());
         assert!(
             with_glyph > without,
             "the condition's glyph must cost the cell something, but {with_glyph} is \
@@ -372,7 +472,7 @@ mod tests {
         // A cell with no readings at all still wants a box for its picture.
         let bare = widget("bare", WidgetKind::Weather);
         assert!(
-            natural_height(&panel, &bare, 700.0) > panel.chrome.inset(),
+            natural_height(&panel, &bare, 700.0, &nothing_pushed()) > panel.chrome.inset(),
             "a weather cell with nothing hung off it still has a sky to draw"
         );
     }
@@ -416,22 +516,89 @@ mod tests {
         let cell_w = 700.0;
         let content_w = cell_w - panel.chrome.inset();
         let (child_w, _) = config::sub_cell_size(content_w, content_w, sub, panel.chrome);
-        let first = natural_height(&panel, &tall, child_w);
-        let second = natural_height(&panel, &middling, child_w);
+        let first = natural_height(&panel, &tall, child_w, &nothing_pushed());
+        let second = natural_height(&panel, &middling, child_w, &nothing_pushed());
 
         assert!(
-            first > natural_height(&panel, &short, child_w),
+            first > natural_height(&panel, &short, child_w, &nothing_pushed()),
             "the fixture's first row must be decided by its list rather than by the \
              figure sharing it, or the test proves nothing"
         );
         assert!(
             close(
-                natural_height(&panel, &host, cell_w),
+                natural_height(&panel, &host, cell_w, &nothing_pushed()),
                 first + second + panel.chrome.gap + panel.chrome.inset()
             ),
             "a group's height is its two rows, the gap between them and its own \
              chrome, not {}",
-            natural_height(&panel, &host, cell_w)
+            natural_height(&panel, &host, cell_w, &nothing_pushed())
+        );
+    }
+
+    /// The whole reason the content store reaches the layout: a pushed list's length
+    /// is not in the configuration, and a track charged one line for a ten-item list
+    /// is a list drawn over the cell beneath it.
+    #[test]
+    fn a_pushed_lists_track_is_charged_for_what_was_pushed() {
+        // No readings declared, so its rows arrive by push.
+        let list = widget("items", WidgetKind::List);
+        let panel = device(vec![list.clone()]);
+        let style = Style::default();
+
+        let waiting = natural_height(&panel, &list, 700.0, &nothing_pushed());
+        let three = natural_height(&panel, &list, 700.0, &pushed("items", 3));
+        let ten = natural_height(&panel, &list, 700.0, &pushed("items", 10));
+
+        assert!(
+            three > waiting,
+            "a list that has arrived wants more than the `no data` line it replaced: \
+             {three} against {waiting}"
+        );
+        assert!(
+            close(ten - three, readings(7, chrome_type(&panel, style), style)),
+            "seven more rows must cost exactly seven rows' pitch, not {}",
+            ten - three
+        );
+
+        // A record pushed to a list that declared its readings is not charged for.
+        // The renderer reads that cell from Home Assistant and ignores the push, and a
+        // track sized for rows nothing draws is a strip of blank paper.
+        let declared = listed("items", WidgetKind::List, 2);
+        assert!(
+            close(
+                natural_height(&panel, &declared, 700.0, &pushed("items", 10)),
+                natural_height(&panel, &declared, 700.0, &nothing_pushed())
+            ),
+            "a Home Assistant list must be charged for its readings and nothing else"
+        );
+    }
+
+    /// `row_type` is what makes a ticket's length a function of its content: pinned,
+    /// a row costs what it was pinned to whatever panel it is on.
+    #[test]
+    fn a_pinned_row_is_charged_the_size_it_was_pinned_to() {
+        let mut pinned_list = widget("items", WidgetKind::List);
+        pinned_list.style.row_type = 20.0;
+        let panel = device(vec![pinned_list.clone()]);
+
+        let charged = natural_height(&panel, &pinned_list, 700.0, &pushed("items", 10));
+        let column = 10.0 * 20.0 * (LINE_BOX + ROW_GAP_FLOOR);
+        assert!(
+            close(
+                charged,
+                header(&pinned_list, chrome_type(&panel, pinned_list.style))
+                    + column
+                    + panel.chrome.inset()
+            ),
+            "a pinned list is its header, ten pinned rows and its own chrome, not {charged}"
+        );
+
+        // And the pin decides it rather than the panel: unpinned, the same ten rows
+        // are charged the chrome's ceiling, which on a panel this size is far larger.
+        let fitted = widget("items", WidgetKind::List);
+        assert!(
+            natural_height(&panel, &fitted, 700.0, &pushed("items", 10)) > charged * 2.0,
+            "the shipped ceiling on a 1072px-high panel must dwarf a 20px pin"
         );
     }
 }
