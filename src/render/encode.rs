@@ -8,7 +8,7 @@
 //! flexible and decoded into whatever framebuffer the device has. There is
 //! deliberately no BMP encoder here to reach for.
 //!
-//! Three decisions here are load-bearing and easy to get wrong.
+//! Four decisions here are load-bearing and easy to get wrong.
 //!
 //! **Quantisation happens in linear light.** Error diffusion is an averaging
 //! process: a 50% grey rendered as a mix of darker and lighter pixels only
@@ -30,6 +30,26 @@
 //!
 //! **Ordered dithering is implemented here rather than taken from `dithr`**, for
 //! the reason documented on [`ordered_dither`].
+//!
+//! **On a two-level palette the effective threshold is 27% coverage, not 50%,
+//! and that is deliberate.** Nearest-level quantisation against levels `{0, 1}`
+//! cuts at linear 0.5, which is sRGB 188 — so an antialiased glyph edge becomes
+//! ink once it covers about 27% of the pixel. The frame arrives opaque (the root
+//! node paints a background, so the rasteriser has already composited every edge
+//! in sRGB) and there is no alpha left to reveal the true coverage, which is what
+//! makes the cut land where it does rather than at half coverage.
+//!
+//! The effect is a half-pixel outline dilation, and on a 203 dpi printhead it is
+//! the difference between type that prints and type that crumbles. Measured on a
+//! 384x1200 ticket of Inter at 20px, against a perceptual 50% cut on the same
+//! layout: modal stem 2 dots against 1, ink 2.08% against 1.47%, and 57 closed
+//! counters against 48 — the fatter cut closes loops the thinner one breaks open.
+//! At 16px the counters survive but shrink to a median of 9 pixels, which is why
+//! 20px is the size the printer's example configuration recommends.
+//!
+//! So this is not a bug to correct to 50%. Doing so thins every printed stem to a
+//! single dot. If the threshold ever needs to move it should move behind a
+//! configuration knob, with the printer left where it is.
 
 use std::sync::LazyLock;
 
@@ -68,8 +88,9 @@ pub fn quantise_and_encode(
         // Nothing to do: the nearest-level lookup below *is* undithered
         // quantisation.
         Dither::None => {}
-        Dither::Bayer => ordered_dither(&mut linear, w, h, &spec, &targets),
-        Dither::Atkinson | Dither::FloydSteinberg => {
+        Dither::Bayer => ordered_dither(&mut linear, w, h, &BAYER_8X8, &spec, &targets),
+        Dither::Cluster => ordered_dither(&mut linear, w, h, &CLUSTER_DOT_4X4, &spec, &targets),
+        Dither::Atkinson | Dither::FloydSteinberg | Dither::DotDiffusion => {
             diffuse(&mut linear, w, h, dither, &targets)?;
         }
     }
@@ -172,6 +193,14 @@ fn srgb_to_linear(encoded: f32) -> f32 {
 /// Diffusion needs no threshold tuning — it quantises to the nearest level and
 /// carries the residual to later pixels — so `dithr`'s implementations are used
 /// directly.
+///
+/// [`Dither::DotDiffusion`] belongs here rather than with the ordered screens
+/// despite its name: dot diffusion also carries a residual forward, so it is
+/// stateful per pixel and gives up frame stability like the rest of this family.
+/// It is two orders of magnitude slower than the classic kernels — roughly 1.5 s
+/// for a 384x1200 ticket against 24 ms — because it optimises a class matrix
+/// rather than sweeping in scanline order. That is affordable once per render
+/// interval and nowhere else.
 fn diffuse(
     linear: &mut [f32],
     w: usize,
@@ -187,12 +216,15 @@ fn diffuse(
     match dither {
         Dither::Atkinson => dithr::diffusion::atkinson_in_place(&mut buffer, mode),
         Dither::FloydSteinberg => dithr::diffusion::floyd_steinberg_in_place(&mut buffer, mode),
+        Dither::DotDiffusion => {
+            dithr::dot_diffusion::optimized_dot_diffusion_in_place(&mut buffer, mode)
+        }
         other => unreachable!("{other:?} is not error diffusion"),
     }
     .map_err(|e| anyhow::anyhow!("dithering with {dither:?}: {e}"))
 }
 
-/// Ordered (Bayer) dithering, implemented here rather than taken from `dithr`.
+/// Ordered dithering, implemented here rather than taken from `dithr`.
 ///
 /// `dithr`'s ordered path biases every pixel by a threshold of at most ±0.25 in
 /// unit space regardless of how far apart the palette's levels actually are: its
@@ -213,11 +245,14 @@ fn diffuse(
 /// Unlike diffusion, this is stateless per pixel: a pixel's result depends only
 /// on its own value and its coordinates. That is what makes frames stable — a
 /// change in one part of the dashboard leaves every other pixel byte-identical,
-/// so the frame hash only moves when something visible actually moved.
+/// so the frame hash only moves when something visible actually moved. Every
+/// screen in [`Screen`] keeps that property; they differ only in where in the
+/// tile the ink lands.
 fn ordered_dither(
     linear: &mut [f32],
     w: usize,
     h: usize,
+    screen: &Screen,
     spec: &PaletteSpec,
     targets: &Palette32F,
 ) {
@@ -225,7 +260,7 @@ fn ordered_dither(
 
     for y in 0..h {
         for x in 0..w {
-            let threshold = bayer_threshold(x, y);
+            let threshold = screen.threshold(x, y);
             let px = &mut linear[(y * w + x) * 3..(y * w + x) * 3 + 3];
 
             match &grey_levels {
@@ -245,27 +280,72 @@ fn ordered_dither(
     }
 }
 
-/// The 8x8 Bayer matrix: recursively generated ranks that spread thresholds as
-/// evenly as possible over the tile.
-const BAYER_8X8: [u8; 64] = [
-    0, 32, 8, 40, 2, 34, 10, 42, //
-    48, 16, 56, 24, 50, 18, 58, 26, //
-    12, 44, 4, 36, 14, 46, 6, 38, //
-    60, 28, 52, 20, 62, 30, 54, 22, //
-    3, 35, 11, 43, 1, 33, 9, 41, //
-    51, 19, 59, 27, 49, 17, 57, 25, //
-    15, 47, 7, 39, 13, 45, 5, 37, //
-    63, 31, 55, 23, 61, 29, 53, 21,
-];
-
-/// This pixel's threshold, strictly between 0 and 1.
+/// A threshold screen: one tile of ranks, applied modulo its own side.
 ///
-/// Never exactly 0 or 1, which is what guarantees a sample sitting exactly on a
-/// palette level is left on it rather than nudged off — flat paper stays flat.
-fn bayer_threshold(x: usize, y: usize) -> f32 {
-    let rank = BAYER_8X8[(y % 8) * 8 + (x % 8)];
-    (f32::from(rank) + 0.5) / 64.0
+/// Ranks are `0..side * side`, and the tile is square. Which rank sits where is
+/// the whole difference between a dispersed screen and a clustered one.
+struct Screen {
+    ranks: &'static [u8],
+    side: usize,
 }
+
+impl Screen {
+    /// This pixel's threshold, strictly between 0 and 1.
+    ///
+    /// Never exactly 0 or 1, which is what guarantees a sample sitting exactly on
+    /// a palette level is left on it rather than nudged off — flat paper stays
+    /// flat.
+    fn threshold(&self, x: usize, y: usize) -> f32 {
+        let rank = self.ranks[(y % self.side) * self.side + (x % self.side)];
+        (f32::from(rank) + 0.5) / (self.side * self.side) as f32
+    }
+}
+
+/// The 8x8 Bayer screen: recursively generated ranks that spread thresholds as
+/// evenly as possible over the tile, so ink lands as far from other ink as it can.
+///
+/// Even tone on glass, and the worst isolated-ink figure of any screen here: see
+/// [`CLUSTER_DOT_4X4`] for the comparison and the numbers.
+const BAYER_8X8: Screen = Screen {
+    ranks: &[
+        0, 32, 8, 40, 2, 34, 10, 42, //
+        48, 16, 56, 24, 50, 18, 58, 26, //
+        12, 44, 4, 36, 14, 46, 6, 38, //
+        60, 28, 52, 20, 62, 30, 54, 22, //
+        3, 35, 11, 43, 1, 33, 9, 41, //
+        51, 19, 59, 27, 49, 17, 57, 25, //
+        15, 47, 7, 39, 13, 45, 5, 37, //
+        63, 31, 55, 23, 61, 29, 53, 21,
+    ],
+    side: 8,
+};
+
+/// The 4x4 clustered-dot screen: ranks ascend outward from one centre per tile,
+/// so ink grows as a blob rather than a scatter.
+///
+/// The classic answer for an output device that spreads its ink, which a thermal
+/// head does. Two measurements, on a ramp reduced to two levels:
+///
+/// - Through this code, it leaves 0.19% of its ink with no dark neighbour against
+///   [`BAYER_8X8`]'s 1.80% — pinned by
+///   `the_clustered_screen_leaves_far_less_isolated_ink_than_bayer`.
+/// - Scored against a printhead's dot-spread kernel, it also beats `BAYER_8X8` on
+///   tone, printed RMSE 0.131 against 0.135. That comparison was run against
+///   `dithr`'s implementations rather than this one, so treat the ordering as the
+///   result and not the third decimal.
+///
+/// It is cheaper too, the tile being a quarter the size. The ranks are `dithr`'s
+/// `CLUSTER_DOT_4X4`, copied so that the screen is visible beside the Bayer one it
+/// is chosen over.
+const CLUSTER_DOT_4X4: Screen = Screen {
+    ranks: &[
+        12, 5, 6, 13, //
+        4, 0, 1, 7, //
+        11, 3, 2, 8, //
+        15, 10, 9, 14,
+    ],
+    side: 4,
+};
 
 /// Picks whichever of the two levels bracketing `value` this pixel's threshold
 /// selects.
@@ -430,10 +510,12 @@ mod tests {
     use super::*;
     use crate::config::DEFAULT_MAX_FRAME_BYTES;
 
-    const EVERY_DITHER: [Dither; 4] = [
+    const EVERY_DITHER: [Dither; 6] = [
         Dither::Atkinson,
         Dither::FloydSteinberg,
+        Dither::DotDiffusion,
         Dither::Bayer,
+        Dither::Cluster,
         Dither::None,
     ];
 
@@ -481,6 +563,84 @@ mod tests {
             .iter()
             .flat_map(|byte| [byte >> 4, byte & 0x0F])
             .collect()
+    }
+
+    /// The share of ink left as pixels with no dark neighbour, as a percentage of
+    /// the ink, for a one-bit image.
+    ///
+    /// The figure that decides a screen on paper. A printhead reproduces a lone
+    /// dot badly — it is the speckle beside a stem rather than a shade of grey —
+    /// so two screens with the same tone are not equally good, and the one that
+    /// keeps its ink touching wins.
+    fn isolated_ink_percent(bytes: &[u8], w: usize, h: usize) -> f32 {
+        let (.., depth, _, samples) = decode(bytes);
+        assert_eq!(depth, BitDepth::One, "this metric is for a mono frame");
+        let stride = w.div_ceil(8);
+        // Dark is sample 0, which is palette index 0: black.
+        let ink = |x: isize, y: isize| -> bool {
+            if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                return false;
+            }
+            let byte = samples[y as usize * stride + (x as usize) / 8];
+            byte >> (7 - (x as usize % 8)) & 1 == 0
+        };
+
+        let mut total = 0usize;
+        let mut alone = 0usize;
+        for y in 0..h as isize {
+            for x in 0..w as isize {
+                if !ink(x, y) {
+                    continue;
+                }
+                total += 1;
+                let touching = [
+                    (1, 0),
+                    (-1, 0),
+                    (0, 1),
+                    (0, -1),
+                    (1, 1),
+                    (1, -1),
+                    (-1, 1),
+                    (-1, -1),
+                ]
+                .iter()
+                .any(|(dx, dy)| ink(x + dx, y + dy));
+                if !touching {
+                    alone += 1;
+                }
+            }
+        }
+        assert!(total > 0, "the ramp must produce some ink to measure");
+        alone as f32 / total as f32 * 100.0
+    }
+
+    /// Why `cluster` is offered beside `bayer`, as a number rather than a claim.
+    ///
+    /// Both screens are ordered, so both are stable frame to frame and the choice
+    /// between them is about where the ink lands. Measured here on a 128x128 ramp
+    /// reduced to two levels: 0.19% of the clustered screen's ink has no dark
+    /// neighbour against 1.80% of the dispersed one's, a factor of nine. On a
+    /// printhead that is the difference between a grey and a scatter of speckles.
+    ///
+    /// The bound is deliberately loose at a factor of four. The point is the order
+    /// of magnitude, so a screen swapped for one that scattered would fail here
+    /// even if it happened to score well on tone.
+    #[test]
+    fn the_clustered_screen_leaves_far_less_isolated_ink_than_bayer() {
+        let (w, h) = (128, 128);
+        let raster = ramp(w, h);
+        let measure = |dither| {
+            let bytes = quantise_and_encode(&raster, w, h, Palette::Mono, dither).unwrap();
+            isolated_ink_percent(&bytes, w as usize, h as usize)
+        };
+
+        let clustered = measure(Dither::Cluster);
+        let dispersed = measure(Dither::Bayer);
+        assert!(
+            clustered * 4.0 < dispersed,
+            "the clustered screen should leave a fraction of the isolated ink the \
+             dispersed one does: {clustered:.2}% against {dispersed:.2}%"
+        );
     }
 
     #[test]
@@ -598,10 +758,12 @@ mod tests {
 
     #[test]
     fn ordered_dithering_is_stable_outside_the_region_that_changed() {
-        // The operational reason `bayer` is offered at all. Error diffusion carries
-        // its residual forward, so touching one pixel perturbs everything after it
-        // and the frame hash moves even where nothing visibly changed. Ordered
-        // dithering is stateless per pixel, so only the changed pixels move.
+        // The operational reason the ordered screens are offered at all. Error
+        // diffusion carries its residual forward, so touching one pixel perturbs
+        // everything after it and the frame hash moves even where nothing visibly
+        // changed. An ordered screen is stateless per pixel, so only the changed
+        // pixels move — and that has to hold for every screen, not just the first
+        // one, because it is the whole reason to prefer one.
         let base = ramp(64, 64);
         let mut changed = base.clone();
         let target = (40 * 64 + 40) * 4;
@@ -616,17 +778,29 @@ mod tests {
             before.iter().zip(&after).filter(|(a, b)| a != b).count()
         };
 
-        let ordered = differing(Dither::Bayer);
-        let diffused = differing(Dither::Atkinson);
-        assert_eq!(
-            ordered, 1,
-            "ordered dithering must change only the pixel that changed"
-        );
-        assert!(
-            diffused > ordered,
-            "error diffusion is expected to spread the change ({diffused} pixels) \
-             further than ordered dithering ({ordered})"
-        );
+        for ordered in [Dither::Bayer, Dither::Cluster] {
+            assert_eq!(
+                differing(ordered),
+                1,
+                "{ordered:?} must change only the pixel that changed"
+            );
+        }
+
+        // Every stateful mode is expected to spread the change further. Named
+        // individually rather than swept, because `None` is stable too and would
+        // pass a sweep for the wrong reason.
+        for diffused in [
+            Dither::Atkinson,
+            Dither::FloydSteinberg,
+            Dither::DotDiffusion,
+        ] {
+            let spread = differing(diffused);
+            assert!(
+                spread > 1,
+                "{diffused:?} carries a residual forward, so it should have spread \
+                 the change past the one pixel that moved; it touched {spread}"
+            );
+        }
     }
 
     #[test]
@@ -807,20 +981,74 @@ mod tests {
     }
 
     #[test]
-    fn the_bayer_threshold_never_reaches_its_endpoints() {
-        // What keeps a sample already sitting on a palette level exactly there.
-        for y in 0..8 {
-            for x in 0..8 {
-                let threshold = bayer_threshold(x, y);
-                assert!(threshold > 0.0 && threshold < 1.0, "at {x},{y}");
+    fn every_screen_is_a_permutation_and_never_reaches_its_endpoints() {
+        // A threshold of exactly 0 or 1 is what would nudge a sample already
+        // sitting on a palette level off it, and a rank that repeats or skips is
+        // a tile that holds more ink at one tone than at a darker one.
+        for (name, screen) in [("bayer 8x8", &BAYER_8X8), ("cluster 4x4", &CLUSTER_DOT_4X4)] {
+            for y in 0..screen.side {
+                for x in 0..screen.side {
+                    let threshold = screen.threshold(x, y);
+                    assert!(threshold > 0.0 && threshold < 1.0, "{name} at {x},{y}");
+                }
             }
+
+            let cells = screen.side * screen.side;
+            assert_eq!(screen.ranks.len(), cells, "{name} is not square");
+            let mut ranks = screen.ranks.to_vec();
+            ranks.sort_unstable();
+            assert_eq!(
+                ranks,
+                (0..cells as u8).collect::<Vec<u8>>(),
+                "{name} must be a permutation of 0..{cells}"
+            );
         }
-        let mut ranks: Vec<u8> = BAYER_8X8.to_vec();
-        ranks.sort_unstable();
-        assert_eq!(
-            ranks,
-            (0..64).collect::<Vec<u8>>(),
-            "the matrix must be a permutation of 0..64"
+    }
+
+    /// The two screens must differ in the one way that matters on paper: a
+    /// clustered screen adds each dot touching the ink already placed, so ink
+    /// grows as a blob a printhead can hold, while a dispersed screen puts each
+    /// dot as far from the last as it can.
+    ///
+    /// Stated as a property of the ranks rather than by pinning the matrices, so
+    /// a replacement screen has to earn its name — and asserted of *both*, since
+    /// a `cluster` that quietly dispersed would cost exactly the isolated-ink
+    /// figure it was chosen for.
+    #[test]
+    fn the_clustered_screen_grows_contiguous_ink_and_bayer_does_not() {
+        /// Whether every rank but the first lands touching a lower one, counting
+        /// diagonals, on the torus the tile repeats over.
+        fn grows_contiguously(screen: &Screen) -> bool {
+            let side = screen.side as isize;
+            let position = |rank: u8| -> (isize, isize) {
+                let index = screen
+                    .ranks
+                    .iter()
+                    .position(|&candidate| candidate == rank)
+                    .expect("every rank is present") as isize;
+                (index % side, index / side)
+            };
+
+            (1..(side * side) as u8).all(|rank| {
+                let (x, y) = position(rank);
+                let placed: Vec<(isize, isize)> = (0..rank).map(position).collect();
+                placed.iter().any(|&(px, py)| {
+                    let step = |a: isize, b: isize| {
+                        let delta = (a - b).abs();
+                        delta.min(side - delta)
+                    };
+                    step(x, px) <= 1 && step(y, py) <= 1
+                })
+            })
+        }
+
+        assert!(
+            grows_contiguously(&CLUSTER_DOT_4X4),
+            "the clustered screen scatters ink, which is the one thing it exists not to do"
+        );
+        assert!(
+            !grows_contiguously(&BAYER_8X8),
+            "the Bayer screen has stopped dispersing, so the two screens no longer differ"
         );
     }
 

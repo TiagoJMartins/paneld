@@ -52,12 +52,38 @@ height = 758
 # gray16 | gray4 | mono | bwry | spectra6
 palette = "gray16"
 
-# atkinson | floyd-steinberg | bayer | none
+# atkinson | floyd-steinberg | dot-diffusion | bayer | cluster | none
 #
-# Error diffusion gives better tone. Ordered dithering (`bayer`) is stateless per
-# pixel, so a change in one corner leaves every other pixel byte-identical and the
-# panel only repaints when something visibly moved. Prefer `bayer` when frame
-# stability matters more than tone.
+# Two families, and the choice between them is operational rather than cosmetic.
+#
+# The diffusion family — `atkinson`, `floyd-steinberg`, `dot-diffusion` — gives the
+# better tone by carrying each pixel's rounding error forward into its neighbours.
+# The cost is that touching one pixel perturbs every pixel after it, so the frame
+# hash moves even where nothing visibly changed and the panel repaints in full.
+#
+# The ordered family — `bayer`, `cluster` — picks each pixel from its own value and
+# its coordinates alone. A change in one corner therefore leaves every other pixel
+# byte-identical, and the panel only repaints when something visibly moved. Prefer
+# these when frame stability matters more than tone.
+#
+# Within each family the choice was measured, by reducing a ramp to two levels and
+# scoring the result the way paper sees it — convolved with a printhead's dot-spread
+# kernel, compared against the intended tone, then counted for ink left as pixels
+# with no dark neighbour, which is what a printhead renders as a speckle:
+#
+#                    printed error   isolated ink   cost per long ticket
+#   floyd-steinberg          0.021          2.03%                  24 ms
+#   dot-diffusion            0.045          0.40%                1489 ms
+#   atkinson                 0.061          1.11%                  32 ms
+#   cluster                  0.131          0.16%                  18 ms
+#   bayer                    0.135          1.96%                  27 ms
+#   none                     0.261          0.00%                 0.3 ms
+#
+# So: `floyd-steinberg` for a photograph on glass, `dot-diffusion` for a photograph
+# on paper where a lone dot is a speckle rather than a pixel, and `cluster` over
+# `bayer` in every case — it is better on tone, better on speckle and cheaper,
+# because it grows ink into blobs instead of scattering it. `atkinson` is kept for
+# the frames that were tuned against it.
 #
 # `none` thresholds instead of dithering, and it is the right answer for a frame
 # that is all type on a two-level palette: with one bit per pixel there is no

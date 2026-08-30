@@ -942,18 +942,53 @@ pub enum Palette {
 
 /// How the rasterised frame is reduced to the panel's palette.
 ///
-/// A real operational decision, not cosmetic: error diffusion gives better tone
-/// but makes pixels in unchanged regions differ between consecutive frames,
-/// which defeats frame-hash comparison whenever any part of the image changes.
-/// Ordered dithering is stateless per pixel and therefore stable frame to frame.
+/// A real operational decision, not cosmetic, and the axes are not the ones a
+/// screen-oriented ditherer optimises. Measured on a 384x256 ramp reduced to two
+/// levels, scoring each candidate by convolving its output with a thermal head's
+/// dot-spread kernel and comparing the result against the intended tone —
+/// printed RMSE, then the share of ink left as pixels with no dark neighbour,
+/// then the cost of a 384x1200 ticket:
+///
+/// | | printed RMSE | isolated ink | cost |
+/// |---|---|---|---|
+/// | [`Dither::FloydSteinberg`] | 0.021 | 2.03% | 24 ms |
+/// | [`Dither::DotDiffusion`] | 0.045 | 0.40% | 1489 ms |
+/// | [`Dither::Atkinson`] | 0.061 | 1.11% | 32 ms |
+/// | [`Dither::Cluster`] | 0.131 | 0.16% | 18 ms |
+/// | [`Dither::Bayer`] | 0.135 | 1.96% | 27 ms |
+/// | [`Dither::None`] | 0.261 | 0.00% | 0.3 ms |
+///
+/// Two consequences worth knowing before choosing. Error diffusion gives the
+/// best tone but makes pixels in unchanged regions differ between consecutive
+/// frames, which defeats frame-hash comparison whenever any part of the image
+/// changes; the ordered screens are stateless per pixel and therefore stable
+/// frame to frame. And isolated ink is a paper-only concern — a lone dot is a
+/// speckle a printhead renders badly and a panel renders exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Dither {
+    /// Error diffusion with Atkinson's kernel, which discards a quarter of the
+    /// residual and so holds contrast at the cost of tone.
     #[serde(rename = "atkinson")]
     Atkinson,
+    /// Error diffusion with the Floyd-Steinberg kernel: the best tone available
+    /// at negligible cost, and the right answer for a photograph.
     #[serde(rename = "floyd-steinberg")]
     FloydSteinberg,
+    /// Optimised dot diffusion: tone between Atkinson and Floyd-Steinberg, with
+    /// a fifth of the latter's isolated ink. For a photograph on paper, where a
+    /// lone dot is a speckle rather than a pixel.
+    #[serde(rename = "dot-diffusion")]
+    DotDiffusion,
+    /// An ordered 8x8 Bayer screen: stable frame to frame, dispersed dots.
     #[serde(rename = "bayer")]
     Bayer,
+    /// An ordered 4x4 clustered-dot screen: as stable as `bayer` and cheaper,
+    /// with better tone and a twelfth of its isolated ink, because it grows ink
+    /// into blobs a printhead can hold instead of scattering it.
+    #[serde(rename = "cluster")]
+    Cluster,
+    /// No dithering: every pixel to its nearest level. On a two-level palette
+    /// this is a threshold, and it is what a frame of type wants.
     #[serde(rename = "none")]
     None,
 }
@@ -3056,7 +3091,14 @@ entity = "sensor.office_temperature"
     #[test]
     fn parses_every_documented_palette_and_dither() {
         for palette in ["gray16", "gray4", "mono", "bwry", "spectra6"] {
-            for dither in ["atkinson", "floyd-steinberg", "bayer", "none"] {
+            for dither in [
+                "atkinson",
+                "floyd-steinberg",
+                "dot-diffusion",
+                "bayer",
+                "cluster",
+                "none",
+            ] {
                 let text = BASE
                     .replace(
                         r#"palette = "gray16""#,
