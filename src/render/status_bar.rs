@@ -14,10 +14,10 @@
 use takumi::prelude::*;
 use time::{Month, OffsetDateTime, Weekday};
 
-use super::{
-    NUMERIC_FAMILY, RenderInputs, UI_FAMILY, fitted, ink, one_line, rule, rule_width, text_node,
-    text_style,
-};
+use super::body::fitted;
+use super::paint::{one_line, rule_width, text_node, text_style};
+use super::types::{Greys, Ink, ink, rule};
+use super::{NUMERIC_FAMILY, RenderInputs, UI_FAMILY};
 use crate::config::{Alert, Device, Edge, StatusBar, StatusField};
 use crate::telemetry::Telemetry;
 
@@ -41,7 +41,7 @@ pub fn node(fonts: &Fonts, device: &Device, bar: &StatusBar, inputs: &RenderInpu
     };
 
     let style = &device.style;
-    let greys = super::Greys::of(style);
+    let greys = Greys::of(style);
     let horizontal = matches!(bar.edge, Edge::Top | Edge::Bottom);
     let size = (bar.thickness as f32 * style.bar_type_scale).max(style.min_type);
     let margin = size * style.bar_margin_scale;
@@ -157,10 +157,12 @@ fn is_raised(alert: &Alert, inputs: &RenderInputs<'_>) -> bool {
     let Some(record) = inputs.content.get(&alert.id) else {
         return false;
     };
-    if alert.stale_after > 0 && super::is_stale_after(alert.stale_after, record, inputs.now) {
+    if alert.stale_after > 0
+        && super::resolve::is_stale_after(alert.stale_after, record, inputs.now)
+    {
         return false;
     }
-    super::beacon_is_on(record, &alert.on_values)
+    super::resolve::beacon_is_on(record, &alert.on_values)
 }
 
 /// One raised alert: its glyph, and its words when it was given any.
@@ -170,7 +172,7 @@ fn alert_node(
     inputs: &RenderInputs<'_>,
     available: f32,
     size: f32,
-    greys: super::Greys,
+    greys: Greys,
 ) -> Node {
     let mut children = Vec::new();
     if let Some(icon) = alert
@@ -181,7 +183,7 @@ fn alert_node(
         // Drawn in full ink, not the bar's grey: the rest of the strip is chrome
         // that is always there, and this is the one thing on it that means
         // something happened.
-        children.push(super::icon_node(icon, size, super::Ink::Current, greys));
+        children.push(super::paint::icon_node(icon, size, Ink::Current, greys));
     }
     if let Some(label) = &alert.label {
         children.push(fitted(fonts, available, size, |size| {
@@ -211,7 +213,7 @@ fn alert_node(
 /// That side and no other: the bar's remaining three sides are the frame's own
 /// edges, and a line drawn along those reads as a border around the whole panel
 /// rather than as a strip set apart from the grid.
-fn separator(edge: Edge, greys: super::Greys) -> [StyleDeclaration; 3] {
+fn separator(edge: Edge, greys: Greys) -> [StyleDeclaration; 3] {
     match edge {
         Edge::Top => [
             StyleDeclaration::border_bottom_width(rule_width(1.0)),
@@ -254,7 +256,7 @@ fn field_node(
     field: StatusField,
     available: f32,
     design: f32,
-    greys: super::Greys,
+    greys: Greys,
 ) -> Node {
     fitted(fonts, available, design, |size| {
         text_node(
