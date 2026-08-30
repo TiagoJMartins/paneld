@@ -701,7 +701,10 @@ async fn battery(State(runtime): State<Arc<Runtime>>) -> Response {
 ///
 /// An operator endpoint, so ordinary status codes: `404` when the device
 /// cannot print (unknown, sinkless or not yet rendered), `409` for a blank
-/// frame, `502` when the bridge refused or could not be reached.
+/// frame or a printer in no state to print — out of paper, cover open, hot,
+/// busy or flat — and `502` when the bridge refused or could not be reached.
+/// The `409` bodies name the reason, because the operator's next move differs:
+/// a blank frame wants a publisher, an empty printer wants paper.
 async fn print(State(runtime): State<Arc<Runtime>>, Path(device_id): Path<String>) -> Response {
     use crate::app::PrintError;
 
@@ -720,7 +723,7 @@ async fn print(State(runtime): State<Arc<Runtime>>, Path(device_id): Path<String
                 PrintError::NoSuchDevice | PrintError::NoSink | PrintError::NoFrame => {
                     StatusCode::NOT_FOUND
                 }
-                PrintError::Blank => StatusCode::CONFLICT,
+                PrintError::Blank | PrintError::NotReady(_) => StatusCode::CONFLICT,
                 PrintError::Delivery(_) => StatusCode::BAD_GATEWAY,
             };
             tracing::warn!(device = %device_id, error = %error, "manual print failed");

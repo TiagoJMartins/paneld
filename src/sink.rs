@@ -10,10 +10,12 @@
 //! Paper is the one output in this program that is not idempotent — a repainted
 //! panel is free, a reprinted receipt is litter. So nothing here runs on its
 //! own: paper moves only when a human posts to the print endpoint, after
-//! looking at the same frame the printer will get. Two mechanical guards
+//! looking at the same frame the printer will get. Three mechanical guards
 //! remain: an all-white frame is refused, because an empty dashboard is not
-//! worth a blank receipt, and trailing blank rows are trimmed, because paper
-//! ends where the content does.
+//! worth a blank receipt; trailing blank rows are trimmed, because paper ends
+//! where the content does; and the printer is asked whether it can print before
+//! anything is sent, because it cannot tell us afterwards — see
+//! [`printer_status`].
 //!
 //! The raster the bridge wants is recovered by *decoding the served PNG* rather
 //! than by teeing off the encoder. That costs a millisecond of decode and buys
@@ -33,6 +35,81 @@ const DARK_BELOW: u8 = 128;
 pub struct Delivery {
     pub height_px: u32,
     pub bytes: usize,
+}
+
+/// What the bridge says about the printer, from `GET {url}/status`.
+///
+/// Only the fields a print decision turns on, plus the charge to log. The bridge
+/// serialises every flag unconditionally, so nothing here is optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub struct Printer {
+    /// Charge percentage, as the printer reports it.
+    pub battery: u8,
+    /// The bridge's own summary: not printing, cover closed, paper present, not
+    /// overheating. Deliberately not trusted on its own — the named flags below
+    /// are what an error message quotes, because "not ready" is not an answer an
+    /// operator can act on.
+    pub ready: bool,
+    pub printing: bool,
+    pub cover_open: bool,
+    pub paper_empty: bool,
+    pub low_battery: bool,
+    pub overheating: bool,
+    pub charging: bool,
+}
+
+impl Printer {
+    /// Why this printer cannot print right now, in the words an operator needs.
+    ///
+    /// `None` when it can. A busy printer counts as refusable: the bridge holds a
+    /// single BLE connection and a job posted mid-feed interleaves with the one
+    /// already on the paper.
+    pub fn refusal(&self) -> Option<&'static str> {
+        // Ordered by what the operator must do about it: load paper, close the
+        // cover, wait for the head to cool, wait for the job, charge it.
+        if self.paper_empty {
+            return Some("the printer is out of paper");
+        }
+        if self.cover_open {
+            return Some("the printer's cover is open");
+        }
+        if self.overheating {
+            return Some("the printhead is too hot");
+        }
+        if self.printing {
+            return Some("the printer is already printing");
+        }
+        if self.low_battery && !self.charging {
+            return Some("the printer's battery is too low to print");
+        }
+        None
+    }
+}
+
+/// Asks the bridge how the printer is, before anything is sent to it.
+///
+/// This exists because the bridge cannot report a wasted job. It answers `200`
+/// once the printer acknowledges the raster, and an out-of-paper printer
+/// acknowledges perfectly well — so without this the endpoint's promise that a
+/// `200` means paper moved is only true when nothing was wrong. The flags are all
+/// there in `GET /status`; the only mistake would be not to look.
+pub async fn printer_status(client: &reqwest::Client, url: &str) -> Result<Printer> {
+    let response = client
+        .get(format!("{url}/status"))
+        .send()
+        .await
+        .with_context(|| format!("asking {url}/status how the printer is"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .with_context(|| format!("reading the response body of GET {url}/status"))?;
+    ensure!(
+        status.is_success(),
+        "the printer bridge answered {status} for its status: {body}"
+    );
+    serde_json::from_str(&body)
+        .with_context(|| format!("the printer status from {url}/status is not JSON: {body}"))
 }
 
 /// Sends a packed raster to a nanoprint bridge.

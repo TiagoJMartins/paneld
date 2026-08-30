@@ -89,6 +89,9 @@ pub enum PrintError {
     NoFrame,
     /// The frame is all white; an empty dashboard is not worth a blank receipt.
     Blank,
+    /// The printer itself is in no state to print: out of paper, cover open,
+    /// overheating, already printing, or too flat. Carries the reason to say so.
+    NotReady(&'static str),
     /// Decoding the frame or talking to the bridge failed.
     Delivery(anyhow::Error),
 }
@@ -100,6 +103,7 @@ impl std::fmt::Display for PrintError {
             Self::NoSink => write!(f, "the device has no printer sink"),
             Self::NoFrame => write!(f, "the device has no rendered frame yet"),
             Self::Blank => write!(f, "the frame is blank; nothing to print"),
+            Self::NotReady(reason) => write!(f, "{reason}"),
             Self::Delivery(error) => write!(f, "{error:#}"),
         }
     }
@@ -239,6 +243,13 @@ impl Runtime {
     /// Returns after the bridge acknowledges the job, so success means paper
     /// moved. The frame is the one any preview of the device is already showing:
     /// the raster is decoded from the same encoded bytes.
+    ///
+    /// The printer is asked how it is before the raster is sent, because the
+    /// bridge cannot report a wasted job: it answers `200` once the printer
+    /// acknowledges the raster, and a printer with no paper in it acknowledges
+    /// like any other. Checking first is what makes "a 200 means paper moved"
+    /// true rather than usually true. The check costs one round trip on the only
+    /// path in this program a human triggers by hand.
     pub async fn print_device(&self, device_id: &str) -> Result<crate::sink::Delivery, PrintError> {
         let config = self.config();
         let device = config
@@ -254,6 +265,27 @@ impl Runtime {
         if raster.is_empty() {
             return Err(PrintError::Blank);
         }
+
+        let printer = crate::sink::printer_status(&self.sink_client, &sink.url)
+            .await
+            .map_err(PrintError::Delivery)?;
+        if let Some(reason) = printer.refusal() {
+            tracing::warn!(
+                device = %device_id,
+                battery = printer.battery,
+                reason,
+                "refusing to print"
+            );
+            return Err(PrintError::NotReady(reason));
+        }
+        tracing::info!(
+            device = %device_id,
+            battery = printer.battery,
+            charging = printer.charging,
+            rows = raster.len() / (device.width as usize / 8),
+            "printing"
+        );
+
         crate::sink::deliver(
             &self.sink_client,
             &sink.url,

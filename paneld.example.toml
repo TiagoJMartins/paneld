@@ -814,13 +814,22 @@ label = "Notes"
 #
 # which delivers the frame being served right now and replies once the printer
 # has acknowledged the job — a 200 means paper moved. Preview, then print.
-# An all-white frame is refused (an empty dashboard is not worth a blank
-# receipt) and trailing blank rows are trimmed: paper ends where the content
-# does.
+#
+# Three things are refused rather than printed, each with a 409 naming the reason.
+# An all-white frame, because an empty dashboard is not worth a blank receipt. A
+# printer that is out of paper, has its cover open, is too hot, is already
+# printing, or is too flat to print while unplugged — the bridge reports all of
+# that at `GET /status` and paneld asks before it sends anything, because a
+# printer with no paper in it acknowledges a job as happily as any other, and
+# without asking first "a 200 means paper moved" would only be usually true.
+# Trailing blank rows are trimmed, so paper ends where the content does; the
+# bridge then feeds 80 dots of its own so the tear-off clears the printhead.
 #
 # The `sink` points at a nanoprint bridge — an ESP32 BLE bridge for the Lidl
-# TRONIC / DP-L1S pocket printer — and the printhead fixes the geometry:
-# `width` must be 384 and `palette` must be `mono`.
+# TRONIC / DP-L1S pocket printer, which speaks ordinary ESC/POS `GS v 0` raster —
+# and the printhead fixes the geometry: `width` must be 384 and `palette` must be
+# `mono`. 384 dots at 203 dpi is 48 mm of printable width on a roll about 57 mm
+# wide.
 #
 # `dither = "none"` is what a ticket of words wants, and it is the one choice
 # here that is not taste. A printhead has two states, and error diffusion spends
@@ -829,8 +838,22 @@ label = "Notes"
 # the ink as pixels with no neighbour and `bayer` 26.5%, against 1.2% for `none`
 # — which is a stem eaten from the side and a speckle beside it, at a size where
 # the stem is two dots wide to begin with. Thresholding instead puts every edge
-# pixel on one side or the other, and glyphs come off solid. Reach for diffusion
-# only when a ticket carries a photograph, which is the case it is for.
+# pixel on one side or the other, and glyphs come off solid.
+#
+# Two dots is not an accident of the type size. On a two-level palette the
+# quantiser picks the nearer of black and white in linear light, which cuts at
+# sRGB 188 — so a glyph edge becomes ink once it covers about 27% of the pixel
+# rather than half of it, and every stem is dilated by half a pixel. That is what
+# makes 20px Inter come off with two-dot stems and closed counters where a
+# perceptual 50% cut would give one-dot stems and break the loops of `e` and `a`.
+# At 16px the counters survive but shrink to a median of nine pixels, which is why
+# 20 is the size recommended below.
+#
+# Reach for diffusion only when a ticket carries a photograph, and then reach for
+# `dot-diffusion` rather than `floyd-steinberg`: it holds nearly the same tone and
+# leaves a fifth of the isolated ink, which on paper is the difference between a
+# grey and a scatter of speckles. It costs about 1.5 s for a long ticket, which is
+# once per render interval and invisible.
 #
 # `height` is not the ticket length. It is the longest ticket this device may
 # print: the frame is rendered at that height, the layout leaves whatever it

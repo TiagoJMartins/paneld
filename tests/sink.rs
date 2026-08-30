@@ -13,11 +13,11 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
-use axum::routing::post;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use common::Harness;
 
 /// The printhead's row width in bytes: 384 dots, one bit each.
@@ -111,45 +111,122 @@ row = 1
     )
 }
 
-/// Binds a stub bridge on an ephemeral loopback port and serves
-/// `POST /print/raster`, capturing what arrives.
-async fn stub_bridge() -> (String, Captured) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("binding a loopback port");
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let captured: Captured = Arc::new(Mutex::new(None));
+/// A stub nanoprint bridge on an ephemeral loopback port, serving the two
+/// endpoints the sink uses: `GET /status` and `POST /print/raster`.
+///
+/// The status is settable because refusing to print is as much of the contract as
+/// printing: an out-of-paper printer acknowledges a raster like any other, so the
+/// only way paneld can keep its promise that a `200` means paper moved is to ask
+/// first — and the only way to test that is a bridge that can say no.
+struct Bridge {
+    url: String,
+    captured: Captured,
+    status: Arc<Mutex<serde_json::Value>>,
+}
 
-    async fn accept(
-        State(captured): State<Captured>,
-        uri: Uri,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> StatusCode {
-        let content_type = headers
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_owned();
-        *captured.lock() = Some((
-            uri.query().unwrap_or("").to_owned(),
-            content_type,
-            body.to_vec(),
-        ));
-        StatusCode::OK
+impl Bridge {
+    /// Binds a bridge whose printer is idle, loaded, cool and charged.
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a loopback port");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let captured: Captured = Arc::new(Mutex::new(None));
+        let status = Arc::new(Mutex::new(ready_status()));
+
+        async fn accept(
+            State(state): State<BridgeState>,
+            uri: Uri,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> StatusCode {
+            let content_type = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            *state.captured.lock() = Some((
+                uri.query().unwrap_or("").to_owned(),
+                content_type,
+                body.to_vec(),
+            ));
+            StatusCode::OK
+        }
+
+        async fn serve_status(State(state): State<BridgeState>) -> Json<serde_json::Value> {
+            Json(state.status.lock().clone())
+        }
+
+        let state = BridgeState {
+            captured: Arc::clone(&captured),
+            status: Arc::clone(&status),
+        };
+        let router = Router::new()
+            .route("/print/raster", post(accept))
+            .route("/status", get(serve_status))
+            .with_state(state);
+        tokio::spawn(axum::serve(listener, router).into_future());
+        Self {
+            url,
+            captured,
+            status,
+        }
     }
 
-    let router = Router::new()
-        .route("/print/raster", post(accept))
-        .with_state(Arc::clone(&captured));
-    tokio::spawn(axum::serve(listener, router).into_future());
-    (url, captured)
+    /// What the bridge was posted to, if it was.
+    fn captured(&self) -> Option<(String, String, Vec<u8>)> {
+        self.captured.lock().clone()
+    }
+
+    /// The raster the bridge received.
+    fn raster(&self) -> Vec<u8> {
+        self.captured()
+            .expect("the bridge should have been posted to")
+            .2
+    }
+
+    /// Raises one status flag, leaving the rest of a healthy printer alone.
+    fn set_flag(&self, flag: &str, value: bool) {
+        let mut status = self.status.lock();
+        status[flag] = serde_json::json!(value);
+        // `ready` is the bridge's own summary of the same flags, so a stub that
+        // left it true while claiming no paper would be testing a bridge that
+        // does not exist.
+        status["ready"] = serde_json::json!(
+            !(status["printing"].as_bool().unwrap()
+                || status["cover_open"].as_bool().unwrap()
+                || status["paper_empty"].as_bool().unwrap()
+                || status["overheating"].as_bool().unwrap())
+        );
+    }
+}
+
+#[derive(Clone)]
+struct BridgeState {
+    captured: Captured,
+    status: Arc<Mutex<serde_json::Value>>,
+}
+
+/// The status of a printer with nothing wrong with it.
+fn ready_status() -> serde_json::Value {
+    serde_json::json!({
+        "battery": 87,
+        "ready": true,
+        "printing": false,
+        "cover_open": false,
+        "paper_empty": false,
+        "low_battery": false,
+        "overheating": false,
+        "charging": false,
+        "model": "A2Y",
+        "firmware": "V1.06LY",
+    })
 }
 
 #[tokio::test]
 async fn a_manual_print_delivers_the_served_frame_as_a_packed_raster() {
-    let (bridge_url, captured) = stub_bridge().await;
-    let harness = Harness::start(&fixture(&bridge_url)).await;
+    let bridge = Bridge::start().await;
+    let harness = Harness::start(&fixture(&bridge.url)).await;
 
     let (status, body) = harness.post_raw("/api/print/printer", Vec::new()).await;
 
@@ -167,9 +244,8 @@ async fn a_manual_print_delivers_the_served_frame_as_a_packed_raster() {
     );
     assert_eq!(height, bytes / ROW_BYTES);
 
-    let (query, content_type, raster) = captured
-        .lock()
-        .clone()
+    let (query, content_type, raster) = bridge
+        .captured()
         .expect("the bridge should have been posted to");
     assert_eq!(
         query, "density=2",
@@ -205,8 +281,8 @@ async fn a_manual_print_delivers_the_served_frame_as_a_packed_raster() {
 /// added and by nothing else.
 #[tokio::test]
 async fn a_pushed_lists_ticket_is_as_long_as_the_list() {
-    let (bridge_url, captured) = stub_bridge().await;
-    let mut harness = Harness::start(&ticket_fixture(&bridge_url)).await;
+    let bridge = Bridge::start().await;
+    let mut harness = Harness::start(&ticket_fixture(&bridge.url)).await;
 
     let (status, _) = harness
         .put(
@@ -235,11 +311,7 @@ async fn a_pushed_lists_ticket_is_as_long_as_the_list() {
         let height = body["height_px"]
             .as_u64()
             .expect("height_px should be a number");
-        let raster = captured
-            .lock()
-            .clone()
-            .expect("the bridge should have been posted to")
-            .2;
+        let raster = bridge.raster();
         assert_eq!(
             raster.len(),
             height as usize * ROW_BYTES,
@@ -274,8 +346,8 @@ async fn a_pushed_lists_ticket_is_as_long_as_the_list() {
 
 #[tokio::test]
 async fn printing_is_never_automatic() {
-    let (bridge_url, captured) = stub_bridge().await;
-    let mut harness = Harness::start(&fixture(&bridge_url)).await;
+    let bridge = Bridge::start().await;
+    let mut harness = Harness::start(&fixture(&bridge.url)).await;
 
     // Startup rendered every device, and a push plus a tick renders the printer
     // again with changed bytes — the exact moment an auto-printer would fire.
@@ -289,15 +361,15 @@ async fn printing_is_never_automatic() {
     harness.tick(std::time::Duration::from_secs(1)).await;
 
     assert!(
-        captured.lock().is_none(),
+        bridge.captured().is_none(),
         "no frame may reach the bridge without a POST to /api/print"
     );
 }
 
 #[tokio::test]
 async fn a_device_without_a_sink_cannot_print() {
-    let (bridge_url, _) = stub_bridge().await;
-    let harness = Harness::start(&fixture(&bridge_url)).await;
+    let bridge = Bridge::start().await;
+    let harness = Harness::start(&fixture(&bridge.url)).await;
 
     let (status, body) = harness.post_raw("/api/print/kindle", Vec::new()).await;
 
@@ -307,8 +379,8 @@ async fn a_device_without_a_sink_cannot_print() {
 
 #[tokio::test]
 async fn an_unknown_device_cannot_print() {
-    let (bridge_url, _) = stub_bridge().await;
-    let harness = Harness::start(&fixture(&bridge_url)).await;
+    let bridge = Bridge::start().await;
+    let harness = Harness::start(&fixture(&bridge.url)).await;
 
     let (status, body) = harness.post_raw("/api/print/toaster", Vec::new()).await;
 
@@ -329,4 +401,57 @@ async fn an_unreachable_bridge_is_the_bridge_s_fault() {
 
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["printed"], false);
+}
+
+/// A printer that cannot print is not a bridge failure and not a caller mistake,
+/// so it is neither a `502` nor a `404`: the frame is fine and the request was
+/// right, the paper is the problem. And nothing may be sent — the point of asking
+/// first is that the raster never leaves.
+#[tokio::test]
+async fn a_printer_in_no_state_to_print_is_refused_before_anything_is_sent() {
+    for (flag, expected) in [
+        ("paper_empty", "out of paper"),
+        ("cover_open", "cover is open"),
+        ("overheating", "too hot"),
+        ("printing", "already printing"),
+    ] {
+        let bridge = Bridge::start().await;
+        let harness = Harness::start(&fixture(&bridge.url)).await;
+        bridge.set_flag(flag, true);
+
+        let (status, body) = harness.post_raw("/api/print/printer", Vec::new()).await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{flag}: {body}");
+        assert_eq!(body["printed"], false, "{flag}");
+        let error = body["error"].as_str().expect("the error names the reason");
+        assert!(
+            error.contains(expected),
+            "{flag} should be reported as `{expected}`, got `{error}`"
+        );
+        assert!(
+            bridge.captured().is_none(),
+            "{flag}: no raster may be posted to a printer that cannot print it"
+        );
+    }
+}
+
+/// A flat battery only refuses while unplugged: on the charger the printhead has
+/// the power it needs, and refusing then would be refusing the fix.
+#[tokio::test]
+async fn a_low_battery_refuses_only_while_unplugged() {
+    let bridge = Bridge::start().await;
+    let harness = Harness::start(&fixture(&bridge.url)).await;
+    bridge.set_flag("low_battery", true);
+
+    let (status, body) = harness.post_raw("/api/print/printer", Vec::new()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(bridge.captured().is_none());
+
+    bridge.set_flag("charging", true);
+    let (status, body) = harness.post_raw("/api/print/printer", Vec::new()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        bridge.captured().is_some(),
+        "a charging printer prints despite the warning"
+    );
 }
