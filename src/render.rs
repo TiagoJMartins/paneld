@@ -2644,21 +2644,19 @@ mod tests {
     }
 
     #[test]
-    fn output_is_a_png_at_the_configured_dimensions() {
-        let device = device(vec![widget("a", WidgetKind::Value, 0, 0)]);
-        let bytes = render(&device, &HashMap::new());
-        assert_eq!(dimensions(&bytes), (device.width, device.height));
-    }
+    fn a_frame_renders_at_the_configured_dimensions_with_no_stored_content() {
+        let single = device(vec![widget("a", WidgetKind::Value, 0, 0)]);
+        assert_eq!(
+            dimensions(&render(&single, &HashMap::new())),
+            (single.width, single.height)
+        );
 
-    #[test]
-    fn a_widget_with_no_stored_content_renders_without_error() {
-        let device = device(vec![
+        let multi = device(vec![
             widget("a", WidgetKind::Value, 0, 0),
             widget("b", WidgetKind::Beacon, 1, 0),
             widget("c", WidgetKind::Text, 0, 1),
         ]);
-        let bytes = render(&device, &HashMap::new());
-        assert_eq!(dimensions(&bytes), (400, 300));
+        assert_eq!(dimensions(&render(&multi, &HashMap::new())), (400, 300));
     }
 
     #[test]
@@ -2702,15 +2700,14 @@ mod tests {
     }
 
     #[test]
-    fn stale_after_zero_disables_the_staleness_timer() {
+    fn is_stale_reports_the_staleness_window_correctly() {
+        // stale_after == 0 disables the timer even for an ancient record.
         let w = widget("a", WidgetKind::Value, 0, 0);
         assert_eq!(w.stale_after, 0);
         let ancient = record(serde_json::json!(1), now() - Duration::days(400));
         assert!(!is_stale(&w, &ancient, now()));
-    }
 
-    #[test]
-    fn staleness_triggers_strictly_after_the_window() {
+        // The window triggers strictly after it closes, not at the boundary.
         let mut w = widget("a", WidgetKind::Value, 0, 0);
         w.stale_after = 60;
         let at_limit = record(serde_json::json!(1), now() - Duration::seconds(60));
@@ -2720,15 +2717,10 @@ mod tests {
         );
         let past = record(serde_json::json!(1), now() - Duration::seconds(61));
         assert!(is_stale(&w, &past, now()));
-    }
 
-    #[test]
-    fn a_record_from_the_future_is_not_stale() {
         // A publisher's clock is irrelevant here because we stamp receipt
         // ourselves, but a clock step backwards on this host must not read as a
         // negative age.
-        let mut w = widget("a", WidgetKind::Value, 0, 0);
-        w.stale_after = 60;
         let ahead = record(serde_json::json!(1), now() + Duration::seconds(500));
         assert!(!is_stale(&w, &ahead, now()));
     }
@@ -2771,9 +2763,10 @@ mod tests {
     }
 
     #[test]
-    fn a_beacon_matches_state_before_value() {
+    fn beacon_is_on_resolves_state_over_value_case_and_space_insensitively() {
         let on_values = vec!["on".to_owned(), "alert".to_owned()];
 
+        // State decides when present.
         let mut alerting = record(serde_json::json!("off"), now());
         alerting.state = Some("alert".to_owned());
         assert!(
@@ -2786,10 +2779,8 @@ mod tests {
         let mut contradictory = record(serde_json::json!("on"), now());
         contradictory.state = Some("idle".to_owned());
         assert!(!beacon_is_on(&contradictory, &on_values));
-    }
 
-    #[test]
-    fn a_beacon_falls_back_to_value_when_no_state_is_pushed() {
+        // With no state pushed, the value decides — for strings and booleans alike.
         let on_values = vec!["on".to_owned(), "true".to_owned()];
         assert!(beacon_is_on(
             &record(serde_json::json!("on"), now()),
@@ -2807,10 +2798,8 @@ mod tests {
             &record(serde_json::json!(false), now()),
             &on_values
         ));
-    }
 
-    #[test]
-    fn beacon_matching_ignores_case_and_surrounding_space() {
+        // Matching ignores case and surrounding whitespace.
         let on_values = vec!["on".to_owned()];
         assert!(beacon_is_on(
             &record(serde_json::json!(" ON "), now()),
@@ -3284,7 +3273,9 @@ mod tests {
     fn a_long_figure_scales_down_rather_than_being_clipped() {
         // Measured fitting, not a character-count estimate: the point is that the
         // run's real advance decides the size, so nothing is ever cut mid-glyph.
+        // A figure that already fits keeps the design size.
         let short = figure_px_for("7", None);
+        assert_eq!(short, 96.0);
         let long = figure_px_for("123456789", None);
         assert!(
             long < short,
@@ -3310,11 +3301,6 @@ mod tests {
         );
         assert!(intrinsic > 0.0, "measuring {text:?} must produce a width");
         fit_size(intrinsic, 200.0, DESIGN)
-    }
-
-    #[test]
-    fn a_figure_that_already_fits_keeps_the_design_size() {
-        assert_eq!(figure_px_for("7", None), 96.0);
     }
 
     #[test]
@@ -4772,5 +4758,239 @@ row = 0
             tall > label_px,
             "the reading still has to outweigh the label naming it: got {tall}"
         );
+    }
+
+    #[test]
+    fn icon_node_draws_a_raster_icon_and_an_svgs_own_colour() {
+        // A decoded raster icon takes the same path to the glass as a vector one:
+        // built into an image node and actually drawn, not silently dropped for
+        // lacking markup.
+        let raster = Icon::Raster {
+            data: [200, 0, 0, 255].repeat(4),
+            width: 2,
+            height: 2,
+        };
+        let raster_bytes = rasterise(
+            &FONTS,
+            icon_node(&raster, 48.0, Ink::Current, GREYS),
+            48,
+            48,
+        )
+        .expect("should rasterise");
+        let raster_inked = raster_bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|&&[.., a]| a > 128)
+            .count();
+        assert!(
+            raster_inked > 20,
+            "a raster icon must actually draw ink, got {raster_inked}"
+        );
+
+        // An SVG carrying its own configured grey is still drawn, whatever the
+        // cell's own ink says.
+        let coloured = Icon::Svg {
+            markup: r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="9"/></svg>"#
+                .to_owned(),
+            ink: Some(96),
+        };
+        let coloured_bytes = rasterise(
+            &FONTS,
+            icon_node(&coloured, 48.0, Ink::Current, GREYS),
+            48,
+            48,
+        )
+        .expect("should rasterise");
+        let coloured_inked = coloured_bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|&&[.., a]| a > 128)
+            .count();
+        assert!(
+            coloured_inked > 20,
+            "an icon's own colour must still actually draw, got {coloured_inked}"
+        );
+    }
+
+    #[test]
+    fn paint_svg_leaves_markup_it_cannot_paint_unchanged() {
+        // No colour to paint with: whatever `currentColor` resolves to at the
+        // rasteriser is what the caller already asked for.
+        let markup = r#"<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0h8v8z"/></svg>"#;
+        assert_eq!(paint_svg(markup, ColorInput::CurrentColor), markup);
+
+        // No `<svg` tag at all: nothing to attach a colour to.
+        let no_tag = "<path d=\"M0 0h8v8z\"/>";
+        assert_eq!(paint_svg(no_tag, muted(GREYS)), no_tag);
+
+        // `<svg` as a prefix of a longer tag name is not the element it looks like.
+        let odd_tag = "<svgfoo/>";
+        assert_eq!(paint_svg(odd_tag, muted(GREYS)), odd_tag);
+    }
+
+    #[test]
+    fn a_list_reading_held_keeps_its_value_and_mutes() {
+        // The `Held` branch of a per-reading line: a sensor that once answered and
+        // then went quiet still shows what it last said, muted rather than blanked
+        // — the list's version of `a_stale_push_keeps_its_value_and_is_marked_not_confirmed`.
+        let w = Widget {
+            readings: vec![reading("Office", "sensor.office", None)],
+            ..widget("rooms", WidgetKind::List, 0, 0)
+        };
+        let ha = HashMap::from([(
+            Reading::state("sensor.office"),
+            Reported::Held("21.44".to_owned()),
+        )]);
+        assert_eq!(
+            resolved(&w, &ha),
+            Cell {
+                body: Body::Rows(vec![resolved_line(
+                    "Office",
+                    serde_json::json!("21.4"),
+                    Some("\u{b0}C"),
+                    Ink::Held
+                )]),
+                ink: Ink::Held,
+            }
+        );
+    }
+
+    #[test]
+    fn a_list_rows_own_icon_draws_beside_its_label() {
+        // Each `reading` may carry its own icon, resolved the same way a widget's
+        // does; nothing before this pinned that a list row actually draws it.
+        let mut office = reading("Office", "sensor.office", None);
+        office.icon = Some("mdi-home".to_owned());
+        let w = Widget {
+            readings: vec![office],
+            ..widget("rooms", WidgetKind::List, 0, 0)
+        };
+        let device = device(vec![w]);
+        let ha = HashMap::from([(
+            Reading::state("sensor.office"),
+            Reported::Fresh("21.4".to_owned()),
+        )]);
+
+        let without_icon = render_with(&device, &HashMap::new(), &ha, &HashMap::new());
+        let icons = HashMap::from([(
+            "mdi-home".to_owned(),
+            Icon::Svg {
+                markup: r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="9"/></svg>"#
+                    .to_owned(),
+                ink: None,
+            },
+        )]);
+        let with_icon = render_with(&device, &HashMap::new(), &ha, &icons);
+
+        assert_ne!(
+            without_icon, with_icon,
+            "a reading's own icon must actually change what a list row draws"
+        );
+    }
+
+    #[test]
+    fn a_frame_past_its_max_bytes_still_renders_and_only_warns() {
+        // The ceiling is advisory: exceeding it must not fail the render, only
+        // warn, since some clients never buffer the whole frame anyway.
+        let device = Device {
+            max_frame_bytes: 1,
+            ..device(vec![widget("a", WidgetKind::Value, 0, 0)])
+        };
+        let bytes = render(&device, &HashMap::new());
+        assert!(
+            !bytes.is_empty(),
+            "a frame over its configured ceiling must still be produced"
+        );
+    }
+
+    #[test]
+    fn a_wide_weather_cell_sets_its_readings_beside_the_glyph_not_below() {
+        // `sky_nodes`' side-by-side layout, only reachable from a cell wider than
+        // it is tall — every other weather fixture used a taller cell, leaving
+        // this whole branch unrasterised. The regression this pins is a panic,
+        // not a misdraw.
+        let w = Widget {
+            readings: vec![reading("Temp", "weather.braga", Some("temperature"))],
+            ..ha_widget("sky", "weather.braga", WidgetKind::Weather)
+        };
+        const GRID: Grid = Grid {
+            cols: 1,
+            rows: 1,
+            fit: Fit::Stretch,
+        };
+        let device = Device {
+            width: 800,
+            height: 200,
+            grid: GRID,
+            chrome: Chrome::derived(800, 200, GRID),
+            ..device(vec![w])
+        };
+        let ha = HashMap::from([
+            (
+                Reading::state("weather.braga"),
+                Reported::Fresh("sunny".to_owned()),
+            ),
+            (
+                Reading::attribute("weather.braga", "temperature"),
+                Reported::Fresh("23.4".to_owned()),
+            ),
+        ]);
+        let png = render_with(&device, &HashMap::new(), &ha, &HashMap::new());
+        assert_eq!(dimensions(&png), (800, 200));
+    }
+
+    #[test]
+    fn a_bare_weather_glyph_with_no_words_still_draws() {
+        // `sky_node`'s empty-condition path: a cell that asked for the icon alone
+        // must still put ink on the glass, not just skip the caption.
+        let w = Widget {
+            state_text: false,
+            ..ha_widget("sky", "weather.braga", WidgetKind::Weather)
+        };
+        let device = device(vec![w]);
+        let ha = HashMap::from([(
+            Reading::state("weather.braga"),
+            Reported::Fresh("sunny".to_owned()),
+        )]);
+        let png = render_with(&device, &HashMap::new(), &ha, &HashMap::new());
+        let (width, _, levels) = greys(&png);
+        let layout = Layout::for_device(&device, &nothing_pushed());
+        let rect = layout.rect(&device.widgets[0]);
+        assert!(
+            inked(&levels, width, rect),
+            "a bare weather glyph must still draw its icon"
+        );
+    }
+
+    #[test]
+    fn width_driven_size_falls_back_to_the_reference_when_every_row_is_empty() {
+        // A column with nothing in it — no label, no value, no icon on its one
+        // row — must not divide by a zero-width measurement.
+        let rows = vec![Line {
+            row: Row {
+                id: None,
+                label: None,
+                value: None,
+                unit: None,
+                state: None,
+            },
+            icon: None,
+            ink: Ink::Current,
+        }];
+        assert_eq!(
+            width_driven_size(&FONTS, &rows, 400.0, GREYS),
+            100.0,
+            "an empty column falls back to width_driven_size's reference size"
+        );
+    }
+
+    #[test]
+    fn value_text_renders_a_pushed_array_or_object_with_its_json_text() {
+        // The catch-all: a publisher that pushes an array or object where a
+        // scalar was expected still gets *something* legible rather than a panic.
+        assert_eq!(value_text(&serde_json::json!([1, 2])), "[1,2]");
+        assert_eq!(value_text(&serde_json::json!({"a": 1})), "{\"a\":1}");
     }
 }
