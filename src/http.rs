@@ -616,7 +616,7 @@ async fn put_content(
     let wants_render = body.render;
     let now = OffsetDateTime::now_utc();
 
-    let record = match runtime.content.put(&widget_id, body, now) {
+    let record = match runtime.state.put_content(&widget_id, body, now) {
         Ok(record) => record,
         Err(error) => {
             let code = match error {
@@ -630,14 +630,14 @@ async fn put_content(
         }
     };
 
-    if let Err(error) = runtime.content.persist() {
+    if let Err(error) = runtime.state.persist() {
         // The value is already stored in memory and the frame will contain it, so
         // a failed write is logged rather than failing the push. Only a restart
         // loses it.
         tracing::warn!(
             widget = %widget_id,
             error = format!("{error:#}"),
-            "storing content to disk failed; it survives until a restart only"
+            "storing state to disk failed; it survives until a restart only"
         );
     }
 
@@ -664,7 +664,7 @@ async fn get_content(
     State(runtime): State<Arc<Runtime>>,
     Path(widget_id): Path<String>,
 ) -> Response {
-    match runtime.content.get(&widget_id) {
+    match runtime.state.content(&widget_id) {
         Some(record) => (StatusCode::OK, Json(record)).into_response(),
         None => (
             StatusCode::NOT_FOUND,
@@ -687,7 +687,7 @@ async fn status(State(runtime): State<Arc<Runtime>>) -> Response {
 /// arithmetic, which is what makes a wrong ETA diagnosable rather than merely
 /// wrong.
 async fn battery(State(runtime): State<Arc<Runtime>>) -> Response {
-    (StatusCode::OK, Json(runtime.battery.reports())).into_response()
+    (StatusCode::OK, Json(runtime.state.battery_reports())).into_response()
 }
 
 /// `POST /api/print/{device}` — deliver the frame currently being served to the

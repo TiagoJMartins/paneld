@@ -281,6 +281,7 @@ mod tests {
             label: None,
             unit: None,
             precision: None,
+            trend: false,
             state_text: true,
             stale_after: 0,
             entity: None,

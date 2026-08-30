@@ -6,7 +6,7 @@
 //! This is the one thing a panel reports that a deploy must not forget: at 1%
 //! resolution on a device that discharges over days, an emptied history means no
 //! rate for hours, and those are exactly the hours after a deploy, when someone
-//! is looking. So [`BatteryStore`] is persisted, unlike [`crate::status`], whose
+//! is looking. So [`Histories`] is persisted, unlike [`crate::status`], whose
 //! every field describes this process's own lifetime.
 //!
 //! What the panel actually sends is an **integer** percentage (see
@@ -47,14 +47,9 @@
 //!   which is no rate.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
-use std::sync::Mutex;
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
-
-use crate::jsonfile;
 
 /// Distinct readings retained per device.
 ///
@@ -62,7 +57,7 @@ use crate::jsonfile;
 /// over a full discharge at 1% resolution, so the cap is reached only by a client
 /// whose reading oscillates — and for that client the oldest readings are the
 /// ones worth dropping.
-const MAX_READINGS: usize = 64;
+pub const MAX_READINGS: usize = 64;
 
 /// How many expected steps the newest level may hold for before the trend is
 /// called stale.
@@ -387,70 +382,47 @@ impl History {
     }
 }
 
-/// Every device's history, and the file it is persisted to.
+/// Every device's battery history.
 ///
-/// Interior mutability so that `&self` methods work from `axum` handlers holding
-/// a shared reference.
-#[derive(Debug)]
-pub struct BatteryStore {
-    path: PathBuf,
-    devices: Mutex<BTreeMap<String, History>>,
-}
+/// One of the domains [`crate::state`] holds: this type owns the retention rules
+/// and the estimate read off them, and the store around it owns the mutex and the
+/// file.
+///
+/// A `BTreeMap` rather than a `HashMap` so the JSON object's keys come out
+/// stable, both on the wire and in the persisted file: a store that reordered
+/// itself on every write would make the file undiffable. Serialises as the bare
+/// map of histories, because a wrapper object around it would be a field name to
+/// keep honest for nothing.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct Histories(BTreeMap<String, History>);
 
-impl BatteryStore {
-    /// Opens the history persisted at `path`.
-    ///
-    /// Never fails; see [`crate::jsonfile`]. Whatever is loaded is capped, so a
-    /// file that grew under a different build cannot grow this process's memory.
-    pub fn load(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let mut devices: BTreeMap<String, History> = jsonfile::read(&path, "battery history");
-        for history in devices.values_mut() {
-            history.truncate();
-        }
-        Self {
-            path,
-            devices: Mutex::new(devices),
-        }
-    }
-
+impl Histories {
     /// Folds one poll's reading into `device`'s history.
-    pub fn record(&self, device: &str, percent: f64, power: Power, at: OffsetDateTime) {
-        self.lock()
+    pub fn record(&mut self, device: &str, percent: f64, power: Power, at: OffsetDateTime) {
+        self.0
             .entry(device.to_owned())
             .or_default()
             .record(percent, power, at);
     }
 
     /// Each device's history and what it implies, ordered by device id.
-    ///
-    /// A `BTreeMap` rather than a `HashMap` so the JSON object's keys come out
-    /// stable, both on the wire and in the persisted file: a store that reordered
-    /// itself on every write would make the file undiffable.
     pub fn reports(&self) -> BTreeMap<String, Report> {
-        self.lock()
+        self.0
             .iter()
             .map(|(device, history)| (device.clone(), history.report()))
             .collect()
     }
 
-    /// Writes every device's history to its configured path, atomically.
+    /// Drops every device's readings back to [`MAX_READINGS`].
     ///
-    /// Called on each poll that carried a level, rather than only on the polls
-    /// that changed one: a poll that merely repeats the level still moves the
-    /// window's end, which is what the staleness test reads, and a device polls
-    /// at most every thirty seconds. The file is one small object per device.
-    pub fn persist(&self) -> Result<()> {
-        let devices = self.lock().clone();
-        jsonfile::write(&self.path, &devices, "battery history")
-    }
-
-    /// A panicking handler must not wedge the history for the rest of the
-    /// process: the map is structurally intact either way, so recover the guard.
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, History>> {
-        self.devices
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Applied to whatever a load found on disk, because that file may have been
+    /// hand-edited or written by a build with a larger cap, and the bound exists to
+    /// be a bound.
+    pub fn truncate(&mut self) {
+        for history in self.0.values_mut() {
+            history.truncate();
+        }
     }
 }
 
@@ -1039,109 +1011,49 @@ mod tests {
         assert_eq!(json["readings"][0]["polls"], 6);
     }
 
-    /// A store file of its own per test, removed on drop.
-    struct Dir(PathBuf);
-
-    impl Dir {
-        fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "paneld-battery-{}-{name}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn file(&self) -> PathBuf {
-            self.0.join("battery.json")
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
-    fn a_persisted_store_reloads_every_reading_and_the_trend_with_it() {
-        let dir = Dir::new("roundtrip");
-        let store = BatteryStore::load(dir.file());
-        for (percent, minute) in [(80.0, 0), (80.0, 30), (79.0, 60), (78.0, 120)] {
-            store.record("kindle", percent, PLUGGED, at(minute));
-        }
-        store.persist().unwrap();
+    fn devices_keep_separate_histories() {
+        let mut histories = Histories::default();
+        histories.record("kitchen", 90.0, SILENT, at(0));
+        histories.record("hallway", 20.0, UNPLUGGED, at(0));
+        histories.record("kitchen", 89.0, SILENT, at(60));
 
-        let reloaded = BatteryStore::load(dir.file()).reports();
-        let kindle = &reloaded["kindle"];
-        assert_eq!(kindle.percent, Some(78.0));
-        assert_eq!(kindle.readings.len(), 3);
-        assert_eq!(kindle.readings[0].polls, 2, "the run length survives");
-        assert_eq!(kindle.readings[0].until, at(30));
-        assert_eq!(kindle.power, PLUGGED);
+        let reports = histories.reports();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports["kitchen"].percent, Some(89.0));
+        assert_eq!(reports["hallway"].percent, Some(20.0));
+        assert_eq!(reports["hallway"].power, UNPLUGGED);
         assert_eq!(
-            kindle.trend.percent_per_hour,
-            Some(-1.0),
-            "the rate is measured from reloaded samples: {:?}",
-            kindle.trend
+            reports.keys().collect::<Vec<_>>(),
+            ["hallway", "kitchen"],
+            "reports come out ordered by device id"
         );
     }
 
     #[test]
-    fn devices_keep_separate_histories_across_a_reload() {
-        let dir = Dir::new("devices");
-        let store = BatteryStore::load(dir.file());
-        store.record("kitchen", 90.0, SILENT, at(0));
-        store.record("hallway", 20.0, UNPLUGGED, at(0));
-        store.persist().unwrap();
-
-        let reloaded = BatteryStore::load(dir.file()).reports();
-        assert_eq!(reloaded["kitchen"].percent, Some(90.0));
-        assert_eq!(reloaded["hallway"].percent, Some(20.0));
-        assert_eq!(reloaded["hallway"].power, UNPLUGGED);
-    }
-
-    #[test]
-    fn a_file_holding_more_readings_than_the_cap_is_trimmed_on_load() {
+    fn deserialising_more_readings_than_the_cap_and_truncating_trims_the_oldest() {
         // The cap is a memory bound, so it has to hold against a file written by
-        // a build with a larger one, or hand-edited.
-        let dir = Dir::new("cap");
-        let store = BatteryStore::load(dir.file());
-        for step in 0..(MAX_READINGS as i64 + 20) {
-            store.record("kindle", 1000.0 - step as f64, SILENT, at(step * 5));
-        }
-        store.persist().unwrap();
-        // Persist wrote a capped history, so widen the file by hand.
-        let padded = format!(
-            r#"{{"kindle":[{{"percent":1,"power":{{}},"since":"2023-01-01T00:00:00Z","until":"2023-01-01T00:00:00Z","polls":1}},{}]}}"#,
-            std::fs::read_to_string(dir.file())
-                .unwrap()
-                .split_once('[')
-                .unwrap()
-                .1
-                .rsplit_once(']')
-                .unwrap()
-                .0
-        );
-        std::fs::write(dir.file(), padded).unwrap();
+        // a build with a larger one, or hand-edited. `truncate` is what
+        // [`crate::state::StateStore::load`] applies to make that true.
+        let readings = (0..MAX_READINGS + 20)
+            .map(|step| {
+                format!(
+                    r#"{{"percent":{},"power":{{}},"since":"2023-01-01T00:00:00Z","until":"2023-01-01T00:00:00Z","polls":1}}"#,
+                    1000 - step as i64
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut histories: Histories =
+            serde_json::from_str(&format!(r#"{{"kindle":[{readings}]}}"#)).unwrap();
 
-        let reloaded = BatteryStore::load(dir.file()).reports();
-        assert_eq!(reloaded["kindle"].readings.len(), MAX_READINGS);
-        assert_ne!(
-            reloaded["kindle"].readings[0].percent, 1.0,
-            "the padded oldest reading is the one dropped"
+        histories.truncate();
+        let readings = &histories.reports()["kindle"].readings;
+        assert_eq!(readings.len(), MAX_READINGS);
+        assert_eq!(
+            readings[0].percent,
+            (1000 - 20) as f64,
+            "the oldest readings are the ones dropped"
         );
-    }
-
-    #[test]
-    fn an_unwritable_path_is_an_error_and_not_a_panic() {
-        // The poll path logs this and carries on; it must never unwind into a
-        // handler.
-        let store = BatteryStore::load("/proc/paneld-cannot-write/battery.json");
-        store.record("kindle", 50.0, SILENT, at(0));
-        assert!(store.persist().is_err());
-        assert_eq!(store.reports()["kindle"].percent, Some(50.0));
     }
 }

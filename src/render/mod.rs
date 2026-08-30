@@ -32,6 +32,7 @@ mod types;
 
 pub use encode::{frame_hash, quantise_and_encode};
 pub use grid::Layout;
+pub(crate) use resolve::shown_numbers;
 
 use std::collections::HashMap;
 
@@ -43,6 +44,7 @@ use crate::config::{Device, Dither, Edge, Palette};
 use crate::content::ContentRecord;
 use crate::ha::{Reading, Reported};
 use crate::icon::Icon;
+use crate::state::Trend;
 use crate::telemetry::Telemetry;
 
 use paint::{family, text_node, text_style};
@@ -93,6 +95,14 @@ pub struct RenderInputs<'a> {
     /// no fetch, no lock and no clock to [`render_frame`], so a frame is still a
     /// pure function of its inputs.
     pub telemetry: &'a Telemetry,
+    /// Which way each reading that asked for a trend last moved, keyed by
+    /// [`crate::state::trend_key`]. A reading absent from this map draws no arrow.
+    ///
+    /// Stepped by the caller before the render, for the same reason the Home
+    /// Assistant states are fetched there: remembering the previous value is a
+    /// mutation of persisted state, and a render that performed one would no
+    /// longer be a function of its inputs.
+    pub trends: &'a HashMap<String, Trend>,
 }
 
 /// Builds the embedded font collection.

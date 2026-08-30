@@ -2,9 +2,11 @@
 //!
 //! Almost everything the bar can say is something this process already knows for
 //! certain — the clock it was handed, the device's own configuration, the last
-//! telemetry it reported. The exception is an [`Alert`], which reads pushed
-//! content, and it reads it from [`RenderInputs`] like every other resolved input,
-//! so [`node`] stays as pure as the rest of the render pipeline.
+//! telemetry it reported. [`Alert`] and [`StatusField::Battery`] are the two
+//! exceptions: an alert reads pushed content, and battery draws a glyph rather
+//! than text. Both still read from [`RenderInputs`] or telemetry the way every
+//! other resolved input does, so [`node`] stays as pure as the rest of the render
+//! pipeline.
 //!
 //! The strip's geometry is not decided here. [`Device::status_bar_area`] owns it,
 //! because the grid beside it is sized by the same arithmetic and the tap hit test
@@ -15,7 +17,8 @@ use takumi::prelude::*;
 use time::{Month, OffsetDateTime, Weekday};
 
 use super::body::fitted;
-use super::paint::{one_line, rule_width, text_node, text_style};
+use super::icon::Battery;
+use super::paint::{icon_node, one_line, rule_width, text_node, text_style};
 use super::types::{Greys, Ink, ink, rule};
 use super::{NUMERIC_FAMILY, RenderInputs, UI_FAMILY};
 use crate::config::{Alert, Device, Edge, StatusBar, StatusField};
@@ -67,6 +70,12 @@ pub fn node(fonts: &Fonts, device: &Device, bar: &StatusBar, inputs: &RenderInpu
         .fields
         .iter()
         .map(|&field| {
+            // Battery with a level is drawn as a glyph. Battery without one, and
+            // every other field, goes through the text path.
+            if let (StatusField::Battery, Some(percent)) = (field, inputs.telemetry.battery_percent)
+            {
+                return battery_node(percent, inputs.telemetry.charging, size, greys);
+            }
             field_node(
                 fonts,
                 &field_text(field, device, bar, inputs.now, inputs.telemetry),
@@ -207,6 +216,26 @@ fn alert_node(
     )
 }
 
+/// The battery field as a glyph: the [`Battery`] state that matches the reading.
+///
+/// Drawn a shade larger than the type it stands beside, for the reason a row's icon
+/// is: a run of digits fills its line box where a silhouette sits inside its own
+/// margins, so a glyph at the same nominal size reads smaller than the text. This
+/// silhouette is a portrait battery half as wide as its box, which makes the effect
+/// worse than for a square glyph — but the bump is held to the row icon's factor
+/// rather than tuned further, because the bar's fields sit at fixed spacing and a
+/// mark taller than the strip's type would set the whole run off-centre.
+///
+/// Full ink, matching the rest of the bar.
+fn battery_node(percent: f64, charging: Option<bool>, size: f32, greys: Greys) -> Node {
+    let state = Battery::of(percent, charging);
+    let icon = crate::icon::Icon::Svg {
+        markup: state.svg().to_owned(),
+        ink: None,
+    };
+    icon_node(&icon, size * 1.15, Ink::Current, greys)
+}
+
 /// The rule between the bar and the dashboard, on the one side of the strip that
 /// faces it.
 ///
@@ -274,6 +303,8 @@ fn field_node(
 /// them: the fields are spread evenly along the strip, so a proportional face
 /// setting `11:11` narrower than `08:48` would nudge every other field along with
 /// every tick. A device id is a name rather than a number, so it takes the UI face.
+/// Battery draws a glyph rather than text when a level is reported, so this face
+/// is only used for the ABSENT em dash fallback.
 fn face(field: StatusField) -> &'static str {
     match field {
         StatusField::Device => UI_FAMILY,
@@ -281,11 +312,13 @@ fn face(field: StatusField) -> &'static str {
     }
 }
 
-/// What one field says.
+/// What one field says, as text.
 ///
-/// Takes the two live values a field can come from rather than the whole
-/// [`RenderInputs`], because a bar reads no pushed content, no Home Assistant
-/// state and no icon — and a signature that said otherwise would invite one to.
+/// Takes the clock, the device's configuration and its telemetry rather than the
+/// whole [`RenderInputs`], because none of these fields reads pushed content or
+/// Home Assistant state — and a signature that said otherwise would invite one
+/// to. A battery with a reported level never reaches here: [`node`] routes it to
+/// [`battery_node`], which is the one field on the strip drawn as a glyph.
 fn field_text(
     field: StatusField,
     device: &Device,
@@ -296,10 +329,9 @@ fn field_text(
     match field {
         StatusField::Date => date_text(bar.timezone.at(now)),
         StatusField::Time => time_text(bar.timezone.at(now)),
-        StatusField::Battery => match telemetry.battery_percent {
-            Some(percent) => format!("{}%", percent.round() as i64),
-            None => ABSENT.to_owned(),
-        },
+        // A battery reading that exists is drawn as a glyph by battery_node and
+        // never reaches here. The em dash is the only text this arm ever returns.
+        StatusField::Battery => ABSENT.to_owned(),
         StatusField::Refresh => period_text(device.refresh_rate),
         StatusField::Device => device.id.clone(),
         StatusField::Signal => signal_text(telemetry.rssi),
@@ -402,6 +434,7 @@ fn month_name(month: Month) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::NO_TRENDS;
     use super::*;
     use crate::content::ContentRecord;
     use std::collections::HashMap;
@@ -544,21 +577,35 @@ grid = {{ cols = 4, rows = 3 }}
     }
 
     #[test]
-    fn battery_reads_as_a_whole_percentage() {
-        let telemetry = Telemetry {
+    fn a_battery_with_a_level_routes_to_field_text_as_em_dash() {
+        // field_text is only reached when battery_percent is None; when it has a
+        // value, node() routes to battery_node instead. This confirms field_text
+        // always returns the em dash for Battery so an unreachable arm never panics.
+        let with_level = Telemetry {
             battery_percent: Some(83.6),
             ..Telemetry::default()
         };
-        assert_eq!(text(UTC_BAR, StatusField::Battery, &telemetry), "84%");
-    }
-
-    #[test]
-    fn an_unreported_battery_reads_as_an_em_dash_and_never_a_zero() {
-        // A panel that has not polled yet is not a flat panel, and `0%` is the one
-        // rendering of that an owner would get up and act on.
+        let without_level = nothing_reported();
+        // Both cases through field_text return ABSENT — the Some branch is drawn
+        // as a glyph by node() before field_text is ever called.
         assert_eq!(
-            text(UTC_BAR, StatusField::Battery, &nothing_reported()),
-            ABSENT
+            field_text(
+                StatusField::Battery,
+                &device(UTC_BAR),
+                device(UTC_BAR)
+                    .status_bar
+                    .as_ref()
+                    .expect("fixture has a bar"),
+                now(),
+                &with_level,
+            ),
+            ABSENT,
+            "field_text for battery always returns ABSENT; the glyph path is in node()"
+        );
+        assert_eq!(
+            text(UTC_BAR, StatusField::Battery, &without_level),
+            ABSENT,
+            "an absent battery still reads as an em dash"
         );
     }
 
@@ -609,7 +656,9 @@ grid = {{ cols = 4, rows = 3 }}
     #[test]
     fn numbers_are_set_in_the_tabular_face_and_the_device_id_is_not() {
         // Not cosmetic: a proportional digit width would move the fields beside a
-        // figure whenever it changed.
+        // figure whenever it changed. Battery draws a glyph when it has a level
+        // and an em dash when it does not; both go through field_node, so this
+        // face still applies to the fallback text path.
         assert_eq!(face(StatusField::Time), NUMERIC_FAMILY);
         assert_eq!(face(StatusField::Battery), NUMERIC_FAMILY);
         assert_eq!(face(StatusField::Device), UI_FAMILY);
@@ -655,6 +704,7 @@ stale_after = 3600"#,
             ha_states: &ha,
             icons: &icons,
             telemetry: &telemetry,
+            trends: &NO_TRENDS,
             now: now(),
         };
         is_raised(&bar.alerts[0], &inputs)

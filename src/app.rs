@@ -11,13 +11,14 @@ use takumi::prelude::Fonts;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
-use crate::battery::{BatteryStore, Power};
+use crate::battery::Power;
 use crate::config::{Config, Device};
-use crate::content::ContentStore;
+use crate::content::ContentRecord;
 use crate::frame::{Frame, FrameStore};
 use crate::ha::{HaClient, HttpHaClient, LastGood, Reading, Reported, fetch_readings};
 use crate::icon;
 use crate::render::{self, RenderInputs};
+use crate::state::{StateStore, Trend};
 use crate::status::StatusStore;
 use crate::tap::{self, Taps};
 use crate::telemetry::Telemetry;
@@ -47,8 +48,9 @@ pub struct Runtime {
     /// Swapped wholesale on a successful reload, so a malformed file leaves the
     /// previous configuration in effect.
     config: RwLock<Arc<Config>>,
-    pub content: ContentStore,
-    pub battery: BatteryStore,
+    /// Everything that outlives the process: pushed content, battery history and
+    /// reading trends, behind one mutex and one file.
+    pub state: StateStore,
     pub frames: FrameStore,
     pub status: StatusStore,
     fonts: Fonts,
@@ -128,8 +130,7 @@ impl Runtime {
         config: Config,
         ha: Option<Box<dyn HaClient>>,
     ) -> Result<(Arc<Self>, mpsc::Receiver<String>)> {
-        let content = ContentStore::load(config.server.content_path.clone());
-        let battery = BatteryStore::load(config.server.battery_path.clone());
+        let state = StateStore::load(config.server.state_path.clone());
         let (wake_tx, wake_rx) = mpsc::channel(WAKE_CHANNEL_CAPACITY);
 
         // A cache directory that cannot be created is logged once here rather than
@@ -148,8 +149,7 @@ impl Runtime {
 
         let runtime = Arc::new(Self {
             config: RwLock::new(Arc::new(config)),
-            content,
-            battery,
+            state,
             frames: FrameStore::new(),
             status: StatusStore::new(),
             fonts: render::fonts().context("loading the embedded fonts")?,
@@ -177,7 +177,8 @@ impl Runtime {
             .clone()
     }
 
-    /// Folds a poll's battery reading into the persisted history.
+    /// Folds a poll's battery reading into the persisted history, and flushes the
+    /// whole state file with it.
     ///
     /// A failed write is logged rather than failing the poll. The reading is in
     /// the store either way, and a panel that stopped polling because a disk
@@ -190,13 +191,13 @@ impl Runtime {
             charging: telemetry.charging,
             usb_connected: telemetry.usb_connected,
         };
-        self.battery.record(device_id, percent, power, now);
+        self.state.record_battery(device_id, percent, power, now);
 
-        if let Err(error) = self.battery.persist() {
+        if let Err(error) = self.state.persist() {
             tracing::warn!(
                 device = %device_id,
                 error = format!("{error:#}"),
-                "the battery history could not be written; it survives only in memory"
+                "the state file could not be written; it survives only in memory"
             );
         }
     }
@@ -314,11 +315,16 @@ impl Runtime {
         // synchronous and reproducible.
         let ha_states = self.ha_states(device).await;
         let icons = self.icons(device).await;
-        let content = self.content.snapshot();
+        let content = self.state.content_snapshot();
         // Read once, here, rather than inside the renderer: a frame is a pure
         // function of its inputs, and a status bar reaching into the status store
         // mid-rasterise would be the one thing in the render path that is not.
         let telemetry = self.status.telemetry(device_id);
+        // Stepped before the pure render, for the same reason the readings are
+        // fetched before it: remembering what a cell last showed is a mutation of
+        // persisted state, and a render that performed one would stop being a
+        // function of its inputs.
+        let trends = self.step_trends(device, &content, &ha_states);
 
         // The layout engine asserts internally on degenerate geometry, so a panic
         // here is possible in a way an error is not. Containing it matters more
@@ -334,6 +340,7 @@ impl Runtime {
                     ha_states: &ha_states,
                     icons: &icons,
                     telemetry: &telemetry,
+                    trends: &trends,
                     now,
                 },
             )
@@ -355,6 +362,46 @@ impl Runtime {
         self.status.record_render(device_id, &hash, now);
 
         Ok(changed)
+    }
+
+    /// Folds this frame's numbers into the remembered trends and hands back the
+    /// arrow each reading should draw.
+    ///
+    /// Idempotent for an unchanged number: a device rendered twice off the same
+    /// data gets the same arrows and so the same frame hash, which is what keeps
+    /// the mark from costing the repaint it exists to save.
+    ///
+    /// Persisted here rather than left for the next poll, and only for a dashboard
+    /// that actually asked for a trend: a panel that reports no battery level never
+    /// reaches [`Runtime::record_battery`], and its arrows would otherwise survive
+    /// only until a restart. A failed write is logged for the same reason it is
+    /// there — the arrows are in memory either way, and a render that failed
+    /// because a disk filled is far worse than an arrow that forgot itself.
+    fn step_trends(
+        &self,
+        device: &Device,
+        content: &HashMap<String, ContentRecord>,
+        ha_states: &HashMap<Reading, Reported>,
+    ) -> HashMap<String, Trend> {
+        let trends: HashMap<String, Trend> = render::shown_numbers(device, content, ha_states)
+            .into_iter()
+            .map(|(key, shown)| {
+                let trend = self.state.trend(&key, shown);
+                (key, trend)
+            })
+            .collect();
+        if trends.is_empty() {
+            return trends;
+        }
+
+        if let Err(error) = self.state.persist() {
+            tracing::warn!(
+                device = %device.id,
+                error = format!("{error:#}"),
+                "the state file could not be written; the trends survive only in memory"
+            );
+        }
+        trends
     }
 
     /// Resolves every Home Assistant reading this device's dashboard references,
@@ -470,7 +517,7 @@ impl Runtime {
         // geometry a finger is resolved against is only geometry given the data.
         // The frame on the glass is a render behind that either way, and the next
         // render brings the two back together.
-        let layout = render::Layout::for_device(device, &self.content.snapshot());
+        let layout = render::Layout::for_device(device, &self.state.content_snapshot());
         let Some(widget) = layout.hit(device, x, y) else {
             return tap::Report::bare(tap::Outcome::NoTarget);
         };
@@ -623,8 +670,7 @@ grid = { cols = 1, rows = 1 }
 
     fn runtime(toml: &str) -> Arc<Runtime> {
         let mut config = crate::config::parse(toml).unwrap();
-        config.server.content_path = temp_path("content");
-        config.server.battery_path = temp_path("battery");
+        config.server.state_path = temp_path("state");
         Runtime::with_home_assistant(config, None).unwrap().0
     }
 

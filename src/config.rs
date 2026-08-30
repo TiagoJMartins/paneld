@@ -105,19 +105,15 @@ pub struct Server {
     /// plain string concatenation, and a trailing slash there produces a doubled
     /// path separator.
     pub public_base_url: String,
-    /// Where the content store is persisted. Relative paths resolve against the
-    /// process working directory.
-    #[serde(default = "default_content_path")]
-    pub content_path: String,
-    /// Where the battery history is persisted. Relative paths resolve against
-    /// the process working directory.
+    /// Where everything the process remembers across a restart is persisted.
+    /// Relative paths resolve against the process working directory.
     ///
-    /// A separate file from the content store because the two have nothing to do
-    /// with each other: one is what publishers pushed, the other is what panels
-    /// reported about themselves, and an operator clearing one should not lose
-    /// the other.
-    #[serde(default = "default_battery_path")]
-    pub battery_path: String,
+    /// One file for pushed content, battery history and reading trends together;
+    /// see [`crate::state`] for why they share it. An operator clearing it loses
+    /// all three, which costs one poll interval of pushed values and the charge
+    /// rate until a level next moves.
+    #[serde(default = "default_state_path")]
+    pub state_path: String,
     /// Where fetched widget icons are cached. Relative paths resolve against the
     /// process working directory.
     ///
@@ -129,12 +125,8 @@ pub struct Server {
     pub icon_cache_path: String,
 }
 
-fn default_content_path() -> String {
-    "paneld-content.json".to_owned()
-}
-
-fn default_battery_path() -> String {
-    "paneld-battery.json".to_owned()
+fn default_state_path() -> String {
+    "paneld-state.json".to_owned()
 }
 
 fn default_icon_cache_path() -> String {
@@ -695,6 +687,18 @@ pub struct Widget {
     /// Already folded with the device's default, so the renderer reads this and
     /// nothing else.
     pub precision: Option<u8>,
+    /// Whether a numeric reading carries an arrow saying which way it last moved.
+    ///
+    /// Off by default, and worth understanding before switching on. A panel
+    /// repaints when the frame's bytes change, so a cell showing `21.4` repaints
+    /// on every tenth of a degree. Asking for a trend rounds the reading to whole
+    /// numbers — this defaults `precision` to `0` — and puts the direction of the
+    /// last change beside it, so the cell changes a handful of times a day and
+    /// still says whether the room is warming.
+    ///
+    /// On a `list` or `weather` cell this is inherited by the readings rather than
+    /// drawn on the cell itself, which has no figure of its own to mark.
+    pub trend: bool,
     /// Whether a graphic reading is captioned in words: a beacon's `ON`/`OFF`, a
     /// weather cell's condition.
     ///
@@ -795,6 +799,9 @@ pub struct Reading {
     pub unit: Option<String>,
     /// Decimal places, already folded with the widget's and the device's.
     pub precision: Option<u8>,
+    /// Whether this reading carries a trend arrow. Already folded with the
+    /// widget's.
+    pub trend: bool,
 }
 
 /// A widget that is itself a grid of widgets.
@@ -1879,6 +1886,7 @@ fn validate_widget(
         label,
         unit,
         precision,
+        trend,
         state_text,
         stale_after,
         entity,
@@ -1901,7 +1909,12 @@ fn validate_widget(
         &format!("widget `{id}` on device `{device_id}`"),
     )?;
 
-    let precision = precision.or(device_precision);
+    // A trend rounds to whole numbers unless the author said otherwise, because
+    // that is what it is for: the arrow restores the direction the dropped digits
+    // used to carry, and a trend beside `21.4` would still repaint the panel every
+    // tenth of a degree. Written before the device default so that asking for a
+    // trend on one widget is not undone by a `precision` set once for the panel.
+    let precision = precision.or(trend.then_some(0)).or(device_precision);
     if let Some(precision) = precision {
         ensure!(
             precision <= MAX_PRECISION,
@@ -1909,6 +1922,20 @@ fn validate_widget(
              {MAX_PRECISION} decimal places a panel can use"
         );
     }
+
+    // A kind with no number on it has nothing for an arrow to describe, and a flag
+    // that silently did nothing would be an author waiting for a mark that is never
+    // coming.
+    ensure!(
+        !trend
+            || matches!(
+                kind,
+                WidgetKind::HaEntity | WidgetKind::Value | WidgetKind::List | WidgetKind::Weather
+            ),
+        "widget `{id}` on device `{device_id}` has kind {kind} and `trend`; only a \
+         numeric reading has a direction, so `trend` belongs on `ha_entity`, `value`, \
+         or the readings of a `list` or `weather` cell"
+    );
 
     // A list is the one kind that may be either: its readings are what it is made
     // of, so declaring them makes it a Home Assistant cell and declaring none makes
@@ -1953,7 +1980,15 @@ fn validate_widget(
         .into_iter()
         .enumerate()
         .map(|(index, raw)| {
-            validate_reading(raw, index, &id, device_id, entity.as_deref(), precision)
+            validate_reading(
+                raw,
+                index,
+                &id,
+                device_id,
+                entity.as_deref(),
+                precision,
+                trend,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -2046,6 +2081,7 @@ fn validate_widget(
         label,
         unit,
         precision,
+        trend,
         state_text,
         stale_after,
         entity,
@@ -2071,6 +2107,7 @@ fn validate_reading(
     device_id: &str,
     widget_entity: Option<&str>,
     widget_precision: Option<u8>,
+    widget_trend: bool,
 ) -> Result<Reading> {
     let RawReading {
         label,
@@ -2079,7 +2116,9 @@ fn validate_reading(
         attribute,
         unit,
         precision,
+        trend,
     } = raw;
+    let trend = trend || widget_trend;
 
     if let Some(icon) = &icon {
         crate::icon::validate(icon).with_context(|| {
@@ -2115,7 +2154,8 @@ fn validate_reading(
         entity,
         attribute,
         unit,
-        precision: precision.or(widget_precision),
+        precision: precision.or(trend.then_some(0)).or(widget_precision),
+        trend,
     })
 }
 
@@ -2351,6 +2391,8 @@ struct RawWidget {
     label: Option<String>,
     unit: Option<String>,
     precision: Option<u8>,
+    #[serde(default)]
+    trend: bool,
     #[serde(default = "yes")]
     state_text: bool,
     #[serde(default)]
@@ -2387,6 +2429,8 @@ struct RawReading {
     attribute: Option<String>,
     unit: Option<String>,
     precision: Option<u8>,
+    #[serde(default)]
+    trend: bool,
 }
 
 /// A `tap` as the file may spell it.
@@ -3204,35 +3248,31 @@ entity = "sensor.office_temperature"
     }
 
     #[test]
-    fn content_path_has_a_default_and_is_overridable() {
-        assert_eq!(
-            parse(BASE).unwrap().server.content_path,
-            "paneld-content.json"
-        );
+    fn state_path_has_a_default_and_is_overridable() {
+        assert_eq!(parse(BASE).unwrap().server.state_path, "paneld-state.json");
         let text = BASE.replace(
             "public_base_url =",
-            "content_path = \"/var/lib/paneld/content.json\"\npublic_base_url =",
+            "state_path = \"/var/lib/paneld/state.json\"\npublic_base_url =",
         );
         assert_eq!(
-            parse(&text).unwrap().server.content_path,
-            "/var/lib/paneld/content.json"
+            parse(&text).unwrap().server.state_path,
+            "/var/lib/paneld/state.json"
         );
     }
 
     #[test]
-    fn battery_path_has_a_default_and_is_overridable() {
-        assert_eq!(
-            parse(BASE).unwrap().server.battery_path,
-            "paneld-battery.json"
-        );
-        let text = BASE.replace(
-            "public_base_url =",
-            "battery_path = \"/var/lib/paneld/battery.json\"\npublic_base_url =",
-        );
-        assert_eq!(
-            parse(&text).unwrap().server.battery_path,
-            "/var/lib/paneld/battery.json"
-        );
+    fn the_retired_per_domain_path_keys_are_rejected() {
+        // `deny_unknown_fields` on `Server` turns a config carrying the old keys
+        // into a startup error naming them, rather than a daemon that silently
+        // persists somewhere the operator did not ask for.
+        for key in ["content_path", "battery_path"] {
+            let text = BASE.replace(
+                "public_base_url =",
+                &format!("{key} = \"/var/lib/paneld/x.json\"\npublic_base_url ="),
+            );
+            let message = err(&text);
+            assert!(message.contains(key), "{message}");
+        }
     }
 
     #[test]
@@ -3829,6 +3869,130 @@ precision = 0
             message.contains(&format!("precision {}", MAX_PRECISION + 1)),
             "{message}"
         );
+    }
+
+    #[test]
+    fn trend_is_off_unless_asked_for() {
+        let text =
+            format!("{BASE}\n[[device.widget]]\nid = \"a\"\nkind = \"value\"\ncol = 0\nrow = 0\n");
+        let widget = &parse(&text).unwrap().devices[0].widgets[0];
+        assert!(!widget.trend);
+        assert_eq!(
+            widget.precision, None,
+            "a cell nobody asked a trend of keeps every digit its source sent"
+        );
+    }
+
+    #[test]
+    fn a_trend_rounds_to_whole_numbers_unless_told_otherwise() {
+        let text = format!(
+            "{BASE}\n[[device.widget]]\nid = \"a\"\nkind = \"value\"\ncol = 0\nrow = 0\n\
+             trend = true\n"
+        );
+        let widget = &parse(&text).unwrap().devices[0].widgets[0];
+        assert!(widget.trend);
+        assert_eq!(
+            widget.precision,
+            Some(0),
+            "the arrow replaces the digits it dropped; keeping them would repaint the \
+             panel just as often"
+        );
+    }
+
+    #[test]
+    fn an_explicit_precision_survives_a_trend_and_beats_the_device_default() {
+        let text = format!(
+            "{}\n[[device.widget]]\nid = \"a\"\nkind = \"value\"\ncol = 0\nrow = 0\n\
+             trend = true\nprecision = 2\n",
+            with_device_line("precision = 3")
+        );
+        assert_eq!(
+            parse(&text).unwrap().devices[0].widgets[0].precision,
+            Some(2)
+        );
+
+        // And a trend on one widget is not undone by a precision set once for the
+        // whole panel: the flag is the more specific statement.
+        let text = format!(
+            "{}\n[[device.widget]]\nid = \"a\"\nkind = \"value\"\ncol = 0\nrow = 0\n\
+             trend = true\n",
+            with_device_line("precision = 3")
+        );
+        assert_eq!(
+            parse(&text).unwrap().devices[0].widgets[0].precision,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_widget_trend_is_inherited_by_its_readings() {
+        let text = with_home_assistant(
+            r#"
+[[device.widget]]
+id = "climate"
+kind = "list"
+col = 0
+row = 0
+trend = true
+entity = "sensor.office"
+
+[[device.widget.reading]]
+label = "Temp"
+
+[[device.widget.reading]]
+label = "Humidity"
+attribute = "humidity"
+precision = 1
+"#,
+        );
+        let widget = &parse(&text).unwrap().devices[0].widgets[0];
+        assert!(widget.readings[0].trend, "inherited from the list");
+        assert_eq!(widget.readings[0].precision, Some(0));
+        assert!(widget.readings[1].trend);
+        assert_eq!(
+            widget.readings[1].precision,
+            Some(1),
+            "a reading's own precision still wins over the trend's default"
+        );
+    }
+
+    #[test]
+    fn a_reading_may_ask_for_a_trend_the_widget_did_not() {
+        let text = with_home_assistant(
+            r#"
+[[device.widget]]
+id = "climate"
+kind = "list"
+col = 0
+row = 0
+entity = "sensor.office"
+
+[[device.widget.reading]]
+label = "Temp"
+trend = true
+
+[[device.widget.reading]]
+label = "Humidity"
+attribute = "humidity"
+"#,
+        );
+        let widget = &parse(&text).unwrap().devices[0].widgets[0];
+        assert!(!widget.trend);
+        assert!(widget.readings[0].trend);
+        assert!(!widget.readings[1].trend);
+    }
+
+    #[test]
+    fn rejects_a_trend_on_a_kind_with_no_number_to_trend() {
+        for kind in ["beacon", "text"] {
+            let text = format!(
+                "{BASE}\n[[device.widget]]\nid = \"a\"\nkind = \"{kind}\"\ncol = 0\nrow = 0\n\
+                 trend = true\n"
+            );
+            let message = err(&text);
+            assert!(message.contains("trend"), "{message}");
+            assert!(message.contains(kind), "{message}");
+        }
     }
 
     /// A list that declares no reading is not an empty list: it is one whose rows

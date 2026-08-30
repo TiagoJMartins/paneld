@@ -550,6 +550,7 @@ mod tests {
                 state: None,
             },
             icon: None,
+            trend: None,
             ink: Ink::Current,
         }];
         assert_eq!(

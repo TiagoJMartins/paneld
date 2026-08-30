@@ -59,8 +59,8 @@ grid = {{ cols = {cols}, rows = {rows} }}
                     render: false,
                 };
                 runtime
-                    .content
-                    .put(
+                    .state
+                    .put_content(
                         &format!("w{row}_{col}"),
                         body,
                         time::OffsetDateTime::now_utc(),

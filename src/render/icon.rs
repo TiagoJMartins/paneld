@@ -313,6 +313,134 @@ pub const UNKNOWN_SKY: &str = icon!(
 /// becomes a smudge that only pulls the eye off the reading.
 pub const NOT_CONFIRMED: &str = icon!(cloud_centred!(), r#"<path d="M4.5 19.5L19.5 4.5"/>"#,);
 
+/// The arrow a reading carries when its widget asked for a trend.
+///
+/// Three marks for [`crate::state::Trend`]'s three states, drawn beside a whole
+/// number that has had its decimals rounded away. The arrow is what pays for
+/// those decimals: it says which way the reading last moved, and it changes only
+/// on the frames the number itself changed, so a cell costs the panel the same
+/// repaints with the arrow as it would have with the digits gone and nothing in
+/// their place.
+///
+/// A stem with a head rather than a bare chevron, and the steady state a plain
+/// bar rather than an empty box: the three sit in a column of readings at 14-20px,
+/// where a chevron and a bar are one smudge apart and a missing mark reads as a
+/// render bug. The heads are open strokes, matching the rest of this module.
+pub fn trend(trend: crate::state::Trend) -> &'static str {
+    match trend {
+        crate::state::Trend::Up => {
+            icon!(r#"<path d="M12 20V5"/>"#, r#"<path d="M6 11L12 5l6 6"/>"#,)
+        }
+        crate::state::Trend::Down => {
+            icon!(r#"<path d="M12 4v15"/>"#, r#"<path d="M6 13l6 6 6-6"/>"#,)
+        }
+        // Level, and the one mark that is not an arrow: a reading holding still
+        // has no direction to point, and a horizontal arrow would claim it is
+        // moving sideways.
+        crate::state::Trend::Steady => icon!(r#"<path d="M5 12h14"/>"#),
+    }
+}
+
+/// The shared silhouette every battery glyph draws: a rounded body with its
+/// terminal nub.
+///
+/// All four variants use this outline unchanged, so they interchange without the
+/// body moving. The nub is at the top centre (the SVG `y` axis points down) and
+/// the body fills y 5 to 21, leaving room at both ends. Not a macro that takes
+/// body content — body geometry is inlined per variant — but a string fragment
+/// that each variant concatenates via `icon!`.
+macro_rules! battery_outline {
+    () => {
+        // Rounded body: x 6-18, y 5-21. Nub: x 10-14, y 3-5.
+        concat!(
+            r#"<rect x="6" y="5" width="12" height="16" rx="1.5"/>"#,
+            r#"<rect x="10" y="3" width="4" height="2" rx="0.5"/>"#,
+        )
+    };
+}
+
+/// Charge level of a device's battery, as the status bar reports it.
+///
+/// Four discrete states rather than a continuous percentage, because e-ink
+/// repaints exactly when a frame's content hash changes. A glyph that changes at
+/// three thresholds costs at most three repaints across a full discharge; a
+/// percent string changes a hundred times and costs a hundred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Battery {
+    Low,
+    Mid,
+    Full,
+    Charging,
+}
+
+impl Battery {
+    /// Every battery state this build draws.
+    ///
+    /// Test-only: nothing in the render path enumerates the states, because
+    /// [`Battery::of`] is the only way one is ever chosen. It exists so the glyph
+    /// invariants below are asserted over all four rather than over a second list
+    /// that can fall out of step with this enum.
+    #[cfg(test)]
+    const ALL: [Self; 4] = [Self::Low, Self::Mid, Self::Full, Self::Charging];
+
+    /// Classifies a battery reading into one of four display states.
+    ///
+    /// `charging == Some(true)` wins immediately: a device on the charger is one
+    /// the owner need not act on regardless of the reported level, and
+    /// `Charging` says exactly that. `Some(false)` and `None` are both treated as
+    /// not charging for display purposes — note that the telemetry module docs
+    /// explain that `battery-charging: 0` means "charge complete, disabled, or no
+    /// battery", so `Some(false)` does not necessarily mean the device is running
+    /// on the cell; it may simply mean the IC has finished charging.
+    pub fn of(percent: f64, charging: Option<bool>) -> Self {
+        if charging == Some(true) {
+            return Self::Charging;
+        }
+        if percent < 20.0 {
+            Self::Low
+        } else if percent < 80.0 {
+            Self::Mid
+        } else {
+            Self::Full
+        }
+    }
+
+    /// Line-art SVG for this battery state.
+    ///
+    /// All four variants share the same outline silhouette via `battery_outline!`
+    /// so they interchange in position. Level variants differ by how many stroked
+    /// bars are drawn inside the body — strokes rather than fills, for the same
+    /// reason the rest of this module uses strokes: Atkinson dithering turns a
+    /// large flat fill into visible noise, while a 1.6-unit stroke survives it.
+    pub fn svg(self) -> &'static str {
+        match self {
+            // One bar near the bottom: one third full.
+            Self::Low => icon!(battery_outline!(), r#"<path d="M9 17h6"/>"#,),
+            // Two bars: two thirds full.
+            Self::Mid => icon!(
+                battery_outline!(),
+                r#"<path d="M9 17h6"/>"#,
+                r#"<path d="M9 13.5h6"/>"#,
+            ),
+            // Three bars: nearly or fully charged.
+            Self::Full => icon!(
+                battery_outline!(),
+                r#"<path d="M9 17h6"/>"#,
+                r#"<path d="M9 13.5h6"/>"#,
+                r#"<path d="M9 10h6"/>"#,
+            ),
+            // Outline plus a bolt centred in the body. The bolt is scaled and
+            // repositioned from `Condition::Lightning`'s full-viewBox version so
+            // it fits inside the battery body without touching the outline, keeping
+            // the two glyphs visually distinct.
+            Self::Charging => icon!(
+                battery_outline!(),
+                r#"<path d="M12.6 7.5L9.5 12h3.1l-.9 4.5 4-5h-3.1l.8-4z"/>"#,
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +455,22 @@ mod tests {
             .collect();
         markup.push(("unknown-sky", UNKNOWN_SKY));
         markup.push(("not-confirmed", NOT_CONFIRMED));
+        for state in Battery::ALL {
+            let name = match state {
+                Battery::Low => "battery-low",
+                Battery::Mid => "battery-mid",
+                Battery::Full => "battery-full",
+                Battery::Charging => "battery-charging",
+            };
+            markup.push((name, state.svg()));
+        }
+        for (name, state) in [
+            ("trend-up", crate::state::Trend::Up),
+            ("trend-down", crate::state::Trend::Down),
+            ("trend-steady", crate::state::Trend::Steady),
+        ] {
+            markup.push((name, trend(state)));
+        }
         markup
     }
 
@@ -381,7 +525,7 @@ mod tests {
         let markup: HashSet<&str> = all_markup().into_iter().map(|(_, svg)| svg).collect();
         assert_eq!(
             markup.len(),
-            17,
+            24,
             "two glyphs share markup, so two conditions draw the same mark"
         );
     }
@@ -436,6 +580,35 @@ mod tests {
             assert!(
                 first.is_uppercase(),
                 "{label:?} does not start with an upper-case letter"
+            );
+        }
+    }
+
+    #[test]
+    fn battery_of_classifies_by_threshold_and_charging_wins() {
+        for (percent, charging, want) in [
+            (0.0, None, Battery::Low),
+            (19.0, None, Battery::Low),
+            (19.999, None, Battery::Low),
+            (20.0, None, Battery::Mid),
+            (79.0, None, Battery::Mid),
+            (79.999, None, Battery::Mid),
+            (80.0, None, Battery::Full),
+            (100.0, None, Battery::Full),
+            // Some(false): charge complete, disabled, or no battery — not "on
+            // the cell", but treated as not-charging for display purposes.
+            (0.0, Some(false), Battery::Low),
+            (50.0, Some(false), Battery::Mid),
+            (100.0, Some(false), Battery::Full),
+            // Some(true): charger actively filling the cell — wins at any level.
+            (0.0, Some(true), Battery::Charging),
+            (50.0, Some(true), Battery::Charging),
+            (100.0, Some(true), Battery::Charging),
+        ] {
+            assert_eq!(
+                Battery::of(percent, charging),
+                want,
+                "Battery::of({percent}, {charging:?})"
             );
         }
     }

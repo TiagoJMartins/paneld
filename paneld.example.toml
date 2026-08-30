@@ -18,15 +18,18 @@ listen = "0.0.0.0:4444"
 # silently blank panel.
 public_base_url = "http://192.168.0.50:4444"
 
-# Where pushed content is persisted, so a redeploy does not blank the dashboard
-# until every publisher happens to fire again.
-content_path = "paneld-content.json"
-
-# Where each panel's battery history is persisted, so a redeploy does not cost
-# the samples the charge rate and ETA on `GET /api/battery` are measured from. A
-# panel reports whole percentages every refresh, so a discharge takes hours per
-# step and an emptied history means no rate for the rest of the day.
-battery_path = "paneld-battery.json"
+# Where everything the server remembers across a restart is persisted: pushed
+# content, so a redeploy does not blank the dashboard until every publisher happens
+# to fire again; each panel's battery history, so it does not cost the samples the
+# charge rate and ETA on `GET /api/battery` are measured from (a panel reports whole
+# percentages every refresh, so a discharge takes hours per step and an emptied
+# history means no rate for the rest of the day); and the last value each `trend`
+# cell showed, so an arrow survives a restart instead of reading level until its
+# reading next moves.
+#
+# One file for all three. Clearing it costs all three at once, which is a thing to
+# know before deleting it and never a thing to do while the panels are up.
+state_path = "paneld-state.json"
 
 # Where fetched widget icons are cached. A cache, not a store: every entry is
 # re-fetchable, so losing the directory costs one round trip per icon. It exists so
@@ -323,7 +326,12 @@ grid = { cols = 4, rows = 3 }
 #
 #   date       the date, in the bar's own time zone
 #   time       the time of day, in the bar's own time zone
-#   battery    the device's last reported battery percentage
+#   battery    the device's charge as one of four glyphs, not a percentage: low
+#              (under 20%), mid, full (80% or over), or a bolt when the panel says
+#              it is charging, which wins over the level. Four states rather than a
+#              hundred, for the same reason `trend` rounds — a percentage repaints
+#              the strip on every point it drops. A panel that has not reported
+#              yet draws an em dash and never a level.
 #   refresh    how often the device is told to poll, as a period
 #   device     the device id, for a household running more than one panel
 #   signal     signal strength as the device reported it
@@ -448,6 +456,19 @@ unit = "°C"
 # sends four decimals and a cell that shows one is the normal arrangement — round
 # where it is read, not where it is measured.
 # precision = 1
+# Draw an arrow beside the figure saying which way it last moved, and round the
+# figure to whole numbers to pay for it. Know why before switching it on: a panel
+# repaints when the frame's bytes change, so a cell showing `21.4` costs a repaint
+# on every tenth of a degree. At whole numbers with an arrow the same cell changes
+# a handful of times a day and still says whether the room is warming. Setting
+# `precision` as well keeps that many digits and gives up most of the saving.
+#
+# The arrow describes the last change to the *displayed* number, so it can only
+# move on a frame the digits moved on: it never costs a repaint of its own. On a
+# `list` or `weather` cell put it here to mark every reading, or on one reading to
+# mark that one. A cell with nothing numeric on it — `beacon`, `text`, `group` —
+# rejects it rather than ignoring it.
+# trend = true
 # Optional, and spelt exactly the way gethomepage.dev spells an icon, so a line can
 # be copied between the two projects:
 #
@@ -511,6 +532,8 @@ label = "Notes"
 # A reading may name its own `entity` and falls back to the widget's when it does
 # not. `label`, `unit` and `precision` are its own, with `precision` falling back to
 # the widget's and then the device's.
+#
+# `trend` is its own too, and a reading inherits the widget's when it does not say.
 #
 # `icon` on a reading stands in place of its label, and on a row it usually earns
 # its place twice over: a row is a single line, so a word competes with the figure
@@ -878,7 +901,7 @@ label = "Notes"
 # `style.row_width = "full"` sets each row across the ticket — name at the left
 # margin, figure at the right — which is what a receipt looks like. The default
 # keeps a name and its figure close together and centres the pair, which reads as
-# an indent on a 48mm roll.
+# an indent on a roll only 48 mm of which is printable.
 #
 # The list below is fed by push and is the last cell on the grid, which is the
 # shape to reach for: a cell placed *after* a list of unknown length has to start

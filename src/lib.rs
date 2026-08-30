@@ -3,18 +3,18 @@
 //! The shape of the process:
 //!
 //! - [`config`] parses a TOML dashboard description into a validated `Config`.
-//! - [`content`] stores values pushed by any device on the network, addressed by
-//!   widget id, last write wins.
+//! - [`content`] holds the values pushed by any device on the network, addressed
+//!   by widget id, last write wins.
 //! - [`render`] turns a device's config plus its content into encoded PNG frame
 //!   bytes. Pure: config and content in, bytes out.
 //! - [`frame`] holds the frame currently served for each device, plus exactly one
 //!   generation back, because a device may be mid-download of the frame it
 //!   replaced.
-//! - [`battery`] keeps each device's reported percentages, run-length encoded
-//!   and persisted, and reads a charge rate and ETA off them for
-//!   `GET /api/battery`.
-//! - [`jsonfile`] loads and atomically replaces the file a store is persisted
-//!   to, for the two stores that outlive the process.
+//! - [`battery`] keeps each device's reported percentages, run-length encoded,
+//!   and reads a charge rate and ETA off them for `GET /api/battery`.
+//! - [`state`] is the one file all of that is persisted to — pushed content,
+//!   battery history and reading trends behind a single mutex — and [`jsonfile`]
+//!   loads and atomically replaces it.
 //! - [`schedule`] decides which devices are due for a rebuild at a given instant.
 //! - [`renderer`] is the single background task that owns all rendering.
 //! - [`http`] is the router. A device poll is a pure read of [`frame`]: it never
@@ -37,6 +37,7 @@ pub mod render;
 pub mod renderer;
 pub mod schedule;
 pub mod sink;
+pub mod state;
 pub mod status;
 pub mod tap;
 pub mod telemetry;

@@ -80,8 +80,7 @@ fn validate(config_path: &Path) -> Result<()> {
     }
     println!("  listen           {}", config.server.listen);
     println!("  public_base_url  {}", config.server.public_base_url);
-    println!("  content_path     {}", config.server.content_path);
-    println!("  battery_path     {}", config.server.battery_path);
+    println!("  state_path       {}", config.server.state_path);
     println!(
         "  home_assistant   {}",
         match &config.home_assistant {

@@ -5,6 +5,7 @@
 use takumi::prelude::*;
 
 use crate::icon::Icon;
+use crate::state::Trend;
 
 use super::paint::{icon_node, one_line, radius, text_node, text_style};
 use super::rows::rows_node;
@@ -29,13 +30,13 @@ pub(super) fn body_nodes(fonts: &Fonts, body: &Body, ink: Ink, space: Space) -> 
     } = space;
     let greys = space.greys();
     match body {
-        Body::Figure { text, unit } => {
+        Body::Figure { text, unit, trend } => {
             // The design size *is* the box's height: a run set at that size overflows
             // it by exactly its line height, so fitting both axes lands the figure on
             // whichever limit actually binds. Fitting width alone, as this did, left
             // the height unused — which on a nearly square cell is most of the cell.
             vec![fitted_box(fonts, content_w, content_h, content_h, |size| {
-                figure_node(text, unit.as_deref(), ink, size, style, greys)
+                figure_node(text, unit.as_deref(), *trend, ink, size, style, greys)
             })]
         }
 
@@ -334,11 +335,17 @@ fn dot_node(size: f32, on: bool, ink: Ink, greys: Greys) -> Node {
 /// about the number rather than as part of it — `23.4` and `°C` are one reading,
 /// and a panel should say so the way a thermometer does.
 ///
+/// The trend arrow, when the cell asked for one, follows the unit — the far end of
+/// the reading, so `21 °C ↑` reads left to right as one statement. Sized to a
+/// little over half the figure like the unit is, because a mark as tall as the
+/// digits competes with them for the cell.
+///
 /// Takes its size rather than choosing one: [`fitted`] decides that, so the unit
-/// is measured into the fit rather than estimated around it.
+/// and the arrow are measured into the fit rather than estimated around it.
 pub(super) fn figure_node(
     text: &str,
     unit: Option<&str>,
+    trend: Option<Trend>,
     ink: Ink,
     size: f32,
     style: &crate::config::Style,
@@ -373,6 +380,30 @@ pub(super) fn figure_node(
                     .with(StyleDeclaration::padding_bottom(Length::Px(
                         size * (1.0 - style.unit_scale) * UNIT_BASELINE_LIFT,
                     ))),
+            ),
+        );
+    }
+
+    if let Some(trend) = trend {
+        // Centred across the line rather than sat on the baseline with the unit.
+        // A glyph has no baseline: its box is square and its mark fills it, so
+        // bottom-aligning it with the digits hung the arrow below them and read as
+        // an underscore. `align_self` on a wrapper, because `icon_node` states its
+        // own complete style and a second `with_style` would replace it.
+        children.push(
+            Node::container(vec![icon_node(
+                &Icon::Svg {
+                    markup: super::icon::trend(trend).to_owned(),
+                    ink: None,
+                },
+                size * style.unit_scale,
+                ink,
+                greys,
+            )])
+            .with_style(
+                Style::default()
+                    .with(StyleDeclaration::display(Display::Flex))
+                    .with(StyleDeclaration::align_self(AlignItems::Center)),
             ),
         );
     }
@@ -649,7 +680,7 @@ mod tests {
         // the lowest inked row under `°` is the degree sign's bottom, nowhere near
         // the baseline, and the `p` of `hPa` has a descender below it.
         for size in [40.0, 60.0, 100.0, 143.0, 168.0] {
-            let node = figure_node("88", Some("88"), Ink::Current, size, &STYLE, GREYS);
+            let node = figure_node("88", Some("88"), None, Ink::Current, size, &STYLE, GREYS);
             let (value, unit) = baselines(node, 1_400, 500);
             let delta = unit as i64 - value as i64;
             assert!(

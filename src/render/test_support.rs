@@ -48,6 +48,11 @@ pub(super) fn nothing_pushed() -> HashMap<String, ContentRecord> {
     HashMap::new()
 }
 
+/// No reading on this fixture asked for a trend, which is the default and so what
+/// almost every render test is about. A shared empty map rather than a temporary
+/// per call site: [`RenderInputs`] borrows it.
+pub(super) static NO_TRENDS: LazyLock<HashMap<String, Trend>> = LazyLock::new(HashMap::new);
+
 pub(super) fn device(widgets: Vec<Widget>) -> Device {
     const GRID: Grid = Grid {
         cols: 2,
@@ -83,6 +88,7 @@ pub(super) fn widget(id: &str, kind: WidgetKind, col: u32, row: u32) -> Widget {
         label: Some(id.to_owned()),
         unit: None,
         precision: None,
+        trend: false,
         state_text: true,
         stale_after: 0,
         entity: None,
@@ -211,6 +217,7 @@ pub(super) fn render_with(
             content,
             ha_states,
             icons,
+            trends: &NO_TRENDS,
             now: now(),
             telemetry: &Telemetry::default(),
         },
@@ -228,6 +235,7 @@ pub(super) fn resolved(widget: &Widget, ha_states: &HashMap<Reading, Reported>) 
             content: &HashMap::new(),
             ha_states,
             icons: &HashMap::new(),
+            trends: &NO_TRENDS,
             now: now(),
             telemetry: &Telemetry::default(),
         },
@@ -248,6 +256,7 @@ pub(super) fn resolved_push(
             content,
             ha_states: &HashMap::new(),
             icons,
+            trends: &NO_TRENDS,
             now: now(),
             telemetry: &Telemetry::default(),
         },
@@ -267,6 +276,7 @@ pub(super) fn reading(
         attribute: attribute.map(str::to_owned),
         unit: Some("\u{b0}C".to_owned()),
         precision: Some(1),
+        trend: false,
     }
 }
 
@@ -289,6 +299,7 @@ pub(super) fn resolved_line(
             state: None,
         },
         icon: None,
+        trend: None,
         ink,
     }
 }
@@ -369,6 +380,7 @@ pub(super) fn cell_fill(
         content,
         ha_states: ha,
         icons: &HashMap::new(),
+        trends: &NO_TRENDS,
         now: now(),
         telemetry: &Telemetry::default(),
     };
@@ -424,7 +436,7 @@ pub(super) fn figure_px_for(text: &str, unit: Option<&str>) -> f32 {
     const DESIGN: f32 = 96.0;
     let intrinsic = intrinsic_width(
         &FONTS,
-        figure_node(text, unit, Ink::Current, DESIGN, &STYLE, GREYS),
+        figure_node(text, unit, None, Ink::Current, DESIGN, &STYLE, GREYS),
     );
     assert!(intrinsic > 0.0, "measuring {text:?} must produce a width");
     fit_size(intrinsic, 200.0, DESIGN)

@@ -18,11 +18,11 @@
 # validation rejects loopback outright but cannot detect a container-internal
 # name, so this one is on you.
 #
-# The content store must land on the volume, or every restart blanks the
-# dashboard until each publisher happens to fire again. The default
-# `content_path` is relative and the working directory is the volume, so leaving
-# it alone already does the right thing; an absolute path must be under
-# /var/lib/paneld.
+# The state file must land on the volume, or every restart blanks the dashboard
+# until each publisher happens to fire again and costs every panel's battery
+# history with it. The default `state_path` is relative and the working directory
+# is the volume, so leaving it alone already does the right thing; an absolute path
+# must be under /var/lib/paneld.
 #
 # `listen` must be "0.0.0.0:4444" rather than a loopback address, or the port
 # publish has nothing to forward to.
@@ -67,7 +67,7 @@ COPY --from=build /usr/local/bin/paneld /usr/local/bin/paneld
 VOLUME /var/lib/paneld
 
 USER paneld
-# Also where a relative `content_path` resolves to, i.e. onto the volume.
+# Also where a relative `state_path` resolves to, i.e. onto the volume.
 WORKDIR /var/lib/paneld
 EXPOSE 4444
 

@@ -6,6 +6,7 @@ use takumi::prelude::*;
 
 use crate::content::Row;
 use crate::icon::Icon;
+use crate::state::Trend;
 
 /// The box a body is drawn in, and the chrome it is drawn against.
 ///
@@ -130,13 +131,21 @@ pub(super) struct Line {
     /// Drawn where the label would go. Resolved here rather than looked up while
     /// building nodes, so that a row's layout takes no map with it.
     pub(super) icon: Option<Icon>,
+    /// The arrow drawn after the value, when this reading asked for a trend.
+    /// Resolved here for the same reason the icon is.
+    pub(super) trend: Option<Trend>,
     pub(super) ink: Ink,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Body {
     /// A large figure with an optional unit.
-    Figure { text: String, unit: Option<String> },
+    Figure {
+        text: String,
+        unit: Option<String>,
+        /// The arrow drawn after the unit, when the widget asked for a trend.
+        trend: Option<Trend>,
+    },
     /// A weather condition: its glyph, the condition in words when the cell asked
     /// for words, and any readings hung off the same entity.
     Sky {

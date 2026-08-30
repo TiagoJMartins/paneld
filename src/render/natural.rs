@@ -344,6 +344,7 @@ mod tests {
             col: 0,
             row: 0,
             col_span: 1,
+            trend: false,
             row_span: 1,
             label: None,
             unit: None,
@@ -375,6 +376,7 @@ mod tests {
                     attribute: None,
                     unit: None,
                     precision: None,
+                    trend: false,
                 })
                 .collect(),
             ..widget(id, kind)

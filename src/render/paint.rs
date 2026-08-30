@@ -145,6 +145,11 @@ pub(super) fn row_runs(line: &Line, size: f32, greys: Greys) -> Node {
 /// is one reading: the figure-and-unit treatment a whole cell gets has no room to
 /// work at this size.
 ///
+/// Exactly two children come back, always, because the row lays them out with
+/// `space-between`: a third sibling would spread the naming, the value and the
+/// trend arrow evenly across the line instead of putting the reading at the
+/// trailing edge. So the arrow travels inside the value's box.
+///
 /// Both runs are one-line, and therefore elided rather than wrapped when a column
 /// cannot be fitted even at [`MIN_TYPE_PX`] — a publisher sending
 /// `21.299999237060547` into a cell a few characters wide. That case is what
@@ -180,24 +185,54 @@ fn row_runs_children(line: &Line, size: f32, greys: Greys) -> Vec<Node> {
         ));
     }
 
-    vec![
-        Node::container(naming).with_style(
-            Style::default()
-                .with(StyleDeclaration::display(Display::Flex))
-                .with(StyleDeclaration::flex_direction(FlexDirection::Row))
-                .with(StyleDeclaration::align_items(AlignItems::Center))
-                .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(
-                    size * 0.35,
-                )))),
+    let digits = text_node(
+        &value,
+        one_line(
+            text_style(size, 700.0, NUMERIC_FAMILY)
+                .with(StyleDeclaration::color(ink.colour(greys))),
         ),
-        text_node(
-            &value,
-            one_line(
-                text_style(size, 700.0, NUMERIC_FAMILY)
-                    .with(StyleDeclaration::color(ink.colour(greys))),
-            ),
+    );
+
+    // The arrow trails the digits rather than leading them, because it qualifies
+    // the number and a mark before it would read as part of the label. At the
+    // value's own nominal size: it stands beside a bold run of digits, and a glyph
+    // enlarged the way a label's is would out-shout the reading it describes.
+    //
+    // Wrapped only when there is an arrow to wrap it with. A box holds its own
+    // column gap whatever it contains, so wrapping unconditionally would give a row
+    // with nothing on it a measurable width — and `width_driven_size` reads that
+    // measurement to size the whole column.
+    let reading = match line.trend {
+        Some(trend) => row_group(
+            vec![
+                digits,
+                icon_node(
+                    &Icon::Svg {
+                        markup: super::icon::trend(trend).to_owned(),
+                        ink: None,
+                    },
+                    size,
+                    ink,
+                    greys,
+                ),
+            ],
+            size * 0.25,
         ),
-    ]
+        None => digits,
+    };
+
+    vec![row_group(naming, size * 0.35), reading]
+}
+
+/// One end of a row: its runs in a line, sized to them.
+fn row_group(children: Vec<Node>, gap: f32) -> Node {
+    Node::container(children).with_style(
+        Style::default()
+            .with(StyleDeclaration::display(Display::Flex))
+            .with(StyleDeclaration::flex_direction(FlexDirection::Row))
+            .with(StyleDeclaration::align_items(AlignItems::Center))
+            .with(StyleDeclaration::column_gap(Gap::Length(Length::Px(gap)))),
+    )
 }
 
 /// A run of text.

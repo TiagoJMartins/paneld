@@ -2,12 +2,15 @@
 //! exists — pushed content, or a Home Assistant reading — into a [`Cell`], before
 //! `scaffold` and `body` draw it.
 
+use std::collections::HashMap;
+
 use time::OffsetDateTime;
 
-use crate::config::{Widget, WidgetKind};
+use crate::config::{Device, Reading as ConfiguredReading, Widget, WidgetKind};
 use crate::content::{ContentRecord, Row};
 use crate::ha::{Reading, Reported};
 use crate::icon::Icon;
+use crate::state::{Trend, trend_key};
 
 use super::RenderInputs;
 use super::icon;
@@ -71,6 +74,10 @@ fn resolve_pushed(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
                         // values, and a publisher that could choose glyphs would be
                         // choosing the dashboard's appearance from outside it.
                         icon: None,
+                        // Nor a trend: a pushed row is identified by whatever the
+                        // publisher called it, so there is no configured reading for
+                        // an arrow to belong to and no stable key to remember it by.
+                        trend: None,
                         ink,
                     })
                     .collect(),
@@ -83,6 +90,7 @@ fn resolve_pushed(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
         WidgetKind::Value => Body::Figure {
             text: format_reading(&value_text(&record.value), widget.precision),
             unit: record.unit.clone().or_else(|| widget.unit.clone()),
+            trend: arrow(inputs, &widget.id, None, widget.trend),
         },
         WidgetKind::Beacon => {
             let on = beacon_is_on(record, &widget.on_values);
@@ -179,7 +187,7 @@ fn resolve_ha(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
 
     // Empty for every kind but `weather`, and cheap when it is: an empty `Vec` does
     // not allocate.
-    let rows = lines(&widget.readings, inputs);
+    let rows = lines(widget, inputs);
     // A weather cell's condition may be current while a reading beside it is held,
     // so the cell's mark is decided over both. Per-line muting says which line is
     // stale; the mark is what a viewer scanning the whole dashboard sees first.
@@ -202,6 +210,7 @@ fn resolve_ha(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
         _ => Body::Figure {
             text: format_reading(value, widget.precision),
             unit: widget.unit.clone(),
+            trend: arrow(inputs, &widget.id, None, widget.trend),
         },
     };
     Cell { body, ink }
@@ -218,7 +227,7 @@ fn resolve_ha(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
 /// Reached only by a list that declared readings: one that declared none is a pushed
 /// cell, which [`resolve`] routes to [`resolve_pushed`] before this is called.
 fn resolve_list(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
-    let rows = lines(&widget.readings, inputs);
+    let rows = lines(widget, inputs);
     let ink = held_over(Ink::Current, &rows);
     Cell {
         body: Body::Rows(rows),
@@ -227,11 +236,33 @@ fn resolve_list(widget: &Widget, inputs: &RenderInputs<'_>) -> Cell {
 }
 
 /// Every configured reading of a cell, resolved to lines in the order written.
-fn lines(readings: &[crate::config::Reading], inputs: &RenderInputs<'_>) -> Vec<Line> {
-    readings
+fn lines(widget: &Widget, inputs: &RenderInputs<'_>) -> Vec<Line> {
+    widget
+        .readings
         .iter()
-        .map(|reading| reading_line(reading, inputs))
+        .enumerate()
+        .map(|(index, reading)| reading_line(reading, index, widget, inputs))
         .collect()
+}
+
+/// The arrow a cell or a row draws, and `None` for one that asked for none.
+///
+/// Also `None` for a reading that asked but whose value is not a number: the
+/// caller never stepped a key for it, so there is nothing to draw and nothing to
+/// invent.
+fn arrow(
+    inputs: &RenderInputs<'_>,
+    widget_id: &str,
+    reading: Option<usize>,
+    wanted: bool,
+) -> Option<Trend> {
+    if !wanted {
+        return None;
+    }
+    inputs
+        .trends
+        .get(&trend_key(&inputs.device.id, widget_id, reading))
+        .copied()
 }
 
 /// One configured reading as a line, carrying how far its own value can be trusted.
@@ -241,7 +272,12 @@ fn lines(readings: &[crate::config::Reading], inputs: &RenderInputs<'_>) -> Vec<
 /// have, and says of that one line that it does not know. Dropping the line instead
 /// would silently shorten the list, and a short list reads as configuration rather
 /// than as a failure.
-fn reading_line(reading: &crate::config::Reading, inputs: &RenderInputs<'_>) -> Line {
+fn reading_line(
+    reading: &ConfiguredReading,
+    index: usize,
+    widget: &Widget,
+    inputs: &RenderInputs<'_>,
+) -> Line {
     let key = ha_reading(&reading.entity, reading.attribute.as_deref());
     let (value, unit, ink) = match inputs.ha_states.get(&key) {
         Some(Reported::Fresh(text)) => (
@@ -271,6 +307,7 @@ fn reading_line(reading: &crate::config::Reading, inputs: &RenderInputs<'_>) -> 
             .as_ref()
             .and_then(|spec| inputs.icons.get(spec))
             .cloned(),
+        trend: arrow(inputs, &widget.id, Some(index), reading.trend),
         ink,
     }
 }
@@ -322,6 +359,86 @@ fn format_reading(text: &str, precision: Option<u8>) -> String {
     };
     let places = places as usize;
     format!("{number:.places$}")
+}
+
+/// Every reading on `device` that asked for a trend, with the number the coming
+/// frame will print for it.
+///
+/// Walked here rather than in the render loop because the number a cell shows is
+/// this module's business: sharing [`ha_reading`] and [`format_reading`] with the
+/// resolve path is what keeps an arrow describing the very digits beside it. The
+/// caller steps each of these into the persisted trend and hands the directions
+/// back in [`RenderInputs::trends`], so the render itself stays pure.
+///
+/// A reading whose text is not a number is left out entirely, and its cell simply
+/// draws no arrow: `unavailable` has no direction.
+pub(crate) fn shown_numbers(
+    device: &Device,
+    content: &HashMap<String, ContentRecord>,
+    ha_states: &HashMap<Reading, Reported>,
+) -> Vec<(String, f64)> {
+    let mut shown = Vec::new();
+    for widget in device.all_widgets() {
+        if widget.trend {
+            let text = match widget.kind {
+                WidgetKind::HaEntity => widget.entity.as_deref().and_then(|entity| {
+                    reported_text(ha_states, entity, widget.attribute.as_deref()).map(str::to_owned)
+                }),
+                WidgetKind::Value => content
+                    .get(&widget.id)
+                    .map(|record| value_text(&record.value)),
+                // A list or weather cell has no figure of its own to mark: the flag
+                // was inherited by its readings, and it is spent on them below.
+                _ => None,
+            };
+            if let Some(number) = text.and_then(|text| shown_number(&text, widget.precision)) {
+                shown.push((trend_key(&device.id, &widget.id, None), number));
+            }
+        }
+        for (index, reading) in widget.readings.iter().enumerate() {
+            if !reading.trend {
+                continue;
+            }
+            let Some(text) =
+                reported_text(ha_states, &reading.entity, reading.attribute.as_deref())
+            else {
+                continue;
+            };
+            if let Some(number) = shown_number(text, reading.precision) {
+                shown.push((trend_key(&device.id, &widget.id, Some(index)), number));
+            }
+        }
+    }
+    shown
+}
+
+/// The text a Home Assistant reading currently shows, whether it was confirmed or
+/// is being held.
+///
+/// Held counts: the cell is showing that number, so it is the number an arrow
+/// must be measured against. Treating a held reading as absent would flip every
+/// arrow to steady for the duration of an outage and then invent a direction from
+/// a value hours old when it came back.
+fn reported_text<'a>(
+    ha_states: &'a HashMap<Reading, Reported>,
+    entity: &str,
+    attribute: Option<&str>,
+) -> Option<&'a str> {
+    match ha_states.get(&ha_reading(entity, attribute)) {
+        Some(Reported::Fresh(text) | Reported::Held(text)) => Some(text.as_str()),
+        Some(Reported::Lost) | None => None,
+    }
+}
+
+/// The number a cell will print, or `None` when what it prints is not one.
+///
+/// Rounded through [`format_reading`] before parsing, deliberately: the trend is a
+/// statement about the *displayed* value, so `21.4` and `21.2` at precision `0`
+/// are the same number and the arrow between them does not move. That is what
+/// makes the mark free — it can only change on a frame where the digits changed
+/// too — and it is why no deadband has to be invented.
+fn shown_number(text: &str, precision: Option<u8>) -> Option<f64> {
+    format_reading(text, precision).trim().parse().ok()
 }
 
 /// Whether a pushed record is older than its widget's `stale_after`.
@@ -465,6 +582,7 @@ mod tests {
                 content: &content,
                 ha_states: &HashMap::new(),
                 icons: &HashMap::new(),
+                trends: &NO_TRENDS,
                 now: now(),
                 telemetry: &Telemetry::default(),
             },
@@ -474,7 +592,8 @@ mod tests {
             Cell {
                 body: Body::Figure {
                     text: "42".to_owned(),
-                    unit: None
+                    unit: None,
+                    trend: None,
                 },
                 ink: Ink::Held,
             }
@@ -601,7 +720,8 @@ mod tests {
             Cell {
                 body: Body::Figure {
                     text: "21.4".to_owned(),
-                    unit: None
+                    unit: None,
+                    trend: None,
                 },
                 ink: Ink::Held,
             }
@@ -614,7 +734,8 @@ mod tests {
             Cell {
                 body: Body::Figure {
                     text: "21.4".to_owned(),
-                    unit: None
+                    unit: None,
+                    trend: None,
                 },
                 ink: Ink::Current,
             }
@@ -752,6 +873,7 @@ mod tests {
                     content: &content,
                     ha_states: &ha,
                     icons: &HashMap::new(),
+                    trends: &NO_TRENDS,
                     now: now(),
                     telemetry: &Telemetry::default(),
                 }
@@ -759,7 +881,8 @@ mod tests {
             Cell {
                 body: Body::Figure {
                     text: "21.4".to_owned(),
-                    unit: None
+                    unit: None,
+                    trend: None,
                 },
                 ink: Ink::Current,
             }
@@ -812,6 +935,7 @@ mod tests {
             Body::Figure {
                 text: "21.5".to_owned(),
                 unit: None,
+                trend: None,
             }
         );
 
@@ -828,6 +952,7 @@ mod tests {
             Body::Figure {
                 text: "21.5".to_owned(),
                 unit: None,
+                trend: None,
             }
         );
     }
@@ -1148,5 +1273,198 @@ mod tests {
         // scalar was expected still gets *something* legible rather than a panic.
         assert_eq!(value_text(&serde_json::json!([1, 2])), "[1,2]");
         assert_eq!(value_text(&serde_json::json!({"a": 1})), "{\"a\":1}");
+    }
+
+    /// A `value` cell and an `ha_entity` cell, both asking for a trend at whole
+    /// numbers — the shape [`crate::config::validate_widget`] produces for
+    /// `trend = true`.
+    fn trending_device() -> Device {
+        let pushed = Widget {
+            trend: true,
+            precision: Some(0),
+            ..widget("pushed", WidgetKind::Value, 0, 0)
+        };
+        let read = Widget {
+            trend: true,
+            precision: Some(0),
+            ..ha_widget("read", "sensor.office", WidgetKind::HaEntity)
+        };
+        let listed = Widget {
+            readings: vec![crate::config::Reading {
+                trend: true,
+                precision: Some(0),
+                ..reading("Office", "sensor.office", None)
+            }],
+            ..widget("listed", WidgetKind::List, 1, 0)
+        };
+        device(vec![pushed, read, listed])
+    }
+
+    #[test]
+    fn shown_numbers_reports_what_each_trending_cell_will_print() {
+        let device = trending_device();
+        let content = HashMap::from([(
+            "pushed".to_owned(),
+            record(serde_json::json!("21.4"), now()),
+        )]);
+        let ha = HashMap::from([(
+            Reading::state("sensor.office"),
+            Reported::Fresh("18.6".to_owned()),
+        )]);
+
+        let shown: HashMap<String, f64> =
+            shown_numbers(&device, &content, &ha).into_iter().collect();
+        assert_eq!(
+            shown,
+            HashMap::from([
+                ("kindle/pushed".to_owned(), 21.0),
+                ("kindle/read".to_owned(), 19.0),
+                ("kindle/listed#0".to_owned(), 19.0),
+            ]),
+            "each number is the rounded one the cell prints, not the raw reading"
+        );
+    }
+
+    #[test]
+    fn shown_numbers_skips_a_reading_that_is_not_a_number() {
+        // `unavailable` has no direction, and inventing one would put an arrow on a
+        // cell that is not reporting anything.
+        let device = trending_device();
+        let ha = HashMap::from([(
+            Reading::state("sensor.office"),
+            Reported::Fresh("unavailable".to_owned()),
+        )]);
+        assert!(shown_numbers(&device, &HashMap::new(), &ha).is_empty());
+    }
+
+    #[test]
+    fn shown_numbers_reads_a_held_value_too() {
+        // The cell is showing that number, so it is the number the arrow describes.
+        let device = trending_device();
+        let ha = HashMap::from([(
+            Reading::state("sensor.office"),
+            Reported::Held("18.6".to_owned()),
+        )]);
+        let shown = shown_numbers(&device, &HashMap::new(), &ha);
+        assert!(
+            shown.contains(&("kindle/read".to_owned(), 19.0)),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_cell_that_asked_for_no_trend_contributes_no_key_and_draws_no_arrow() {
+        let w = ha_widget("plain", "sensor.office", WidgetKind::HaEntity);
+        let device = device(vec![w.clone()]);
+        let ha = HashMap::from([(
+            Reading::state("sensor.office"),
+            Reported::Fresh("21.4".to_owned()),
+        )]);
+        assert!(shown_numbers(&device, &HashMap::new(), &ha).is_empty());
+
+        // And even handed a direction under its key, it draws none: the flag is
+        // what decides, so a stale key left in the file cannot mark a cell.
+        let trends = HashMap::from([("kindle/plain".to_owned(), Trend::Up)]);
+        let cell = resolve(
+            &w,
+            &RenderInputs {
+                device: &device,
+                content: &HashMap::new(),
+                ha_states: &ha,
+                icons: &HashMap::new(),
+                trends: &trends,
+                now: now(),
+                telemetry: &Telemetry::default(),
+            },
+        );
+        assert_eq!(
+            cell.body,
+            Body::Figure {
+                text: "21.4".to_owned(),
+                unit: None,
+                trend: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_trending_figure_and_row_carry_the_direction_under_their_own_key() {
+        let device = trending_device();
+        let ha = HashMap::from([(
+            Reading::state("sensor.office"),
+            Reported::Fresh("18.6".to_owned()),
+        )]);
+        let trends = HashMap::from([
+            ("kindle/read".to_owned(), Trend::Up),
+            ("kindle/listed#0".to_owned(), Trend::Down),
+        ]);
+        let inputs = RenderInputs {
+            device: &device,
+            content: &HashMap::new(),
+            ha_states: &ha,
+            icons: &HashMap::new(),
+            trends: &trends,
+            now: now(),
+            telemetry: &Telemetry::default(),
+        };
+
+        let figure = resolve(&device.widgets[1], &inputs).body;
+        assert_eq!(
+            figure,
+            Body::Figure {
+                text: "19".to_owned(),
+                unit: None,
+                trend: Some(Trend::Up),
+            }
+        );
+
+        let Body::Rows(rows) = resolve(&device.widgets[2], &inputs).body else {
+            panic!("a list resolves to rows");
+        };
+        assert_eq!(rows[0].trend, Some(Trend::Down));
+    }
+
+    #[test]
+    fn a_trend_arrow_reaches_the_glass_and_moves_the_frame_only_with_the_reading() {
+        let w = Widget {
+            trend: true,
+            precision: Some(0),
+            unit: Some("\u{b0}C".to_owned()),
+            ..ha_widget("temp", "sensor.office", WidgetKind::HaEntity)
+        };
+        let device = panel(vec![w]);
+        let ha = HashMap::from([(
+            Reading::state("sensor.office"),
+            Reported::Fresh("18.6".to_owned()),
+        )]);
+
+        let frame = |trend: Trend| {
+            let trends = HashMap::from([("kindle/temp".to_owned(), trend)]);
+            super::super::render_frame(
+                &FONTS,
+                RenderInputs {
+                    device: &device,
+                    content: &HashMap::new(),
+                    ha_states: &ha,
+                    icons: &HashMap::new(),
+                    trends: &trends,
+                    now: now(),
+                    telemetry: &Telemetry::default(),
+                },
+            )
+            .expect("frame should render")
+        };
+
+        let steady = frame(Trend::Steady);
+        let up = frame(Trend::Up);
+        let down = frame(Trend::Down);
+        assert_ne!(steady, up, "the arrow is actually drawn");
+        assert_ne!(up, down, "and the three marks are told apart on the glass");
+
+        // The property the feature rests on: the frame is a function of the
+        // direction, so a reading that has not moved keeps the same bytes and the
+        // panel does not repaint. `state::Trends::step` is what holds the direction
+        // still between changes.
+        assert_eq!(up, frame(Trend::Up));
     }
 }

@@ -8,7 +8,7 @@
 //!
 //! Two properties the rest of the program depends on:
 //!
-//! - `received_at` is stamped server-side from the `now` handed to [`ContentStore::put`].
+//! - `received_at` is stamped server-side from the `now` handed to [`Records::put`].
 //!   The publishers that matter cannot be trusted to have a correct clock, and
 //!   no decision here depends on theirs. Staleness is computed at render time
 //!   against this stamp.
@@ -17,15 +17,10 @@
 //!   makes that ordering painful.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
 
-use anyhow::Result;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
-
-use crate::jsonfile;
 
 /// Maximum number of distinct widget ids the store will hold.
 ///
@@ -168,38 +163,23 @@ impl std::fmt::Display for PutError {
 
 impl std::error::Error for PutError {}
 
-/// The content store: an in-memory map plus the file it is persisted to.
+/// Every widget id's record.
 ///
-/// Interior mutability so that `&self` methods work from `axum` handlers holding
-/// a shared reference.
-#[derive(Debug)]
-pub struct ContentStore {
-    path: PathBuf,
-    records: Mutex<HashMap<String, ContentRecord>>,
-}
+/// One of the domains [`crate::state`] holds: this type owns the bounds and the
+/// last-write-wins contract, and the store around it owns the mutex and the file.
+/// Serialises as the bare map of records, because a wrapper object around it
+/// would be a field name to keep honest for nothing.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct Records(HashMap<String, ContentRecord>);
 
-impl ContentStore {
-    /// Opens the store persisted at `path`.
-    ///
-    /// Never fails: a missing file starts empty silently, and an unreadable or
-    /// corrupt one logs a warning and starts empty. Refusing to boot because a
-    /// cache of last-seen values is damaged would be the wrong trade — the panel
-    /// would show nothing at all.
-    pub fn load(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let records = jsonfile::read(&path, "content store");
-        Self {
-            path,
-            records: Mutex::new(records),
-        }
-    }
-
+impl Records {
     /// Stores content for `widget_id`, replacing any previous record wholesale.
     ///
     /// Bounds are checked before anything is inserted, so a rejected push leaves
     /// the store exactly as it was.
     pub fn put(
-        &self,
+        &mut self,
         widget_id: &str,
         body: ContentBody,
         now: OffsetDateTime,
@@ -207,38 +187,24 @@ impl ContentStore {
         check_string("widget_id", widget_id)?;
         let record = build_record(widget_id, body, now)?;
 
-        let mut records = self.lock();
-        if records.len() >= MAX_WIDGETS && !records.contains_key(widget_id) {
+        if self.0.len() >= MAX_WIDGETS && !self.0.contains_key(widget_id) {
             return Err(PutError::TooManyWidgets {
                 widget_id: widget_id.to_owned(),
             });
         }
-        records.insert(widget_id.to_owned(), record.clone());
+        self.0.insert(widget_id.to_owned(), record.clone());
         Ok(record)
     }
 
     /// The record stored for `widget_id`, if any.
-    pub fn get(&self, widget_id: &str) -> Option<ContentRecord> {
-        self.lock().get(widget_id).cloned()
+    pub fn get(&self, widget_id: &str) -> Option<&ContentRecord> {
+        self.0.get(widget_id)
     }
 
     /// Every stored record, for rendering a whole dashboard from one consistent
     /// view of the store.
-    pub fn snapshot(&self) -> HashMap<String, ContentRecord> {
-        self.lock().clone()
-    }
-
-    /// Writes the whole store to its configured path, atomically.
-    pub fn persist(&self) -> Result<()> {
-        jsonfile::write(&self.path, &self.snapshot(), "content store")
-    }
-
-    /// A panicking handler must not wedge content updates for the rest of the
-    /// process: the map is structurally intact either way, so recover the guard.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ContentRecord>> {
-        self.records
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    pub fn all(&self) -> &HashMap<String, ContentRecord> {
+        &self.0
     }
 }
 
@@ -365,34 +331,10 @@ mod tests {
         serde_json::from_str(json).expect("body fixture should deserialise")
     }
 
-    /// A unique directory per test, so file tests cannot see each other's state.
-    struct Dir(PathBuf);
-
-    impl Dir {
-        fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "paneld-content-{name}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn file(&self) -> PathBuf {
-            self.0.join("content.json")
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn store() -> ContentStore {
-        ContentStore::load("unused-in-memory-only.json")
+    /// An empty record map. The file the merged store wraps it in is
+    /// [`crate::state`]'s business, so nothing here touches a disk.
+    fn store() -> Records {
+        Records::default()
     }
 
     #[test]
@@ -414,7 +356,7 @@ mod tests {
 
     #[test]
     fn an_explicit_null_value_is_stored() {
-        let store = store();
+        let mut store = store();
         let record = store
             .put("sensor", body(r#"{"value":null}"#), at(0))
             .expect("an explicit null value is a legal push");
@@ -425,7 +367,7 @@ mod tests {
 
     #[test]
     fn a_body_without_value_or_rows_is_rejected() {
-        let store = store();
+        let mut store = store();
         let error = store
             .put("sensor", body(r#"{"state":"alert"}"#), at(0))
             .expect_err("an absent value is not the same as a null one");
@@ -445,7 +387,7 @@ mod tests {
 
     #[test]
     fn a_null_rows_key_does_not_count_as_content() {
-        let store = store();
+        let mut store = store();
         assert!(
             store
                 .put("sensor", body(r#"{"rows":null}"#), at(0))
@@ -455,7 +397,7 @@ mod tests {
 
     #[test]
     fn accepts_every_scalar_value_kind() {
-        let store = store();
+        let mut store = store();
         for (id, json, expected) in [
             ("s", r#"{"value":"on"}"#, Value::from("on")),
             ("n", r#"{"value":21.5}"#, Value::from(21.5)),
@@ -468,7 +410,7 @@ mod tests {
 
     #[test]
     fn the_second_put_wins_wholesale() {
-        let store = store();
+        let mut store = store();
         store
             .put(
                 "sensor",
@@ -490,12 +432,12 @@ mod tests {
             "a field absent from the second put does not survive it"
         );
         assert_eq!(second.received_at, at(60));
-        assert_eq!(store.get("sensor").unwrap(), second);
+        assert_eq!(store.get("sensor").unwrap(), &second);
     }
 
     #[test]
     fn an_older_stamp_still_wins_because_last_write_wins_unconditionally() {
-        let store = store();
+        let mut store = store();
         store
             .put("sensor", body(r#"{"value":"new"}"#), at(600))
             .unwrap();
@@ -510,7 +452,7 @@ mod tests {
 
     #[test]
     fn rows_supersede_value() {
-        let store = store();
+        let mut store = store();
         let record = store
             .put(
                 "group",
@@ -532,7 +474,7 @@ mod tests {
 
     #[test]
     fn rows_alone_are_content_enough() {
-        let store = store();
+        let mut store = store();
         let record = store
             .put(
                 "group",
@@ -544,15 +486,15 @@ mod tests {
     }
 
     #[test]
-    fn get_and_snapshot_report_what_is_stored() {
-        let store = store();
+    fn get_and_all_report_what_is_stored() {
+        let mut store = store();
         assert!(store.get("nothing").is_none());
-        assert!(store.snapshot().is_empty());
+        assert!(store.all().is_empty());
 
         store.put("a", body(r#"{"value":1}"#), at(0)).unwrap();
         store.put("b", body(r#"{"value":2}"#), at(1)).unwrap();
 
-        let snapshot = store.snapshot();
+        let snapshot = store.all();
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot["a"].value, Value::from(1));
         assert_eq!(snapshot["b"].received_at, at(1));
@@ -560,7 +502,7 @@ mod tests {
 
     #[test]
     fn rejects_an_oversize_widget_id() {
-        let store = store();
+        let mut store = store();
         let id = "w".repeat(MAX_STRING_BYTES + 1);
         let error = store.put(&id, body(r#"{"value":1}"#), at(0)).unwrap_err();
 
@@ -571,12 +513,12 @@ mod tests {
                 len: MAX_STRING_BYTES + 1,
             }
         );
-        assert!(store.snapshot().is_empty());
+        assert!(store.all().is_empty());
     }
 
     #[test]
     fn accepts_a_string_field_exactly_at_the_byte_bound() {
-        let store = store();
+        let mut store = store();
         let text = "u".repeat(MAX_STRING_BYTES);
         store
             .put(
@@ -589,7 +531,7 @@ mod tests {
 
     #[test]
     fn rejects_oversize_strings_wherever_they_appear() {
-        let store = store();
+        let mut store = store();
         let text = "x".repeat(MAX_STRING_BYTES + 1);
 
         for (json, field) in [
@@ -615,12 +557,12 @@ mod tests {
                 "{field} should be bounded"
             );
         }
-        assert!(store.snapshot().is_empty(), "no rejected push was stored");
+        assert!(store.all().is_empty(), "no rejected push was stored");
     }
 
     #[test]
     fn rejects_more_rows_than_the_limit() {
-        let store = store();
+        let mut store = store();
         let row = r#"{"label":"a","value":1}"#;
 
         let at_limit = format!(r#"{{"rows":[{}]}}"#, vec![row; MAX_ROWS].join(","));
@@ -645,7 +587,7 @@ mod tests {
 
     #[test]
     fn at_the_widget_cap_new_ids_are_rejected_but_overwrites_still_work() {
-        let store = store();
+        let mut store = store();
         for index in 0..MAX_WIDGETS {
             store
                 .put(&format!("w{index}"), body(r#"{"value":1}"#), at(0))
@@ -663,97 +605,6 @@ mod tests {
             .put("w0", body(r#"{"value":2}"#), at(1))
             .expect("an existing publisher must keep working at the cap");
         assert_eq!(overwritten.value, Value::from(2));
-        assert_eq!(store.snapshot().len(), MAX_WIDGETS);
-    }
-
-    #[test]
-    fn a_missing_file_starts_empty() {
-        let dir = Dir::new("missing");
-        let store = ContentStore::load(dir.file());
-        assert!(store.snapshot().is_empty());
-        assert!(!dir.file().exists(), "load does not create the file");
-    }
-
-    #[test]
-    fn persist_then_load_round_trips_records() {
-        let dir = Dir::new("roundtrip");
-        let store = ContentStore::load(dir.file());
-        store
-            .put(
-                "sensor",
-                body(r#"{"value":"on","state":"alert","unit":"°C"}"#),
-                at(0),
-            )
-            .unwrap();
-        store
-            .put(
-                "group",
-                body(r#"{"rows":[{"id":"a","label":"A","value":1,"unit":"C","state":"ok"}]}"#),
-                at(90),
-            )
-            .unwrap();
-        store.persist().unwrap();
-
-        let reloaded = ContentStore::load(dir.file()).snapshot();
-        assert_eq!(reloaded, store.snapshot());
-        assert_eq!(reloaded["sensor"].received_at, at(0));
-        assert_eq!(reloaded["group"].received_at, at(90));
-    }
-
-    #[test]
-    fn persist_leaves_no_temporary_file_behind() {
-        let dir = Dir::new("temp");
-        let store = ContentStore::load(dir.file());
-        store.put("sensor", body(r#"{"value":1}"#), at(0)).unwrap();
-        store.persist().unwrap();
-        store.persist().unwrap();
-
-        let entries: Vec<String> = std::fs::read_dir(&dir.0)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(entries, ["content.json"]);
-    }
-
-    #[test]
-    fn persist_overwrites_a_previous_store() {
-        let dir = Dir::new("overwrite");
-        let first = ContentStore::load(dir.file());
-        first.put("gone", body(r#"{"value":1}"#), at(0)).unwrap();
-        first.persist().unwrap();
-
-        let second = ContentStore::load(dir.file());
-        second.put("kept", body(r#"{"value":2}"#), at(1)).unwrap();
-        second.persist().unwrap();
-
-        // The second store loaded the first's contents, so both ids survive; the
-        // point is that persisting replaces the file rather than appending.
-        let reloaded = ContentStore::load(dir.file()).snapshot();
-        assert_eq!(reloaded.len(), 2);
-        assert_eq!(reloaded["kept"].value, Value::from(2));
-    }
-
-    #[test]
-    fn a_corrupt_file_yields_an_empty_store() {
-        let dir = Dir::new("corrupt");
-        std::fs::write(dir.file(), "{not json at all").unwrap();
-
-        let store = ContentStore::load(dir.file());
-        assert!(
-            store.snapshot().is_empty(),
-            "a damaged store must not stop the boot"
-        );
-
-        // And the store is usable afterwards, replacing the bad file on persist.
-        store.put("sensor", body(r#"{"value":1}"#), at(0)).unwrap();
-        store.persist().unwrap();
-        assert_eq!(ContentStore::load(dir.file()).snapshot().len(), 1);
-    }
-
-    #[test]
-    fn a_file_of_the_wrong_shape_yields_an_empty_store() {
-        let dir = Dir::new("wrong-shape");
-        std::fs::write(dir.file(), r#"["not","a","map"]"#).unwrap();
-        assert!(ContentStore::load(dir.file()).snapshot().is_empty());
+        assert_eq!(store.all().len(), MAX_WIDGETS);
     }
 }

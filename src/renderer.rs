@@ -193,8 +193,7 @@ mod tests {
 
     fn runtime(toml: &str) -> (Arc<Runtime>, Receiver<String>) {
         let mut parsed = config::parse(toml).expect("fixture config should be valid");
-        parsed.server.content_path = temp_path("content");
-        parsed.server.battery_path = temp_path("battery");
+        parsed.server.state_path = temp_path("state");
         Runtime::with_home_assistant(parsed, None).expect("runtime should build")
     }
 

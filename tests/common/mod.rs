@@ -106,14 +106,14 @@ pub struct Harness {
     /// The loop's notion of the monotonic present, advanced only by [`Self::tick`]
     /// so that nothing here depends on wall-clock timing.
     at: Instant,
-    content_path: PathBuf,
+    state_path: PathBuf,
 }
 
 impl Harness {
     /// Builds the runtime from a fixture and renders every device once, exactly as
     /// startup does before the listener accepts.
     ///
-    /// Starts from an empty content store: the path is per-test, and any file left
+    /// Starts from an empty state file: the path is per-test, and any file left
     /// by an earlier run of the same test is removed.
     pub async fn start(toml: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
@@ -122,20 +122,18 @@ impl Harness {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(battery_path(&path));
         Self::start_at(toml, path).await
     }
 
-    /// Starts again against the same content file, without clearing it — what a
+    /// Starts again against the same state file, without clearing it — what a
     /// redeploy looks like to the store.
     pub async fn restart(&self, toml: &str) -> Self {
-        Self::start_at(toml, self.content_path.clone()).await
+        Self::start_at(toml, self.state_path.clone()).await
     }
 
-    async fn start_at(toml: &str, content_path: PathBuf) -> Self {
+    async fn start_at(toml: &str, state_path: PathBuf) -> Self {
         let mut parsed = config::parse(toml).expect("fixture config should be valid");
-        parsed.server.content_path = content_path.to_string_lossy().into_owned();
-        parsed.server.battery_path = battery_path(&content_path).to_string_lossy().into_owned();
+        parsed.server.state_path = state_path.to_string_lossy().into_owned();
 
         let (runtime, wake) =
             Runtime::with_home_assistant(parsed, None).expect("runtime should build");
@@ -150,7 +148,7 @@ impl Harness {
             wake,
             schedule,
             at,
-            content_path,
+            state_path,
         }
     }
 
@@ -296,15 +294,8 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.content_path);
-        let _ = std::fs::remove_file(battery_path(&self.content_path));
+        let _ = std::fs::remove_file(&self.state_path);
     }
-}
-
-/// The battery history file beside a test's content file, so the two stores stay
-/// per-test and a restart of the same harness reloads both.
-fn battery_path(content_path: &std::path::Path) -> PathBuf {
-    content_path.with_extension("battery.json")
 }
 
 /// Reads width and height straight out of the PNG IHDR chunk.

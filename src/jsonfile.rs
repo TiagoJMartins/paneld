@@ -1,7 +1,8 @@
-//! Loading and replacing the JSON file a store is persisted to.
+//! Loading and replacing the JSON file the state store is persisted to.
 //!
-//! Two stores outlive the process — pushed content and battery history — and
-//! both want the same two properties, so they are written once here.
+//! One caller — [`crate::state`] — and two properties it wants, written here so
+//! that the file's failure modes are described in one place rather than tangled
+//! with what the state means.
 //!
 //! **A load never stops the boot.** A missing file is an empty store, and an
 //! unreadable or corrupt one is a warning and an empty store. Refusing to start

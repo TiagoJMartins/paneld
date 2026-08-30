@@ -156,13 +156,13 @@ struct HaFixture {
     services: Arc<Mutex<Vec<ServiceCall>>>,
     /// Held only to keep the wake channel open for the runtime's lifetime.
     _wake: Receiver<String>,
-    content_path: PathBuf,
+    state_path: PathBuf,
 }
 
 impl HaFixture {
-    /// `tag` must be unique per fixture: it names a private content file, so two
-    /// fixtures sharing a tag would share a content store and confound a
-    /// byte-for-byte comparison.
+    /// `tag` must be unique per fixture: it names a private state file, so two
+    /// fixtures sharing a tag would share a store and confound a byte-for-byte
+    /// comparison.
     async fn start(toml: &str, tag: &str, answers: &[(&str, Result<&str, &str>)]) -> Self {
         Self::start_with(toml, tag, answers, None).await
     }
@@ -184,14 +184,14 @@ impl HaFixture {
         answers: &[(&str, Result<&str, &str>)],
         refuses: Option<String>,
     ) -> Self {
-        let content_path = std::env::temp_dir().join(format!(
+        let state_path = std::env::temp_dir().join(format!(
             "paneld-integration-{}-{tag}.json",
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&content_path);
+        let _ = std::fs::remove_file(&state_path);
 
         let mut config = paneld::config::parse(toml).expect("fixture config should be valid");
-        config.server.content_path = content_path.to_string_lossy().into_owned();
+        config.server.state_path = state_path.to_string_lossy().into_owned();
 
         let calls = Arc::new(AtomicUsize::new(0));
         let services = Arc::new(Mutex::new(Vec::new()));
@@ -218,7 +218,7 @@ impl HaFixture {
             calls,
             services,
             _wake: wake,
-            content_path,
+            state_path,
         }
     }
 
@@ -299,7 +299,7 @@ impl HaFixture {
 
 impl Drop for HaFixture {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.content_path);
+        let _ = std::fs::remove_file(&self.state_path);
     }
 }
 

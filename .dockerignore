@@ -6,7 +6,7 @@ target
 # A local config carries this host's LAN address and must not be baked into an
 # image; it is mounted at run time instead.
 paneld.toml
-paneld-content.json
+paneld-state.json
 
 # Rendered previews.
 *.png
