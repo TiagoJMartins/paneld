@@ -589,8 +589,15 @@ fn body_nodes(
         Body::Rows(rows) => {
             // Every row plus every gap between them fills the box: a row's line box
             // is about 1.2 of its size and the gaps are 0.28 of it, so `n` rows want
-            // `1.48n - 0.28` sizes' worth of height.
+            // `1.48n - 0.28` sizes' worth of height. That is the height's say; the
+            // width has one too, or a two-row list in a tall cell is set at 100px
+            // and its longest row clips at the cell edge. Each row is fitted on its
+            // own and the list set at the smallest, so the rows stay one size.
             let row_px = (content_h / (rows.len().max(1) as f32 * 1.48 - 0.28)).max(MIN_TYPE_PX);
+            let row_px = rows.iter().fold(row_px, |px, row| {
+                let intrinsic = intrinsic_width(fonts, row_node(row, px, ink));
+                fit_size(intrinsic, content_w, px)
+            });
             let children = rows
                 .iter()
                 .map(|row| row_node(row, row_px, ink))

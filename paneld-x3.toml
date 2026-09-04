@@ -1,0 +1,62 @@
+# Local paneld instance for verifying the Xteink X3 dashboard integration.
+# The X3 panel is 528x792 portrait, 1-bit — hence mono + bayer: ordered dithering
+# is stateless per pixel, so an unchanged corner stays byte-identical and the
+# content hash only moves when something visibly moved.
+
+[server]
+listen = "0.0.0.0:4455"
+public_base_url = "http://192.168.0.217:4455"
+content_path = "/tmp/paneld-x3-content.json"
+icon_cache_path = "/tmp/paneld-x3-icons"
+
+[[device]]
+id = "x3"
+width = 528
+height = 792
+palette = "mono"
+dither = "bayer"
+refresh_rate = 300
+render_interval = 60
+grid = { cols = 2, rows = 4 }
+
+[[device.widget]]
+id = "hn"
+kind = "text"
+col = 0
+row = 0
+col_span = 2
+label = "Hacker News"
+
+[[device.widget]]
+id = "battery"
+kind = "value"
+col = 0
+row = 1
+label = "X3 battery"
+unit = "%"
+icon = "mdi-battery"
+
+[[device.widget]]
+id = "printer"
+kind = "beacon"
+col = 1
+row = 1
+label = "Printer"
+on_values = ["on", "true", "ready"]
+
+[[device.widget]]
+id = "agents"
+kind = "value"
+col = 0
+row = 2
+col_span = 2
+label = "Agents running"
+icon = "mdi-robot"
+
+[[device.widget]]
+id = "notes"
+kind = "text"
+col = 0
+row = 3
+col_span = 2
+label = "Notes"
